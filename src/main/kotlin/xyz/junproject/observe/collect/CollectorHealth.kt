@@ -2,12 +2,15 @@ package xyz.junproject.observe.collect
 
 import org.slf4j.LoggerFactory
 import xyz.junproject.observe.log.RetentionResult
+import java.sql.SQLException
 import java.time.Duration
 import java.time.Instant
 
 /**
  * 수집이 살아 있는가의 판정. 200 은 `ok` 하나뿐이다.
- * - `unreachable`(503): 지금 Redis(미확인 건수)나 DB(가장 최근 행의 시각)에 닿지 못한다. 헬스를 물을 때마다 직접 보고
+ * - `unreachable`(503): 지금 Redis(미확인 건수)나 DB(가장 최근 행의 시각)에 닿지 못한다. 표가 아직 없다는 답(SQLSTATE 42P01)은
+ *   DB 에 닿은 것이라 여기 넣지 않는다 — 스키마를 만들기 전(`starting`)이나 만들지 못한 때(`failing`, `schema …`)를 가리지 않게.
+ *   헬스를 물을 때마다 직접 보고
  *   결과를 담아 두지 않는다 — 스트림이 조용하면 수집 바퀴가 DB 에 닿지 않아 바퀴 결과만으로는 "DB 가 죽었는데 정상"으로 보이고,
  *   담아 두면 끊긴 직후에도 200 이 나간다.
  * - `failing`(503): 마지막 수집 바퀴가 실패했다(스키마 생성 실패 포함).
@@ -36,7 +39,8 @@ class CollectorHealth(
         val lastLoopAt = collector.lastLoopAt
         val failure = collector.lastFailure
         val pending = runCatching(unacknowledged)
-        val stored = runCatching(latestStoredAt)
+        // 표가 없으면 DB 에는 닿았고 저장된 행이 없는 것과 같다 — 마지막 저장 시각은 비우고 판정은 수집 바퀴의 결과에 맡긴다
+        val stored = runCatching(latestStoredAt).recoverCatching { if (isTableMissing(it)) null else throw it }
         val behind = runCatching(lag)
         val problems = listOfNotNull(pending.exceptionOrNull()?.let { "redis" to it }, stored.exceptionOrNull()?.let { "database" to it })
         logProblems(problems)
@@ -63,10 +67,17 @@ class CollectorHealth(
         return Report(status == "ok", body)
     }
 
+    private fun isTableMissing(error: Throwable) =
+        generateSequence(error) { it.cause }.any { it is SQLException && it.sqlState == UNDEFINED_TABLE }
+
     /** 닿지 못한 이유의 전체 문구는 서버 로그에만 — 같은 이유를 헬스 요청마다 되풀이해 남기지 않는다 */
     private fun logProblems(problems: List<Pair<String, Throwable>>) {
         val detail = problems.joinToString("; ") { (where, error) -> "$where ${error.javaClass.simpleName}: ${error.message?.take(200)}" }.ifEmpty { null }
         if (detail != lastLoggedProblem && detail != null) log.warn("observe:observe:health check unreachable: {}", detail)
         lastLoggedProblem = detail
+    }
+
+    companion object {
+        private const val UNDEFINED_TABLE = "42P01"   // PostgreSQL: relation does not exist
     }
 }

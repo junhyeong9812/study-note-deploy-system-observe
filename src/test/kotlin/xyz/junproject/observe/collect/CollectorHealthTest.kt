@@ -2,7 +2,9 @@ package xyz.junproject.observe.collect
 
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Test
+import org.springframework.jdbc.BadSqlGrammarException
 import xyz.junproject.observe.log.RetentionResult
+import java.sql.SQLException
 import java.time.Duration
 import java.time.Instant
 
@@ -13,6 +15,7 @@ class CollectorHealthTest {
     private val startedAt = Instant.parse("2026-11-21T00:00:00Z")
     private var now = startedAt
     private var databaseReachable = true
+    private var tableMissing = false                                  // 스키마가 아직 없다 — 실제 DB 는 SQLSTATE 42P01 로 답한다
     private var latestInDatabase: Instant? = null
     private var lag: () -> Long? = { 0L }
     private var retention: RetentionResult? = null
@@ -21,7 +24,12 @@ class CollectorHealthTest {
         collector,
         unacknowledged = { stream.unacknowledgedCount() },
         lag = { lag() },
-        latestStoredAt = { if (!databaseReachable) throw IllegalStateException("DB 에 닿지 못함 jdbc:postgresql://postgres:5432") else latestInDatabase },
+        latestStoredAt = {
+            if (!databaseReachable) throw IllegalStateException("DB 에 닿지 못함 jdbc:postgresql://postgres:5432")
+            if (tableMissing) throw BadSqlGrammarException("latest", "SELECT stream_ms FROM log_entry",
+                SQLException("ERROR: relation \"log_entry\" does not exist", "42P01"))
+            latestInDatabase
+        },
         lastRetention = { retention },
         startedAt = startedAt,
     )
@@ -173,5 +181,37 @@ class CollectorHealthTest {
         assertEquals(503 to "unreachable", check().let { it.first to it.second["status"] })
         databaseReachable = true
         assertEquals(200, check().first)
+    }
+
+    @Test
+    fun `스키마를 만들지 못해 최신 행 조회도 표가 없어 실패하면 unreachable 이 아니라 failing 이고 사유에 schema 가 남는다`() {
+        // 표가 없다는 답은 DB 에 닿았다는 뜻이다 — 그 실패가 스키마 실패라는 진짜 원인을 가리면 안 된다
+        tableMissing = true
+        sink.schemaFailing = true
+        collector.runOnce()
+        val (status, body) = check()
+        assertEquals(503 to "failing", status to body["status"])
+        assertEquals("schema IllegalStateException", body["failure"])
+        assertEquals("", body["last_stored_at"])
+    }
+
+    @Test
+    fun `정상 첫 기동에서 스키마를 만들기 전 표가 없으면 unreachable 이 아니라 starting 이다`() {
+        tableMissing = true
+        // 첫 바퀴는 그룹을 먼저 만들고 스키마를 만든다 — 그룹은 생겼고 스키마는 아직(DB 가 늦거나 만드는 중)인 때
+        stream.ensureGroup()
+        val (status, body) = check()
+        assertEquals(503 to "starting", status to body["status"])
+        assertEquals("", body["failure"])
+    }
+
+    @Test
+    fun `스키마를 만들 때 DB 에 닿지 못하면 unreachable 이다`() {
+        databaseReachable = false
+        sink.schemaFailing = true                                       // 연결이 안 되니 스키마도 실패한다
+        collector.runOnce()
+        val (status, body) = check()
+        assertEquals(503 to "unreachable", status to body["status"])
+        assertEquals("database IllegalStateException", body["failure"])
     }
 }

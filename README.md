@@ -56,7 +56,7 @@ front · backend · llm · 배포 시스템 ── XADD logs ──▶ Redis(bac
 | `ok` | 200 | 마지막으로 성공한 수집 바퀴가 60초 안(읽을 것이 없었어도) |
 | `starting` | 503 | 뜬 지 60초 안, 아직 한 바퀴도 성공하지 못함 — 배포의 헬스 게이트가 한 번도 수집하지 못한 자리를 통과시키지 않게 |
 | `failing` | 503 | 마지막 수집 바퀴가 실패(저장 실패·Redis 오류, 스키마 생성 실패는 `failure` 가 `schema …`) |
-| `unreachable` | 503 | 지금 Redis 나 DB 에 닿지 못함(`failure` 가 `redis …` · `database …`) |
+| `unreachable` | 503 | 지금 Redis 나 DB 에 닿지 못함(`failure` 가 `redis …` · `database …`). 표가 아직 없다는 DB 의 답은 닿은 것으로 보아 넣지 않는다 — 스키마를 만들기 전은 `starting`, 만들지 못했으면 `failing` 으로 보인다 |
 | `stalled` | 503 | 수집 바퀴가 60초 넘게 끝나지 않음(첫 바퀴 전 포함) |
 
 판정 순서는 `unreachable` → `failing` → `ok` → `starting` → `stalled`.
@@ -65,7 +65,7 @@ front · backend · llm · 배포 시스템 ── XADD logs ──▶ Redis(bac
 |---|---|
 | `status` | 위 표 |
 | `last_loop_at` | 마지막으로 성공한 수집 바퀴가 끝난 시각(없으면 빈 문자열) |
-| `last_stored_at` | DB 의 가장 최근 로그가 찍힌 시각 — DB 에서 읽어 재시작 직후에도, 다른 자리가 저장한 것도 보인다(표가 비었거나 DB 에 닿지 못하면 빈 문자열) |
+| `last_stored_at` | DB 의 가장 최근 로그가 찍힌 시각 — DB 에서 읽어 재시작 직후에도, 다른 자리가 저장한 것도 보인다(표가 비었거나 아직 없거나 DB 에 닿지 못하면 빈 문자열) |
 | `stored_since_start` | 이 프로세스가 뜬 뒤 저장한 건수 |
 | `unacknowledged` | 받았지만 확인(ack)하지 못한 건수(물어볼 수 없으면 -1) |
 | `lag` | 그룹에 아직 전달되지 않은 밀린 건수(`XINFO GROUPS` 의 lag, 읽지 못하면 -1). 판정에는 넣지 않는다 — 밀림은 진행 상황 |

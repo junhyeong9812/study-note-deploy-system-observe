@@ -1,5 +1,6 @@
 package xyz.junproject.observe.engine
 
+import com.zaxxer.hikari.HikariConfig
 import com.zaxxer.hikari.HikariDataSource
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Assertions.*
@@ -193,6 +194,44 @@ class LogStoreEngineTest {
         val result = schedule.lastRetention!!
         assertEquals(now to null, result.ranAt to result.deleted)
         assertEquals("CannotGetJdbcConnectionException", result.failure)
+    }
+
+    @Test
+    fun `표가 없는 실제 DB 에서 스키마를 만들지 못하면 헬스는 unreachable 이 아니라 failing 이고 사유에 schema 가 남는다`() {
+        // 만들 권한이 없는 계정 + 빈 스키마 — 스키마 생성은 실제 권한 오류로, 최신 행 조회는 실제 "표 없음"(42P01)으로 실패한다
+        val role = "observe_no_create"
+        val schema = "observe_empty"
+        jdbc.execute("DROP SCHEMA IF EXISTS $schema CASCADE")
+        jdbc.execute("DROP ROLE IF EXISTS $role")
+        jdbc.execute("CREATE ROLE $role LOGIN PASSWORD 'no-create-test'")
+        jdbc.execute("CREATE SCHEMA $schema")
+        jdbc.execute("GRANT USAGE ON SCHEMA $schema TO $role")          // 볼 수는 있고 만들 수는 없다
+        val limited = HikariDataSource(HikariConfig().apply {
+            jdbcUrl = EngineSupport.databaseUrl + "?currentSchema=$schema"; username = role; password = "no-create-test"; maximumPoolSize = 2
+        })
+        try {
+            val limitedStore = EngineSupport.store(limited)
+            val tableMissing = runCatching { limitedStore.latestStoredAt() }.exceptionOrNull()
+            println("observe-test latest row without table: ${tableMissing?.javaClass?.name} sqlState=${(tableMissing?.cause as? java.sql.SQLException)?.sqlState}")
+
+            val stream = FakeLogStream()
+            val collector = LogCollector(stream, limitedStore, block = Duration.ZERO)
+            val health = CollectorHealth(collector, { stream.unacknowledgedCount() }, { 0L }, { limitedStore.latestStoredAt() }, { null })
+            stream.ensureGroup()
+            assertEquals("starting", health.report(Instant.now()).body["status"], "스키마를 만들기 전 표가 없을 뿐인데 unreachable 로 보였다")
+
+            collector.runOnce()
+            val report = health.report(Instant.now())
+            println("observe-test health without schema: ${report.body}")
+            assertFalse(report.healthy)
+            assertEquals("failing", report.body["status"])
+            assertTrue((report.body["failure"] as String).startsWith("schema "), "${report.body["failure"]}")
+            assertEquals("", report.body["last_stored_at"])
+        } finally {
+            limited.close()
+            jdbc.execute("DROP SCHEMA IF EXISTS $schema CASCADE")
+            jdbc.execute("DROP ROLE IF EXISTS $role")
+        }
     }
 
     @Test
