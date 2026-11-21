@@ -18,20 +18,25 @@ import xyz.junproject.observe.log.LogStore
 class ObserveConfiguration {
     private val log = LoggerFactory.getLogger("observe")
 
-    private fun pool(name: String, url: String, user: String, password: String, size: Int, statementTimeoutMs: Int, extraInitSql: String = "") =
+    private fun pool(name: String, url: String, user: String, password: String, size: Int, statementTimeoutMs: Int, extraInitSql: String = "",
+                     connectionTimeoutMs: Long = 5_000, validationTimeoutMs: Long = 5_000) =
         HikariDataSource(HikariConfig().apply {
             poolName = name
             jdbcUrl = url
             username = user
             this.password = password
             maximumPoolSize = size
-            connectionTimeout = 5_000
+            connectionTimeout = connectionTimeoutMs
+            validationTimeout = validationTimeoutMs
             // 뜰 때 DB 가 아직 준비 전이어도 죽지 않는다 — 수집 바퀴가 실패로 남기고 다시 시도한다
             initializationFailTimeout = -1
             connectionInitSql = "SET statement_timeout = $statementTimeoutMs$extraInitSql"
         })
 
-    /** 수집과 조회의 연결 풀을 나눈다 — 무거운 조회가 연결을 다 잡아도 수집은 밀리지 않는다. 조회는 10초에서 끊는다. */
+    /**
+     * 수집·조회·헬스의 연결 풀을 나눈다 — 무거운 조회가 연결을 다 잡아도, 인증 없는 헬스 요청이 몰려도 수집은 밀리지 않는다.
+     * 조회는 10초에서 끊는다. 헬스는 1개·짧은 대기 — 몰리면 헬스끼리만 기다리다 503 이 되고, DB 가 끊기면 몇 초 안에 503 이 된다.
+     */
     @Bean
     fun logStore(
         @Value("\${observe.db.url}") url: String,
@@ -43,7 +48,8 @@ class ObserveConfiguration {
         // 바꿀 수 있는데, 그 계획으로는 흔한 말 검색이 75만 행에서 2초 걸렸다(값을 보고 세운 계획은 1ms). 계획 비용은 1ms 안팎.
         val query = pool("observe-query", url, user, password, size = 4, statementTimeoutMs = 10_000,
             extraInitSql = "; SET plan_cache_mode = force_custom_plan")
-        return LogStore(JdbcTemplate(ingest), JdbcTemplate(query))
+        val health = pool("observe-health", url, user, password, size = 1, statementTimeoutMs = 2_000, connectionTimeoutMs = 2_000, validationTimeoutMs = 1_000)
+        return LogStore(JdbcTemplate(ingest), JdbcTemplate(query), JdbcTemplate(health))
     }
 
     @Bean
@@ -60,6 +66,6 @@ class ObserveConfiguration {
     fun logCollector(source: RedisLogStreamSource, store: LogStore) = LogCollector(source, store)
 
     @Bean
-    fun collectorHealth(collector: LogCollector, source: RedisLogStreamSource, store: LogStore) =
-        CollectorHealth(collector, { source.unacknowledgedCount() }, { store.ping() })
+    fun collectorHealth(collector: LogCollector, source: RedisLogStreamSource, store: LogStore, schedule: ObserveSchedule) =
+        CollectorHealth(collector, { source.unacknowledgedCount() }, { source.lag() }, { store.latestStoredAt() }, { schedule.lastRetention })
 }

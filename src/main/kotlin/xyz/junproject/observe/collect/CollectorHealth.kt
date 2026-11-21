@@ -1,51 +1,72 @@
 package xyz.junproject.observe.collect
 
+import org.slf4j.LoggerFactory
+import xyz.junproject.observe.log.RetentionResult
 import java.time.Duration
 import java.time.Instant
 
 /**
- * 수집이 살아 있는가의 판정.
- * - DB·Redis 에 지금 닿는지를 헬스를 물을 때마다 직접 본다 — 스트림이 조용하면 수집 바퀴가 DB 에 닿지 않으므로
- *   바퀴 결과만으로는 "DB 가 죽었는데 정상"으로 보인다. 닿지 못하면 503(unreachable).
- * - 수집 바퀴가 [stallAfter] 안에 한 번이라도 끝까지 돌았고(읽을 것이 없었어도) 마지막 바퀴가 실패하지 않았으면 정상
- * - 뜬 지 [stallAfter] 가 안 됐고 아직 첫 바퀴 전이면 starting(200)
- * - 그 밖은 503 — 바퀴가 실패하고 있거나(failing), 바퀴가 멈췄다(stalled)
+ * 수집이 살아 있는가의 판정. 200 은 `ok` 하나뿐이다.
+ * - `unreachable`(503): 지금 Redis(미확인 건수)나 DB(가장 최근 행의 시각)에 닿지 못한다. 헬스를 물을 때마다 직접 보고
+ *   결과를 담아 두지 않는다 — 스트림이 조용하면 수집 바퀴가 DB 에 닿지 않아 바퀴 결과만으로는 "DB 가 죽었는데 정상"으로 보이고,
+ *   담아 두면 끊긴 직후에도 200 이 나간다.
+ * - `failing`(503): 마지막 수집 바퀴가 실패했다(스키마 생성 실패 포함).
+ * - `ok`(200): 마지막으로 성공한 바퀴가 [stallAfter] 안이다(읽을 것이 없었어도).
+ * - `starting`(503): 뜬 지 [stallAfter] 가 안 됐고 아직 한 바퀴도 성공하지 못했다. 배포의 헬스 게이트는 첫 200 에서 통과하므로
+ *   한 번도 수집하지 못한 자리를 통과시키지 않게 503 이다.
+ * - `stalled`(503): 그 밖 — 바퀴가 [stallAfter] 넘게 끝나지 않는다(첫 바퀴 전 포함).
+ * 밀린 건수(lag)와 30일 삭제 결과는 본문에만 낸다 — 밀림은 장애가 아니라 진행 상황이고, 삭제 실패는 수집과 무관하다.
+ * 실패 사유는 예외 종류 이름만 낸다(헬스는 인증이 없다). 문구는 서버 로그에만.
  */
 class CollectorHealth(
     private val collector: LogCollector,
     private val unacknowledged: () -> Long,           // 받았지만 확인하지 못한 건수 — 물어볼 수 없으면 예외(= Redis 에 닿지 못함)
-    private val databaseCheck: () -> Unit,            // DB 에 닿는가 — 닿지 못하면 예외
+    private val lag: () -> Long?,                     // 그룹에 아직 전달되지 않은 건수 — 셀 수 없으면 null, 실패해도 판정에 넣지 않는다
+    private val latestStoredAt: () -> Instant?,       // DB 의 가장 최근 행의 시각(비었으면 null) — 닿지 못하면 예외
+    private val lastRetention: () -> RetentionResult?,
     private val stallAfter: Duration = Duration.ofSeconds(60),
     private val startedAt: Instant = Instant.now(),
 ) {
     data class Report(val healthy: Boolean, val body: Map<String, Any>)
 
-    private fun reason(error: Throwable) = "${error.javaClass.simpleName}: ${error.message?.take(200)}"
+    private val log = LoggerFactory.getLogger("observe")
+    @Volatile private var lastLoggedProblem: String? = null
 
     fun report(now: Instant): Report {
         val lastLoopAt = collector.lastLoopAt
         val failure = collector.lastFailure
         val pending = runCatching(unacknowledged)
-        val database = runCatching(databaseCheck)
-        val unreachable = listOfNotNull(
-            pending.exceptionOrNull()?.let { "redis ${reason(it)}" },
-            database.exceptionOrNull()?.let { "database ${reason(it)}" },
-        )
+        val stored = runCatching(latestStoredAt)
+        val behind = runCatching(lag)
+        val problems = listOfNotNull(pending.exceptionOrNull()?.let { "redis" to it }, stored.exceptionOrNull()?.let { "database" to it })
+        logProblems(problems)
         val status = when {
-            unreachable.isNotEmpty() -> "unreachable"
+            problems.isNotEmpty() -> "unreachable"
             failure != null -> "failing"
             lastLoopAt != null && Duration.between(lastLoopAt, now) < stallAfter -> "ok"
             lastLoopAt == null && Duration.between(startedAt, now) < stallAfter -> "starting"
             else -> "stalled"
         }
+        val retention = lastRetention()
         val body = mapOf(
             "status" to status,
             "last_loop_at" to (lastLoopAt?.toString() ?: ""),
-            "last_stored_at" to (collector.lastStoredAt?.toString() ?: ""),   // 마지막으로 저장한 로그가 찍힌 시각
+            "last_stored_at" to (stored.getOrNull()?.toString() ?: ""),     // DB 의 가장 최근 로그가 찍힌 시각
             "stored_since_start" to collector.storedTotal,
             "unacknowledged" to (pending.getOrNull() ?: -1L),
-            "failure" to (unreachable.joinToString("; ").ifEmpty { failure ?: "" }),
+            "lag" to (behind.getOrNull() ?: -1L),
+            "failure" to (problems.joinToString("; ") { (where, error) -> "$where ${error.javaClass.simpleName}" }.ifEmpty { failure ?: "" }),
+            "last_retention_at" to (retention?.ranAt?.toString() ?: ""),
+            "last_retention_deleted" to (retention?.deleted ?: -1),
+            "last_retention_failure" to (retention?.failure ?: ""),
         )
-        return Report(status == "ok" || status == "starting", body)
+        return Report(status == "ok", body)
+    }
+
+    /** 닿지 못한 이유의 전체 문구는 서버 로그에만 — 같은 이유를 헬스 요청마다 되풀이해 남기지 않는다 */
+    private fun logProblems(problems: List<Pair<String, Throwable>>) {
+        val detail = problems.joinToString("; ") { (where, error) -> "$where ${error.javaClass.simpleName}: ${error.message?.take(200)}" }.ifEmpty { null }
+        if (detail != lastLoggedProblem && detail != null) log.warn("observe:observe:health check unreachable: {}", detail)
+        lastLoggedProblem = detail
     }
 }

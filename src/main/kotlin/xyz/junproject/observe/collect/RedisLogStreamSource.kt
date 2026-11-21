@@ -1,5 +1,6 @@
 package xyz.junproject.observe.collect
 
+import io.lettuce.core.api.async.RedisStreamAsyncCommands
 import org.springframework.data.redis.RedisSystemException
 import org.springframework.data.redis.connection.stream.Consumer
 import org.springframework.data.redis.connection.stream.MapRecord
@@ -44,6 +45,31 @@ class RedisLogStreamSource(
     }
 
     override fun unacknowledgedCount(): Long = operations.pending(stream, group)?.totalPendingMessages ?: 0
+
+    /**
+     * 그룹에 아직 전달되지 않은 밀린 건수(`XINFO GROUPS` 의 `lag`, Redis 7 부터). 미확인 건수는 "받았지만 확인 못 한" 것만이라
+     * 수집이 밀려 아직 받지도 못한 양은 이것으로만 보인다. Spring Data Redis 의 XInfoGroup 이 lag 를 주지 않고, 스프링의 저수준
+     * `execute` 는 겹친 목록 응답을 읽지 못해(바이트 한 덩이로만 받는다) Lettuce 의 명령을 직접 쓴다 — 응답은 겹친 목록 그대로 온다.
+     * Redis 가 셀 수 없다고 하거나(nil — 스트림 중간이 지워졌을 때 등) 그룹이 없으면 null. 스트림이 없으면 예외(ERR no such key).
+     */
+    fun lag(): Long? {
+        val groups = redis.execute { connection ->
+            @Suppress("UNCHECKED_CAST")
+            val commands = connection.nativeConnection as RedisStreamAsyncCommands<ByteArray, ByteArray>
+            commands.xinfoGroups(stream.toByteArray()).get()   // 연결의 명령 제한 시간(application.yml 10초)이 걸려 있다
+        } ?: return null
+        for (fields in groups) {
+            val pairs = (fields as? List<*>)?.chunked(2)?.associate { text(it[0]) to it.getOrNull(1) } ?: continue
+            if (text(pairs["name"]) == group) return (pairs["lag"] as? Number)?.toLong()
+        }
+        return null
+    }
+
+    private fun text(value: Any?): String? = when (value) {
+        is ByteArray -> String(value)
+        null -> null
+        else -> value.toString()
+    }
 
     private fun convert(records: List<MapRecord<String, String, String>>?): List<StreamRecord> =
         records.orEmpty().map { StreamRecord(it.id.value, it.value["level"], it.value["line"]) }

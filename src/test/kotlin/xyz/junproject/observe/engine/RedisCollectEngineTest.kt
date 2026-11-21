@@ -49,6 +49,7 @@ class RedisCollectEngineTest {
     /** 실패하라고 할 때 실패하는 저장소 */
     private class SwitchableSink(private val delegate: LogSink) : LogSink {
         @Volatile var failing = false
+        override fun createSchema() = delegate.createSchema()
         override fun insertAll(entries: List<LogEntry>): Int { if (failing) throw IllegalStateException("저장 실패(테스트)"); return delegate.insertAll(entries) }
     }
 
@@ -61,6 +62,18 @@ class RedisCollectEngineTest {
         assertNull(collector.lastFailure)
         assertEquals(sent, storedIds())
         assertEquals(0L, reader.unacknowledgedCount())
+    }
+
+    @Test
+    fun `수집 전 밀린 건수는 넣은 건수이고 수집 뒤 0 이다`() {
+        val reader = source()
+        assertNull(runCatching { reader.lag() }.getOrNull(), "스트림·그룹이 없으면 셀 수 없다(헬스는 -1)")
+        (1..7).forEach { send("req-$it:backend:lag $it") }
+        reader.ensureGroup()
+        assertEquals(7L, reader.lag())
+        assertEquals(0L, reader.unacknowledgedCount(), "아직 아무에게도 가지 않았다 — 미확인 건수로는 밀림이 보이지 않는다")
+        assertEquals(7, LogCollector(reader, store, block = Duration.ofMillis(200)).runOnce())
+        assertEquals(0L, reader.lag())
     }
 
     @Test
@@ -162,13 +175,14 @@ class RedisCollectEngineTest {
     }
 
     @Test
-    fun `블로킹 읽기가 기다리는 동안에도 미확인 건수 조회는 바로 답한다`() {
+    fun `블로킹 읽기가 기다리는 동안에도 미확인·밀린 건수 조회는 바로 답한다`() {
         val reader = source()
         reader.ensureGroup()
         val blocking = thread { reader.readNew(10, Duration.ofSeconds(3)) }
         Thread.sleep(300)
         val started = System.nanoTime()
         reader.unacknowledgedCount()
+        reader.lag()                                  // 헬스는 밀린 건수도 함께 묻는다
         val elapsed = Duration.ofNanos(System.nanoTime() - started)
         blocking.join()
         assertTrue(elapsed < Duration.ofSeconds(1), "헬스가 블로킹 읽기에 묶였다: $elapsed")

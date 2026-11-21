@@ -2,21 +2,27 @@ package xyz.junproject.observe.collect
 
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Test
+import xyz.junproject.observe.log.RetentionResult
 import java.time.Duration
 import java.time.Instant
 
-/** 명세 ②: /health — 마지막으로 저장한 로그의 시각, 아직 확인하지 못한 건수. DB 나 Redis 에 닿지 못하면 503. */
+/** 명세 ②: /health — 마지막으로 저장한 로그의 시각, 아직 확인하지 못한 건수. DB 나 Redis 에 닿지 못하면 503. 200 은 ok 하나뿐. */
 class CollectorHealthTest {
     private val stream = FakeLogStream()
     private val sink = FakeLogSink()
     private val startedAt = Instant.parse("2026-11-21T00:00:00Z")
     private var now = startedAt
     private var databaseReachable = true
+    private var latestInDatabase: Instant? = null
+    private var lag: () -> Long? = { 0L }
+    private var retention: RetentionResult? = null
     private val collector = LogCollector(stream, sink, block = Duration.ZERO, clock = { now })
     private val health = CollectorHealth(
         collector,
         unacknowledged = { stream.unacknowledgedCount() },
-        databaseCheck = { if (!databaseReachable) throw IllegalStateException("DB 에 닿지 못함") },
+        lag = { lag() },
+        latestStoredAt = { if (!databaseReachable) throw IllegalStateException("DB 에 닿지 못함 jdbc:postgresql://postgres:5432") else latestInDatabase },
+        lastRetention = { retention },
         startedAt = startedAt,
     )
 
@@ -26,6 +32,7 @@ class CollectorHealthTest {
     fun `방금 한 바퀴를 돌았으면 200 이고 마지막 저장 시각과 미확인 건수를 보인다`() {
         stream.add(StreamRecord("1763700000123-0", "info", "req-1:backend:x"))
         collector.runOnce()
+        latestInDatabase = Instant.ofEpochMilli(1_763_700_000_123)
         val (status, body) = check()
         assertEquals(200, status)
         assertEquals("ok", body["status"])
@@ -58,11 +65,39 @@ class CollectorHealthTest {
     }
 
     @Test
-    fun `첫 바퀴 전에는 starting 이지만 1분이 지나도 못 돌면 503`() {
+    fun `첫 바퀴가 성공하기 전에는 starting 이어도 503 이고 1분이 지나면 stalled`() {
+        // 배포의 헬스 게이트는 첫 200 에서 통과한다 — 한 번도 수집하지 못한 자리를 통과시키지 않게 첫 성공 전에는 503
         stream.ensureGroup()
-        assertEquals(200 to "starting", check().let { it.first to it.second["status"] })
+        assertEquals(503 to "starting", check().let { it.first to it.second["status"] })
         now = startedAt.plusSeconds(120)
+        assertEquals(503 to "stalled", check().let { it.first to it.second["status"] })
+    }
+
+    @Test
+    fun `첫 바퀴가 성공하면 그때부터 200`() {
         assertEquals(503, check().first)
+        collector.runOnce()
+        assertEquals(200 to "ok", check().let { it.first to it.second["status"] })
+    }
+
+    @Test
+    fun `헬스 본문에는 예외 문구 없이 종류 이름만 낸다`() {
+        // 헬스는 인증이 없다 — 접속 주소·SQL 같은 예외 문구는 서버 로그에만 남긴다
+        collector.runOnce()
+        databaseReachable = false
+        val (status, body) = check()
+        assertEquals(503, status)
+        assertEquals("database IllegalStateException", body["failure"])
+    }
+
+    @Test
+    fun `수집 바퀴의 실패 사유도 종류 이름만 낸다`() {
+        stream.add(StreamRecord("1-0", "info", "a"))
+        sink.failing = true
+        collector.runOnce()
+        val (status, body) = check()
+        assertEquals(503 to "failing", status to body["status"])
+        assertEquals("IllegalStateException", body["failure"])
     }
 
     @Test
@@ -70,5 +105,73 @@ class CollectorHealthTest {
         collector.runOnce()
         now = now.plusSeconds(120)
         assertEquals(503 to "stalled", check().let { it.first to it.second["status"] })
+    }
+
+    @Test
+    fun `마지막 저장 시각은 DB 에서 읽어 재시작 직후 이 프로세스가 아무것도 저장하지 않았어도 보인다`() {
+        latestInDatabase = Instant.parse("2026-11-20T23:59:59.500Z")    // 앞 프로세스(또는 다른 자리)가 저장한 행
+        collector.runOnce()                                            // 스트림이 조용하다 — 이 프로세스는 아무것도 저장하지 않았다
+        val (status, body) = check()
+        assertEquals(200, status)
+        assertEquals(0L, body["stored_since_start"])
+        assertEquals("2026-11-20T23:59:59.500Z", body["last_stored_at"])
+    }
+
+    @Test
+    fun `표가 비었으면 마지막 저장 시각은 빈 문자열이고 그것만으로 503 이 되지 않는다`() {
+        collector.runOnce()
+        assertEquals(200 to "", check().let { it.first to it.second["last_stored_at"] })
+    }
+
+    @Test
+    fun `밀린 건수를 보이되 판정에는 넣지 않고 읽지 못하면 -1`() {
+        collector.runOnce()
+        lag = { 9_000L }
+        assertEquals(200 to 9_000L, check().let { it.first to it.second["lag"] })
+        lag = { null }                                                   // Redis 가 셀 수 없다고 했다
+        assertEquals(200 to -1L, check().let { it.first to it.second["lag"] })
+        lag = { throw IllegalStateException("ERR unknown subcommand") }
+        assertEquals(200 to -1L, check().let { it.first to it.second["lag"] })
+    }
+
+    @Test
+    fun `30일 삭제의 마지막 실행 시각과 결과를 보이되 실패해도 판정에는 넣지 않는다`() {
+        collector.runOnce()
+        check().second.let {
+            assertEquals("", it["last_retention_at"])
+            assertEquals(-1, it["last_retention_deleted"])
+            assertEquals("", it["last_retention_failure"])
+        }
+        retention = RetentionResult(Instant.parse("2026-11-21T03:40:00Z"), 812, null)
+        check().second.let {
+            assertEquals("2026-11-21T03:40:00Z", it["last_retention_at"])
+            assertEquals(812, it["last_retention_deleted"])
+            assertEquals("", it["last_retention_failure"])
+        }
+        retention = RetentionResult(Instant.parse("2026-11-22T03:40:00Z"), null, "QueryTimeoutException")
+        val (status, body) = check()
+        assertEquals(200, status)
+        assertEquals("2026-11-22T03:40:00Z", body["last_retention_at"])
+        assertEquals(-1, body["last_retention_deleted"])
+        assertEquals("QueryTimeoutException", body["last_retention_failure"])
+    }
+
+    @Test
+    fun `스키마를 만들지 못하면 503 failing 이고 사유에 schema 가 남는다`() {
+        sink.schemaFailing = true
+        collector.runOnce()
+        val (status, body) = check()
+        assertEquals(503 to "failing", status to body["status"])
+        assertEquals("schema IllegalStateException", body["failure"])
+    }
+
+    @Test
+    fun `DB 확인 결과를 담아 두지 않아 끊긴 다음 요청에서 바로 503 이고 이어지면 바로 200`() {
+        collector.runOnce()
+        assertEquals(200, check().first)
+        databaseReachable = false
+        assertEquals(503 to "unreachable", check().let { it.first to it.second["status"] })
+        databaseReachable = true
+        assertEquals(200, check().first)
     }
 }

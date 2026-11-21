@@ -29,8 +29,8 @@ object EngineSupport {
         jdbcUrl = databaseUrl; username = databaseUser; password = databasePassword; maximumPoolSize = size
     })
 
-    /** 수집·조회 풀을 나누지 않은 단순 저장소 — 저장소 동작만 볼 때 */
-    fun store(dataSource: HikariDataSource): LogStore = LogStore(JdbcTemplate(dataSource), JdbcTemplate(dataSource))
+    /** 수집·조회·헬스 풀을 나누지 않은 단순 저장소 — 저장소 동작만 볼 때 */
+    fun store(dataSource: HikariDataSource): LogStore = JdbcTemplate(dataSource).let { LogStore(it, it, it) }
 
     fun resetTable(dataSource: HikariDataSource) {
         store(dataSource).createSchema()

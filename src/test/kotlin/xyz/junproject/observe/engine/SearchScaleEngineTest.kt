@@ -1,5 +1,6 @@
 package xyz.junproject.observe.engine
 
+import com.zaxxer.hikari.HikariConfig
 import com.zaxxer.hikari.HikariDataSource
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Assertions.*
@@ -9,7 +10,13 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
 import org.springframework.jdbc.core.JdbcTemplate
 import org.springframework.jdbc.core.RowMapper
+import org.springframework.mock.web.MockHttpServletRequest
 import xyz.junproject.observe.ObserveConfiguration
+import xyz.junproject.observe.api.LogController
+import xyz.junproject.observe.collect.CollectorHealth
+import xyz.junproject.observe.collect.FakeLogSink
+import xyz.junproject.observe.collect.FakeLogStream
+import xyz.junproject.observe.collect.LogCollector
 import xyz.junproject.observe.log.LogEntry
 import xyz.junproject.observe.log.LogQuery
 import xyz.junproject.observe.log.LogStore
@@ -42,7 +49,7 @@ class SearchScaleEngineTest {
         }
     }
     private val capturing = CapturingJdbcTemplate(dataSource)
-    private val explainingStore = LogStore(JdbcTemplate(dataSource), capturing)
+    private val explainingStore = LogStore(JdbcTemplate(dataSource), capturing, JdbcTemplate(dataSource))
     /** 운영과 같은 조립(풀 둘, statement_timeout) */
     private val configuredStore = ObserveConfiguration().logStore(EngineSupport.databaseUrl, EngineSupport.databaseUser, EngineSupport.databasePassword)
 
@@ -131,11 +138,12 @@ class SearchScaleEngineTest {
     }
 
     @Test
-    fun `두 글자 검색어의 시간을 잰다`() {
-        // 명세는 q 를 2자 이상으로 열어 두었다 — trigram 은 세 글자 단위라 두 글자는 인덱스로 좁히지 못한다. 기록용으로 잰다.
+    fun `두 글자 검색어는 3초 안에 끝난다`() {
+        // 명세는 q 를 2자 이상으로 열어 두었다 — trigram 은 세 글자 단위라 두 글자는 인덱스로 좁히지 못하고, 드문 말이면 표 전체를 훑는다.
+        // 가정 2 판정(11-21): 3자 이상은 1초 안, 2자는 1초 안팎(실측 0.45~1.0초)을 받아들인다. 상한은 그 3배.
         for (text in listOf("ms", "zq")) {
             val measured = measure(text)
-            assertTrue(measured.milliseconds.max() < 10_000, "조회 statement_timeout(10초) 안에 끝나야 한다: ${measured.milliseconds}")
+            assertTrue(measured.milliseconds.max() < 3_000, "${measured.milliseconds}")
         }
     }
 
@@ -143,10 +151,16 @@ class SearchScaleEngineTest {
     fun `무거운 조회가 몰려도 저장은 밀리지 않는다`() {
         val running = AtomicBoolean(true)
         val searches = AtomicInteger()
+        val searchFailures = AtomicInteger()
         val heavy = LogQuery(monthAgo, now, text = "zq", limit = 500)       // 인덱스로 좁히지 못하는 큰 기간 조회
         val searchers = (1..8).map {
             thread(name = "observe-test-search-$it") {
-                while (running.get()) { runCatching { configuredStore.search(heavy) }; searches.incrementAndGet() }
+                // 성공한 조회만 센다 — 실패(연결 대기 초과 등)를 세면 조회가 몰리지 않았는데도 몰린 것처럼 보인다
+                while (running.get()) {
+                    runCatching { configuredStore.search(heavy) }
+                        .onSuccess { searches.incrementAndGet() }
+                        .onFailure { searchFailures.incrementAndGet(); println("observe-test search failed: $it") }
+                }
             }
         }
         // 저장이 실패해 예외로 빠져도 조회 스레드를 멈춘다 — 남아 돌면 뒤 테스트의 시간을 흐린다
@@ -161,8 +175,68 @@ class SearchScaleEngineTest {
             running.set(false)
             searchers.forEach { it.join(30_000) }
         }
-        println("observe-test ingest latency under 8 heavy searchers: max=${latencies.max()} ms median=${latencies.sorted()[20]} ms, searches done=${searches.get()}")
+        println("observe-test ingest latency under 8 heavy searchers: max=${latencies.max()} ms median=${latencies.sorted()[20]} ms, searches done=${searches.get()} failed=${searchFailures.get()}")
+        assertEquals(0, searchFailures.get(), "조회가 실패했다 — 성공한 조회로만 몰림을 본다")
         assertTrue(searches.get() >= 8, "조회가 실제로 몰리지 않았다")
         assertTrue(latencies.max() < 300, "조회가 저장을 밀었다: $latencies")
+    }
+
+    @Test
+    fun `헬스 요청이 몰려도 저장은 밀리지 않는다`() {
+        // 헬스는 인증이 없다 — 마구 불려도 헬스 전용 풀(1개)끼리만 기다리고 수집 풀은 비어 있어야 한다
+        val running = AtomicBoolean(true)
+        val checks = AtomicInteger()
+        val checkers = (1..16).map {
+            thread(name = "observe-test-health-$it") {
+                while (running.get()) { runCatching { configuredStore.latestStoredAt() }.onSuccess { checks.incrementAndGet() } }
+            }
+        }
+        val latencies = try {
+            Thread.sleep(300)
+            (1..40).map { index ->
+                val started = System.nanoTime()
+                configuredStore.insertAll(listOf(LogEntry(StreamId(now.toEpochMilli() + 1_000 + index, 2), "info", "backend", "req-ingest", "health flood $index")))
+                Duration.ofNanos(System.nanoTime() - started).toMillis().also { Thread.sleep(20) }
+            }
+        } finally {
+            running.set(false)
+            checkers.forEach { it.join(10_000) }
+        }
+        println("observe-test ingest latency under 16 health checkers: max=${latencies.max()} ms median=${latencies.sorted()[20]} ms, checks done=${checks.get()}")
+        assertTrue(checks.get() >= 16, "헬스 요청이 실제로 몰리지 않았다")
+        assertTrue(latencies.max() < 300, "헬스 요청이 저장을 밀었다: $latencies")
+    }
+
+    @Test
+    fun `실제 PostgreSQL 의 statement_timeout 은 504 query_timeout, 닿지 못하면 503 query_failed 로 나간다`() {
+        // 조회 풀의 statement_timeout 을 1ms 로 줄여 실제로 끊기게 한다 — PgJDBC 가 무엇을 던지고 스프링이 무엇으로 바꾸는지 본다
+        val impatient = HikariDataSource(HikariConfig().apply {
+            jdbcUrl = EngineSupport.databaseUrl; username = EngineSupport.databaseUser; password = EngineSupport.databasePassword
+            maximumPoolSize = 1; connectionInitSql = "SET statement_timeout = 1"
+        })
+        val closed = EngineSupport.dataSource(size = 1).also { it.close() }
+        try {
+            val timeoutStore = LogStore(JdbcTemplate(dataSource), JdbcTemplate(impatient), JdbcTemplate(dataSource))
+            val thrown = runCatching { timeoutStore.search(LogQuery(monthAgo, now, text = "zq")) }.exceptionOrNull()
+            println("observe-test statement_timeout raised: ${thrown?.javaClass?.name} cause=${thrown?.cause?.javaClass?.name} " +
+                "sqlState=${(thrown?.cause as? java.sql.SQLException)?.sqlState}")
+            assertNotNull(thrown, "1ms 에 끊기지 않았다")
+
+            fun answer(store: LogStore): org.springframework.http.ResponseEntity<out Any> {
+                val stream = FakeLogStream().also { it.ensureGroup() }
+                val controller = LogController(store, CollectorHealth(LogCollector(stream, FakeLogSink()), { 0 }, { 0L }, { null }, { null }), "secret")
+                return controller.logs(MockHttpServletRequest().apply { addHeader("X-Observe-Secret", "secret") },
+                    monthAgo.toString(), now.toString(), null, null, null, "zq", null, null, now)
+            }
+            val timedOut = answer(timeoutStore)
+            assertEquals(504, timedOut.statusCode.value())
+            assertEquals(mapOf("success" to false, "error" to mapOf("code" to "query_timeout")), timedOut.body)
+
+            val unreachable = answer(LogStore(JdbcTemplate(dataSource), JdbcTemplate(closed), JdbcTemplate(dataSource)))
+            assertEquals(503, unreachable.statusCode.value())
+            assertEquals(mapOf("success" to false, "error" to mapOf("code" to "query_failed")), unreachable.body)
+        } finally {
+            impatient.close()
+        }
     }
 }

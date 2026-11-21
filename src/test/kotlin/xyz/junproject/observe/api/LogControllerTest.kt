@@ -2,6 +2,9 @@ package xyz.junproject.observe.api
 
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Test
+import org.springframework.dao.DataAccessResourceFailureException
+import org.springframework.dao.QueryTimeoutException
+import org.springframework.jdbc.UncategorizedSQLException
 import org.springframework.mock.web.MockHttpServletRequest
 import xyz.junproject.observe.collect.CollectorHealth
 import xyz.junproject.observe.collect.FakeLogSink
@@ -12,6 +15,7 @@ import xyz.junproject.observe.log.LogEntry
 import xyz.junproject.observe.log.LogQuery
 import xyz.junproject.observe.log.LogReader
 import xyz.junproject.observe.log.StreamId
+import java.sql.SQLException
 import java.time.Duration
 import java.time.Instant
 
@@ -20,14 +24,14 @@ class LogControllerTest {
     private val now = Instant.parse("2026-11-21T12:00:00Z")
     private val received = mutableListOf<LogQuery>()
     private var answer: (LogQuery) -> List<LogEntry> = { emptyList() }
+    private var statsAnswer: (Instant, Instant) -> List<LogCount> = { from, _ -> listOf(LogCount(from, "backend", "error", 3)) }
     private val reader = object : LogReader {
         override fun search(query: LogQuery): List<LogEntry> { received += query; return answer(query) }
-        override fun stats(from: Instant, to: Instant): List<LogCount> =
-            listOf(LogCount(from, "backend", "error", 3))
+        override fun stats(from: Instant, to: Instant): List<LogCount> = statsAnswer(from, to)
     }
     private val stream = FakeLogStream().also { it.ensureGroup() }
     private val collector = LogCollector(stream, FakeLogSink(), block = Duration.ZERO)
-    private val health = CollectorHealth(collector, { stream.unacknowledgedCount() }, {})
+    private val health = CollectorHealth(collector, { stream.unacknowledgedCount() }, { 0L }, { null }, { null })
     private val controller = LogController(reader, health, "the-secret")
 
     private fun request(secret: String? = "the-secret") = MockHttpServletRequest().apply { if (secret != null) addHeader("X-Observe-Secret", secret) }
@@ -95,10 +99,61 @@ class LogControllerTest {
 
     @Test
     fun `커서가 응답의 꼴이 아니면 422`() {
-        for (cursor in listOf("abc", "123", "1-2-3", "1763700000123-x")) assertEquals(422, logs(before = cursor).statusCode.value(), cursor)
+        // 기간을 함께 넘겨 커서의 꼴만 보게 한다 — 기간 없이 커서만 넘기면 그것만으로 422 다(아래 테스트)
+        val from = "2026-11-21T10:00:00Z"
+        val to = "2026-11-21T11:00:00Z"
+        for (cursor in listOf("abc", "123", "1-2-3", "1763700000123-x")) assertEquals(422, logs(before = cursor, from = from, to = to).statusCode.value(), cursor)
         assertTrue(received.isEmpty())
-        assertEquals(200, logs(before = "1763700000123-4").statusCode.value())
+        assertEquals(200, logs(before = "1763700000123-4", from = from, to = to).statusCode.value())
         assertEquals(StreamId(1_763_700_000_123, 4), received.single().before)
+    }
+
+    @Test
+    fun `커서만 넘기고 from·to 를 둘 다 빼면 422 이고 조회하지 않는다`() {
+        // 쪽마다 "지금부터 1시간"을 다시 세면 창의 오래된 끝이 밀려 그 사이 로그가 조용히 빠진다 — 응답의 from·to 를 함께 받는다
+        val response = logs(before = "1763700000123-4")
+        assertEquals(422, response.statusCode.value())
+        @Suppress("UNCHECKED_CAST")
+        val error = (response.body as Map<String, Any>)["error"] as Map<String, Any>
+        assertEquals("이어 보려면 응답의 from·to 를 함께 넘긴다", error["detail"])
+        assertTrue(received.isEmpty())
+        // 한쪽만 있어도 창의 오래된 끝이 고정되므로 받는다
+        assertEquals(200, logs(before = "1763700000123-4", from = "2026-11-21T10:00:00Z").statusCode.value())
+        assertEquals(200, logs(before = "1763700000123-4", to = "2026-11-21T11:00:00Z").statusCode.value())
+    }
+
+    private val failedQuery = mapOf("success" to false, "error" to mapOf("code" to "query_failed"))
+    private val timedOutQuery = mapOf("success" to false, "error" to mapOf("code" to "query_timeout"))
+
+    @Test
+    fun `조회가 statement_timeout 으로 끊기면 504 query_timeout 이고 예외 문구를 내지 않는다`() {
+        answer = { throw QueryTimeoutException("canceling statement due to statement timeout — 내부 문구") }
+        val response = logs()
+        assertEquals(504, response.statusCode.value())
+        assertEquals(timedOutQuery, response.body)
+    }
+
+    @Test
+    fun `SQLSTATE 57014 로 끊긴 조회도 504 query_timeout 이다`() {
+        // 번역기가 QueryTimeoutException 이 아닌 다른 종류로 감싸도 원인의 SQLSTATE 로 알아본다
+        answer = { throw UncategorizedSQLException("search", "SELECT 내부 문장", SQLException("canceling statement due to statement timeout", "57014")) }
+        assertEquals(504, logs().statusCode.value())
+        statsAnswer = { _, _ -> throw QueryTimeoutException("내부 문구") }
+        val stats = controller.stats(request(), null, null, now)
+        assertEquals(504, stats.statusCode.value())
+        assertEquals(timedOutQuery, stats.body)
+    }
+
+    @Test
+    fun `조회 중 DB 오류면 503 query_failed 이고 예외 문구를 내지 않는다`() {
+        answer = { throw DataAccessResourceFailureException("Connection to postgres:5432 refused — 내부 문구") }
+        val response = logs()
+        assertEquals(503, response.statusCode.value())
+        assertEquals(failedQuery, response.body)
+        statsAnswer = { _, _ -> throw DataAccessResourceFailureException("내부 문구") }
+        val stats = controller.stats(request(), null, null, now)
+        assertEquals(503, stats.statusCode.value())
+        assertEquals(failedQuery, stats.body)
     }
 
     @Test

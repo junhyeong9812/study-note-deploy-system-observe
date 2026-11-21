@@ -38,17 +38,42 @@ class LogCollector(
     private val clock: () -> Instant = Instant::now,
 ) {
     private val log = LoggerFactory.getLogger("observe")
+    private var schemaReady = false
     private var groupReady = false
     private var lastUnacknowledgedCheck: Instant? = null
+    private var lastFailureDetail: String? = null                  // 같은 실패를 바퀴마다 되풀이해 로그에 남기지 않으려고
 
     @Volatile var lastLoopAt: Instant? = null; private set          // 마지막으로 한 바퀴를 끝까지 돈 시각(읽을 것이 없었어도)
-    @Volatile var lastStoredAt: Instant? = null; private set        // 마지막으로 저장한 로그의 시각(로그가 찍힌 시각)
-    @Volatile var lastFailure: String? = null; private set          // 마지막 바퀴가 실패했으면 그 이유, 성공했으면 null
+    // 마지막 바퀴가 실패했으면 그 예외의 종류 이름(스키마 단계면 앞에 "schema "), 성공했으면 null.
+    // 인증 없는 헬스에 그대로 나가므로 예외 문구(접속 주소·SQL)는 담지 않는다 — 문구는 서버 로그에만.
+    @Volatile var lastFailure: String? = null; private set
     @Volatile var storedTotal: Long = 0; private set
 
     /** 한 바퀴. 처리한(저장하고 확인한) 항목 수를 돌려준다. 실패하면 예외 없이 0 을 돌려주고 이유를 남긴다. */
-    fun runOnce(): Int = try {
-        if (!groupReady) { source.ensureGroup(); groupReady = true }
+    fun runOnce(): Int {
+        var step = "collect"
+        return try {
+            // 그룹을 먼저 — 그룹이 없으면 헬스의 미확인 건수 조회가 NOGROUP 으로 실패해 스키마 실패가 "Redis 불통"으로 가려진다
+            if (!groupReady) { source.ensureGroup(); groupReady = true }
+            // 스키마는 DB 에 처음 닿았을 때 만든다 — DB 가 늦게 떠도 이 바퀴가 실패로 남기고 다음 바퀴에 다시 시도한다
+            if (!schemaReady) { step = "schema"; sink.createSchema(); schemaReady = true; step = "collect"; log.info("observe:observe:schema ready") }
+            collect()
+        } catch (error: Exception) {
+            // 저장 실패든 Redis 불통이든 확인하지 않고 물러난다 — 미확인분 재확인을 다음 바퀴에 다시 하게 한다.
+            // 그룹도 다시 확인한다 — Redis 는 디스크에 저장하지 않아 재시작하면 스트림과 그룹이 함께 사라지는데,
+            // 그룹을 다시 만들지 않으면 NOGROUP 만 되풀이하며 수집이 영영 멈춘다.
+            lastUnacknowledgedCheck = null
+            groupReady = false
+            val kind = error.javaClass.simpleName
+            val detail = "$step $kind: ${error.message?.take(200)}"
+            if (detail != lastFailureDetail) log.error("observe:observe:collect failed — will retry: {}", detail)
+            lastFailureDetail = detail
+            lastFailure = if (step == "schema") "schema $kind" else kind
+            0
+        }
+    }
+
+    private fun collect(): Int {
         val now = clock()
         var handled = 0
         // 미확인분부터 — 기동 직후, 그리고 주기적으로(다른 인스턴스가 저장하다 죽으며 남긴 것을 거둔다)
@@ -64,17 +89,8 @@ class LogCollector(
         handled += storeAndAcknowledge(source.readNew(batchSize, block))
         lastLoopAt = clock()
         lastFailure = null
-        handled
-    } catch (error: Exception) {
-        // 저장 실패든 Redis 불통이든 확인하지 않고 물러난다 — 미확인분 재확인을 다음 바퀴에 다시 하게 한다.
-        // 그룹도 다시 확인한다 — Redis 는 디스크에 저장하지 않아 재시작하면 스트림과 그룹이 함께 사라지는데,
-        // 그룹을 다시 만들지 않으면 NOGROUP 만 되풀이하며 수집이 영영 멈춘다.
-        lastUnacknowledgedCheck = null
-        groupReady = false
-        val reason = "${error.javaClass.simpleName}: ${error.message?.take(200)}"
-        if (reason != lastFailure) log.error("observe:observe:collect failed — will retry: {}", reason)
-        lastFailure = reason
-        0
+        lastFailureDetail = null
+        return handled
     }
 
     private fun storeAndAcknowledge(records: List<StreamRecord>): Int {
@@ -92,7 +108,6 @@ class LogCollector(
         sink.insertAll(entries)                       // 실패하면 예외 → 아래 확인을 하지 않는다
         source.acknowledge(records.map { it.id })     // 읽을 수 없는 ID 의 항목도 함께 확인한다(영원히 미확인으로 남지 않게)
         storedTotal += entries.size
-        entries.maxByOrNull { it.id }?.let { lastStoredAt = it.id.at }
         return records.size
     }
 }

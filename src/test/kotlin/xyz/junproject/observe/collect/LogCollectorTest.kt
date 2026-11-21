@@ -110,10 +110,27 @@ class LogCollectorTest {
     }
 
     @Test
-    fun `마지막으로 저장한 로그의 시각은 스트림 ID 의 밀리초다`() {
+    fun `저장한 건수를 센다`() {
+        // 마지막 저장 시각은 헬스가 DB 에서 읽는다(재시작 직후에도 보이게) — 수집기는 이 프로세스가 저장한 건수만 센다
         stream.add(record(1_763_700_000_123), record(1_763_700_000_999))
         collector.runOnce()
-        assertEquals(Instant.ofEpochMilli(1_763_700_000_999), collector.lastStoredAt)
         assertEquals(2, collector.storedTotal)
+    }
+
+    @Test
+    fun `스키마를 만들지 못하면 그 바퀴는 읽지도 확인하지도 않고 실패 사유에 schema 를 남긴다`() {
+        stream.add(record(1_000))
+        sink.schemaFailing = true
+        assertEquals(0, collector.runOnce())
+        assertEquals("schema IllegalStateException", collector.lastFailure)
+        assertNull(collector.lastLoopAt, "스키마 없이 바퀴가 성공한 것으로 보였다")
+        assertFalse(events.any { it.startsWith("ack") || it.startsWith("insert") }, "$events")
+
+        sink.schemaFailing = false
+        assertEquals(1, collector.runOnce())
+        assertNull(collector.lastFailure)
+        assertEquals(1, sink.schemaCreations)
+        collector.runOnce()
+        assertEquals(1, sink.schemaCreations, "성공한 뒤에도 바퀴마다 스키마를 다시 만든다")
     }
 }

@@ -49,10 +49,17 @@ class FakeLogStream(private val events: MutableList<String> = mutableListOf()) :
     override fun unacknowledgedCount(): Long { requireUsable(); return pending.size.toLong() }
 }
 
-/** 메모리 저장소 — 같은 스트림 ID 는 한 번만 남긴다(기본 키 흉내). [failing] 이면 저장이 예외로 실패한다. */
+/** 메모리 저장소 — 같은 스트림 ID 는 한 번만 남긴다(기본 키 흉내). [failing] 이면 저장이, [schemaFailing] 이면 스키마 생성이 예외로 실패한다. */
 class FakeLogSink(private val events: MutableList<String> = mutableListOf()) : LogSink {
     val stored = LinkedHashMap<StreamId, LogEntry>()
     var failing = false
+    var schemaFailing = false
+    var schemaCreations = 0
+
+    override fun createSchema() {
+        if (schemaFailing) throw IllegalStateException("permission denied to create extension pg_trgm")
+        schemaCreations++
+    }
 
     override fun insertAll(entries: List<LogEntry>): Int {
         if (failing) { events += "insert-failed"; throw IllegalStateException("DB 에 닿지 못함") }

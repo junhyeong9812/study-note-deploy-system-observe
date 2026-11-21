@@ -7,6 +7,7 @@ import org.springframework.scheduling.annotation.Scheduled
 import org.springframework.stereotype.Component
 import xyz.junproject.observe.collect.LogCollector
 import xyz.junproject.observe.log.LogStore
+import xyz.junproject.observe.log.RetentionResult
 import java.time.Duration
 import java.time.Instant
 
@@ -15,16 +16,17 @@ import java.time.Instant
 class ObserveSchedule(private val collector: LogCollector, private val store: LogStore) {
     private val log = LoggerFactory.getLogger("observe")
     @Volatile private var running = true
-    private var schemaReady = false
     private lateinit var thread: Thread
+
+    /** 마지막 30일 삭제의 결과(헬스 본문용) — 뜬 뒤 아직 한 번도 돌지 않았으면 null. 삭제가 조용히 실패해 쌓이는 것을 보이게 한다. */
+    val lastRetention: RetentionResult? get() = retention
+    @Volatile private var retention: RetentionResult? = null      // 스프링이 이 클래스를 open 으로 만들어 private set 을 쓸 수 없다
 
     @PostConstruct
     fun start() {
         thread = Thread({
             while (running) {
                 try {
-                    // 스키마는 DB 에 처음 닿았을 때 만든다 — DB 가 늦게 떠도 이 루프가 기다렸다 이어 간다
-                    if (!schemaReady) { store.createSchema(); schemaReady = true; log.info("observe:observe:schema ready") }
                     val handled = collector.runOnce()
                     if (collector.lastFailure != null) Thread.sleep(FAILURE_PAUSE_MS)   // 실패가 이어질 때 헛돌지 않게
                     else if (handled == 0) Thread.sleep(IDLE_PAUSE_MS)                  // 읽기가 이미 2초를 기다렸다 — 숨만 고른다
@@ -51,8 +53,14 @@ class ObserveSchedule(private val collector: LogCollector, private val store: Lo
     /** [now] 기준 [RETENTION] 보다 오래된 로그를 지운다 — 기준 시각의 경계를 테스트가 시계를 정해 확인할 수 있게 나눴다 */
     internal fun deleteOldLogs(now: Instant): Int? =
         runCatching { store.deleteOlderThan(now.minus(RETENTION)) }
-            .onSuccess { log.info("observe:observe:deleted {} logs older than {} days", it, RETENTION.toDays()) }
-            .onFailure { log.error("observe:observe:retention failed: {}: {}", it.javaClass.simpleName, it.message?.take(200)) }
+            .onSuccess {
+                log.info("observe:observe:deleted {} logs older than {} days", it, RETENTION.toDays())
+                retention = RetentionResult(now, it, null)
+            }
+            .onFailure {
+                log.error("observe:observe:retention failed: {}: {}", it.javaClass.simpleName, it.message?.take(200))
+                retention = RetentionResult(now, null, it.javaClass.simpleName)   // 문구는 위 로그에만 — 헬스는 인증이 없다
+            }
             .getOrNull()
 
     companion object {

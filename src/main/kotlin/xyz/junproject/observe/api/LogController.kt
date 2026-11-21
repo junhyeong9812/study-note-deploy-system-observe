@@ -1,16 +1,21 @@
 package xyz.junproject.observe.api
 
 import jakarta.servlet.http.HttpServletRequest
+import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Value
+import org.springframework.dao.DataAccessException
+import org.springframework.dao.QueryTimeoutException
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.GetMapping
 import org.springframework.web.bind.annotation.RequestParam
 import org.springframework.web.bind.annotation.RestController
 import xyz.junproject.observe.collect.CollectorHealth
+import xyz.junproject.observe.log.LogEntry
 import xyz.junproject.observe.log.LogQuery
 import xyz.junproject.observe.log.LogReader
 import xyz.junproject.observe.log.StreamId
 import java.security.MessageDigest
+import java.sql.SQLException
 import java.time.Duration
 import java.time.Instant
 import java.time.format.DateTimeParseException
@@ -22,6 +27,8 @@ class LogController(
     private val health: CollectorHealth,
     @Value("\${observe.secret:}") private val secret: String,
 ) {
+    private val log = LoggerFactory.getLogger("observe")
+
     private fun authorized(request: HttpServletRequest): Boolean {
         val provided = request.getHeader("X-Observe-Secret") ?: return false
         // 설정이 비어 있으면 항상 거절(fail-closed), 비교는 상수 시간
@@ -33,6 +40,20 @@ class LogController(
         ResponseEntity.status(422).body(mapOf("success" to false, "error" to mapOf("code" to "invalid_request", "detail" to detail)))
 
     private class Invalid(val detail: String) : RuntimeException(detail)
+
+    /**
+     * 조회 중 DB 오류를 정해진 꼴로 — 시간 초과(statement_timeout, SQLSTATE 57014)는 504 `query_timeout`, 그 밖은 503 `query_failed`.
+     * 예외 문구(SQL·접속 주소)는 응답에 넣지 않고 서버 로그에만 남긴다.
+     */
+    private fun answering(what: String, block: () -> ResponseEntity<out Any>): ResponseEntity<out Any> = try {
+        block()
+    } catch (error: DataAccessException) {
+        val timedOut = error is QueryTimeoutException ||
+            generateSequence<Throwable>(error) { it.cause }.any { it is SQLException && it.sqlState == QUERY_CANCELED }
+        log.error("observe:observe:{} failed{}: {}: {}", what, if (timedOut) " (timeout)" else "", error.javaClass.simpleName, error.message?.take(500))
+        val (status, code) = if (timedOut) 504 to "query_timeout" else 503 to "query_failed"
+        ResponseEntity.status(status).body(mapOf("success" to false, "error" to mapOf("code" to code)))
+    }
 
     private fun instant(name: String, text: String?): Instant? =
         try { text?.takeIf { it.isNotBlank() }?.let(Instant::parse) } catch (_: DateTimeParseException) { throw Invalid("$name 은 ISO 시각이어야 한다(예: 2026-11-21T00:00:00Z)") }
@@ -47,8 +68,9 @@ class LogController(
     }
 
     /**
-     * 로그 조회 — 최신순. 다음 쪽은 응답의 `next_before` 를 `before` 로 넘긴다(없으면 끝).
-     * 기간을 주지 않으면 최근 1시간.
+     * 로그 조회 — 최신순. 기간을 주지 않으면 최근 1시간.
+     * 이어 보기: 다음 쪽은 응답의 `next_before` 를 `before` 로, **응답의 `from`·`to` 를 그대로 함께** 넘긴다(`next_before` 가 비면 끝).
+     * 기간 없이 `before` 만 넘기면 422 — 쪽마다 "지금부터 1시간"을 다시 세면 창의 오래된 끝이 밀려 그 사이 로그가 조용히 빠진다.
      */
     @GetMapping("/logs")
     fun logs(
@@ -67,6 +89,7 @@ class LogController(
                       q: String?, before: String?, limit: String?, now: Instant): ResponseEntity<out Any> {
         if (!authorized(request)) return unauthorized()
         val query = try {
+            if (!before.isNullOrBlank() && from.isNullOrBlank() && to.isNullOrBlank()) throw Invalid("이어 보려면 응답의 from·to 를 함께 넘긴다")
             val (start, end) = range(from, to, Duration.ofHours(1), MAX_RANGE, now)
             LogQuery(
                 from = start, to = end,
@@ -81,7 +104,10 @@ class LogController(
                 limit = (limit?.takeIf { it.isNotBlank() } ?: "100").toIntOrNull()?.takeIf { it in 1..MAX_LIMIT } ?: throw Invalid("limit 은 1~$MAX_LIMIT"),
             )
         } catch (error: Invalid) { return invalid(error.detail) }
-        val entries = reader.search(query)
+        return answering("search") { respond(query, reader.search(query)) }
+    }
+
+    private fun respond(query: LogQuery, entries: List<LogEntry>): ResponseEntity<out Any> {
         val body = mapOf(
             "logs" to entries.map {
                 mapOf("id" to it.id.toString(), "at" to it.id.at.toString(), "level" to it.level, "service" to it.service,
@@ -102,10 +128,12 @@ class LogController(
     internal fun stats(request: HttpServletRequest, from: String?, to: String?, now: Instant): ResponseEntity<out Any> {
         if (!authorized(request)) return unauthorized()
         val (start, end) = try { range(from, to, Duration.ofDays(1), MAX_RANGE, now) } catch (error: Invalid) { return invalid(error.detail) }
-        val counts = reader.stats(start, end).map {
-            mapOf("hour" to it.hour.toString(), "service" to it.service, "level" to it.level, "count" to it.count)
+        return answering("stats") {
+            val counts = reader.stats(start, end).map {
+                mapOf("hour" to it.hour.toString(), "service" to it.service, "level" to it.level, "count" to it.count)
+            }
+            ResponseEntity.ok(mapOf("success" to true, "data" to mapOf("counts" to counts, "from" to start.toString(), "to" to end.toString())))
         }
-        return ResponseEntity.ok(mapOf("success" to true, "data" to mapOf("counts" to counts, "from" to start.toString(), "to" to end.toString())))
     }
 
     /** 수집이 살아 있는가 — 알림 서버와 배포가 본다. */
@@ -117,6 +145,7 @@ class LogController(
 
     companion object {
         const val MAX_LIMIT = 500
+        private const val QUERY_CANCELED = "57014"   // PostgreSQL: statement_timeout 으로 끊김
         val MAX_RANGE: Duration = Duration.ofDays(31)
         val LEVELS = setOf("debug", "info", "warning", "error")
         private val SERVICE = Regex("^[a-z0-9-]{1,40}$")

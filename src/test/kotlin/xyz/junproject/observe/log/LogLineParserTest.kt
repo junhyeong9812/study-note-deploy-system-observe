@@ -70,12 +70,27 @@ class LogLineParserTest {
     }
 
     @Test
-    fun `아주 긴 줄도 버려지지 않고 앞부분이 남는다`() {
+    fun `아주 긴 줄도 자르지 않고 원문 전체가 남는다`() {
+        // 명세 ②: 원문 그대로 — 길이 상한을 두지 않는다
         val content = "가".repeat(200_000) + "끝"
         val entry = LogLineParser.parse(id, "info", "req-1:llm-wrapper:$content")
         assertEquals("llm-wrapper", entry.service)
-        assertTrue(entry.message.isNotEmpty())
-        assertTrue(content.startsWith(entry.message), "앞부분이 원문과 같아야 한다")
+        assertEquals(content, entry.message)
+    }
+
+    @Test
+    fun `나눌 수 없는 아주 긴 줄도 원문 전체가 남는다`() {
+        val line = "형식 아닌 줄 " + "x".repeat(50_000) + " 끝"
+        val entry = LogLineParser.parse(id, "info", line)
+        assertEquals(LogLineParser.UNKNOWN_SERVICE, entry.service)
+        assertEquals(line, entry.message)
+    }
+
+    @Test
+    fun `아주 긴 줄의 NUL 문자도 지워지고 나머지는 전부 남는다`() {
+        val content = "앞".repeat(30_000) + "\u0000" + "뒤".repeat(30_000)
+        val entry = LogLineParser.parse(id, "info", "req-1:backend:$content")
+        assertEquals("앞".repeat(30_000) + "뒤".repeat(30_000), entry.message)
     }
 
     @Test

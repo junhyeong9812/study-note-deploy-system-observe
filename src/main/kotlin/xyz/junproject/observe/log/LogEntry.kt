@@ -31,10 +31,10 @@ data class LogEntry(
 /**
  * 발신 쪽 형식 `<요청ID>:<서비스>:<내용>` 한 줄을 나눈다(네 서비스의 로거가 이 형식으로 보낸다 — 발신 쪽은 바꾸지 않는다).
  * 나눌 수 없는 줄도 버리지 않는다: 서비스 `unknown`, 원문을 내용으로.
+ * 길이는 자르지 않는다 — 명세 ② "원문 그대로". 긴 오류의 뒷부분(원인 예외)이 찾고 싶은 부분인 경우가 많다.
  */
 object LogLineParser {
     const val UNKNOWN_SERVICE = "unknown"
-    const val MESSAGE_LIMIT = 8000
     private val shape = Regex("""^([A-Za-z0-9_.-]{1,80}):([a-z0-9-]{1,40}):(.*)$""", RegexOption.DOT_MATCHES_ALL)
     private val knownLevels = setOf("debug", "info", "warning", "error")
 
@@ -43,9 +43,9 @@ object LogLineParser {
         val match = shape.matchEntire(line)
         val level = (rawLevel ?: "").trim().lowercase().let { if (it in knownLevels) it else if (it == "warn") "warning" else "info" }
         return if (match != null) {
-            LogEntry(id, level, match.groupValues[2], match.groupValues[1], match.groupValues[3].take(MESSAGE_LIMIT))
+            LogEntry(id, level, match.groupValues[2], match.groupValues[1], match.groupValues[3])
         } else {
-            LogEntry(id, level, UNKNOWN_SERVICE, "", line.take(MESSAGE_LIMIT))
+            LogEntry(id, level, UNKNOWN_SERVICE, "", line)
         }
     }
 
