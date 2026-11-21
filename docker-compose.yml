@@ -1,0 +1,69 @@
+# 관측 서버 — 두 자리(blue·green) 중 하나만 뜨고 nginx 가 그쪽으로 보낸다(무중단 배포, ci-cd agent 가 전환).
+# 처음 올릴 때와 수동 조작은 이 저장소 README 의 "구동" 절과 ci-cd 저장소 README 의 "무중단 배포" 절을 따른다.
+# 로그 Redis 는 같은 서버의 다른 compose 프로젝트(backend) 것이다 — 여기에 두지 않고 .env 의 REDIS_URL 로 가리킨다.
+x-observe-environment: &observe-environment
+  # DB 접속은 아래 postgres 와 같은 값(.env 의 POSTGRES_*)으로 조립한다 — .env 에 같은 값을 두 번 적지 않게
+  OBSERVE_DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:?set-in-env}
+  OBSERVE_DB_USER: ${POSTGRES_USER:?set-in-env}
+  OBSERVE_DB_PASSWORD: ${POSTGRES_PASSWORD:?set-in-env}
+
+x-observe: &observe
+  build: .
+  image: observe-app:${IMAGE_TAG:-local}  # ci-cd: CI 가 커밋 태그로 빌드, CD 가 그 태그로 교체
+  env_file: .env                          # 서버 간 비밀값·Redis 주소 — 서버에만 있다(.env.example 참고)
+  depends_on:
+    postgres:
+      condition: service_healthy          # 손으로 올릴 때는 DB 가 받을 수 있게 된 뒤 뜬다. agent 는 --no-deps 로 자리만 띄운다(postgres 를 건드리지 않는다)
+  healthcheck:
+    # localhost 금지 — 컨테이너 안에서 ::1로 풀려 IPv4 바인딩 서버가 unhealthy로 찍힘
+    test: ["CMD-SHELL", "curl -fsS -m 5 http://127.0.0.1:17000/health || exit 1"]
+    interval: 30s
+    timeout: 10s
+    retries: 3
+  restart: unless-stopped
+  stop_grace_period: 30s
+
+services:
+  observe-blue:
+    <<: *observe
+    profiles: ["blue"]           # 이름을 지정해야만 뜬다 — `docker compose up -d` 가 두 자리를 한꺼번에 띄우지 않게
+    container_name: observe-app-blue
+    environment:
+      <<: *observe-environment
+    ports:
+      - "127.0.0.1:17001:17000"    # agent 의 자리별 헬스 확인용
+  observe-green:
+    <<: *observe
+    profiles: ["green"]
+    container_name: observe-app-green
+    environment:
+      <<: *observe-environment
+    ports:
+      - "127.0.0.1:17002:17000"
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: observe-nginx
+    ports:
+      - "${BIND_ADDR:?set-in-env}:17000:17000"   # LAN 에만 연다 — 조회는 어드민이, 헬스는 알림 서버가 부른다
+    volumes:
+      - ./deploy/active:/etc/nginx:ro            # nginx 가 읽는 것은 git 밖의 활성 디렉토리뿐
+    restart: unless-stopped
+
+  # 로그 저장소. profiles 가 없어 이름 없이 `docker compose up -d` 해도 뜬다. 두 자리가 같은 DB 를 본다.
+  postgres:
+    image: postgres:17-alpine
+    container_name: observe-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?set-in-env}
+      POSTGRES_USER: ${POSTGRES_USER:?set-in-env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set-in-env}
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data   # 호스트 볼륨 — 컨테이너를 지워도 로그가 남는다
+    # ports 를 두지 않는다 — LAN 에도 호스트에도 열지 않고, 같은 compose 네트워크의 두 자리만 닿는다
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped

@@ -1,0 +1,6 @@
+.gradle
+build
+.git
+# 서버에만 있는 것 — DB 볼륨(postgres 소유라 읽을 수도 없다)·비밀값은 빌드 컨텍스트에 넣지 않는다
+data
+.env
