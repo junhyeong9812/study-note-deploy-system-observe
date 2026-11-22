@@ -131,6 +131,28 @@ class AuthAttemptHttpEngineTest {
     }
 
     @Test
+    fun `replayed 칸이 null 이면 HTTP 로 422 이고 기록하지 않는다`() {
+        // 세부 4: replayed 칸이 있으면 Boolean 이어야 한다 — 칸이 없을 때만 기본 false
+        val before = recordedAttempts()
+        val withNull = """{"attempt_id":"${UUID.randomUUID()}","at":"2026-11-22T03:00:00Z","credential_ok":false,"ip":"203.0.113.7","user_agent":"http/1","replayed":null}"""
+        assertInvalidRequest(call("POST", "/auth/attempts", withNull), "replayed null")
+        val withNullAndOutcome = """{"attempt_id":"${UUID.randomUUID()}","at":"2026-11-22T03:00:00Z","credential_ok":false,"ip":"203.0.113.7","user_agent":"http/1","replayed":null,"outcome":"failure"}"""
+        assertInvalidRequest(call("POST", "/auth/attempts", withNullAndOutcome), "replayed null + outcome")
+        assertEquals(before, recordedAttempts(), "422 로 거절한 요청이 기록됐다")
+    }
+
+    @Test
+    fun `거절 기록 경로는 계약에 없는 replayed 칸을 무시하고 기록한다`() {
+        val before = recordedAttempts()
+        for (extra in listOf("\"replayed\":true", "\"replayed\":null", "\"outcome\":\"success\"")) {
+            val body = """{"attempt_id":"${UUID.randomUUID()}","at":"2026-11-22T03:00:00Z","reason":"rate_limited","ip":"203.0.113.7","user_agent":"http/1",$extra}"""
+            val response = call("POST", "/auth/attempts/rejected", body)
+            assertEquals(200, response.statusCode(), "$extra ${response.body()}")
+        }
+        assertEquals(before + 3, recordedAttempts())
+    }
+
+    @Test
     fun `맞는 본문과 맞는 비밀값이면 두 POST 경로가 200 — 본문 해석 규칙이 정상 요청을 막지 않는다`() {
         for (path in postPaths) {
             val response = call("POST", path, validBody(path))

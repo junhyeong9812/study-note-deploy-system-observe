@@ -204,6 +204,28 @@ class AuthAttemptControllerTest {
     }
 
     @Test
+    fun `replayed 칸이 있는데 null 이면 422 — 칸이 없을 때만 기본 false`() {
+        // 세부 4: replayed 칸이 있으면 Boolean 이어야 한다
+        assertEquals(422, controller.decide(request(), attemptBody("replayed" to null)).statusCode.value(), "replayed=null")
+        assertEquals(422, controller.decide(request(), attemptBody("replayed" to null, "outcome" to "failure")).statusCode.value(), "replayed=null + outcome")
+        assertTrue(attempts.decided.isEmpty())
+        assertEquals(200, controller.decide(request(), attemptBody()).statusCode.value(), "replayed 칸 없음")
+        assertFalse(attempts.decided.single().replayed)
+    }
+
+    @Test
+    fun `거절 기록에 계약에 없는 칸이 와도 무시하고 기록한다`() {
+        val extras = listOf<Pair<String, Any?>>("replayed" to true, "replayed" to null, "outcome" to "success", "credential_ok" to false, "unknown" to "x")
+        for (extra in extras) {
+            val response = controller.rejected(request(), rejectedBody(extra))
+            assertEquals(200, response.statusCode.value(), "${extra.first}=${extra.second} ${response.body}")
+            assertEquals("rate_limited", attempts.rejected.last().reason)
+        }
+        assertEquals(extras.size, attempts.rejected.size)
+        assertTrue(attempts.decided.isEmpty())
+    }
+
+    @Test
     fun `user_agent 는 200자까지 받고 넘으면 422`() {
         assertEquals(200, controller.decide(request(), attemptBody("user_agent" to "가".repeat(200))).statusCode.value())
         assertEquals("가".repeat(200), attempts.decided.single().userAgent)
