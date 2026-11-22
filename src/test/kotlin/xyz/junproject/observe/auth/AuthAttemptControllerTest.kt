@@ -150,7 +150,8 @@ class AuthAttemptControllerTest {
 
     @Test
     fun `replayed false 거나 빠졌는데 outcome 을 보내면 422`() {
-        for (value in listOf("success", "failure", "locked")) {
+        // 세부 3: 칸이 있으면 값이 null 이어도 422
+        for (value in listOf("success", "failure", "locked", null)) {
             assertEquals(422, controller.decide(request(), attemptBody("replayed" to false, "outcome" to value)).statusCode.value(), "replayed=false outcome=$value")
             assertEquals(422, controller.decide(request(), attemptBody("outcome" to value)).statusCode.value(), "replayed 없음 outcome=$value")
         }
@@ -263,7 +264,8 @@ class AuthAttemptControllerTest {
 
     @Test
     fun `거절 사유는 세 낱말 밖이면 422`() {
-        for (value in listOf("locked", "success", "failure", "", "RATE_LIMITED", "Origin_Rejected", "malformed ", 1, null, REMOVE)) {
+        // not_configured 는 계약에서 철회됐다(어드민은 설정이 없으면 뜨지 않는다) — 세 낱말 밖이므로 422
+        for (value in listOf("locked", "success", "failure", "", "RATE_LIMITED", "Origin_Rejected", "malformed ", "not_configured", 1, null, REMOVE)) {
             assertEquals(422, controller.rejected(request(), rejectedBody("reason" to value)).statusCode.value(), "reason=$value")
         }
         assertTrue(attempts.rejected.isEmpty())
