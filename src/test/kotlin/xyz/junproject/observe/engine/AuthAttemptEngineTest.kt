@@ -67,8 +67,9 @@ class AuthAttemptEngineTest {
         administration.close()
     }
 
-    private fun attempt(at: Instant, credentialOk: Boolean, replayed: Boolean = false, id: UUID = UUID.randomUUID()) =
-        AuthAttemptRequest(id, at, credentialOk, "203.0.113.7", "Mozilla/5.0", replayed)
+    /** 세부 2: replayed 면 어드민이 실제 내린 판정 [outcome] 을 함께 보낸다(필수) */
+    private fun attempt(at: Instant, credentialOk: Boolean, replayed: Boolean = false, id: UUID = UUID.randomUUID(), outcome: AuthOutcome? = null) =
+        AuthAttemptRequest(id, at, credentialOk, "203.0.113.7", "Mozilla/5.0", replayed, outcome)
 
     private fun fail(at: Instant) = store.decide(attempt(at, credentialOk = false))
 
@@ -256,7 +257,7 @@ class AuthAttemptEngineTest {
     @Test
     fun `replayed 실패는 기록만 하고 횟수에 넣지 않는다`() {
         (0 until 4).forEach { fail(start.plusSeconds(it.toLong())) }
-        val replayed = store.decide(attempt(start.plusSeconds(10), credentialOk = false, replayed = true))
+        val replayed = store.decide(attempt(start.plusSeconds(10), credentialOk = false, replayed = true, outcome = AuthOutcome.FAILURE))
         assertFalse(replayed.lockStarted, "replayed 가 잠금을 걸었다")
         assertEquals(4, store.lockStatus(start.plusSeconds(11)).failures, "replayed 가 횟수를 늘렸다")
         assertFalse(store.lockStatus(start.plusSeconds(11)).locked)
@@ -273,7 +274,7 @@ class AuthAttemptEngineTest {
     @Test
     fun `replayed 성공은 실패 횟수를 0 으로 되돌리지 않는다`() {
         (0 until 4).forEach { fail(start.plusSeconds(it.toLong())) }
-        store.decide(attempt(start.plusSeconds(10), credentialOk = true, replayed = true))
+        store.decide(attempt(start.plusSeconds(10), credentialOk = true, replayed = true, outcome = AuthOutcome.SUCCESS))
         assertEquals(4, store.lockStatus(start.plusSeconds(11)).failures, "replayed 성공이 잠금 계산에 들어갔다")
         assertTrue(fail(start.plusSeconds(20)).lockStarted)
         assertEquals(AuthOutcome.SUCCESS, allRows().single { it.replayed }.outcome)
@@ -283,8 +284,8 @@ class AuthAttemptEngineTest {
     fun `replayed 는 잠금 중에도 잠금 끝을 바꾸지 않는다`() {
         (0 until 5).forEach { fail(start.plusSeconds(it.toLong())) }
         val until = start.plusSeconds(4).plus(lockDuration)
-        store.decide(attempt(start.plusSeconds(60), credentialOk = false, replayed = true))
-        store.decide(attempt(start.plusSeconds(61), credentialOk = true, replayed = true))
+        store.decide(attempt(start.plusSeconds(60), credentialOk = false, replayed = true, outcome = AuthOutcome.FAILURE))
+        store.decide(attempt(start.plusSeconds(61), credentialOk = true, replayed = true, outcome = AuthOutcome.SUCCESS))
         val status = store.lockStatus(start.plusSeconds(62))
         assertEquals(Triple(true, until, 5), Triple(status.locked, status.lockedUntil, status.failures))
     }
@@ -302,6 +303,108 @@ class AuthAttemptEngineTest {
         assertEquals(3, rejectedRows.size)
         assertTrue(rejectedRows.all { it.ip == "198.51.100.9" && it.userAgent == "curl/8" && !it.replayed })
         assertTrue(fail(start.plusSeconds(30)).lockStarted)
+    }
+
+    // ── 세부 2: 재전송의 결과 · 거절 이유 ──────────────────
+
+    @Test
+    fun `replayed 의 기록 outcome 은 보낸 값 그대로 — 자격이 맞았어도 locked 로 보냈으면 locked`() {
+        (0 until 2).forEach { fail(start.plusSeconds(it.toLong())) }
+        val id = UUID.randomUUID()
+        val verdict = store.decide(attempt(start.plusSeconds(10), credentialOk = true, replayed = true, id = id, outcome = AuthOutcome.LOCKED))
+        assertFalse(verdict.lockStarted, "replayed 가 잠금을 걸었다")
+        val row = allRows().single { it.id == id }
+        assertEquals(AuthOutcome.LOCKED, row.outcome, "보낸 outcome 이 아니라 자격으로 다시 매겼다")
+        assertTrue(row.replayed)
+        assertEquals(start.plusSeconds(10), row.at)
+        val status = store.lockStatus(start.plusSeconds(11))
+        assertEquals(false to 2, status.locked to status.failures, "replayed 가 잠금 계산에 들어갔다")
+    }
+
+    @Test
+    fun `replayed 로 보낸 failure·success 도 보낸 값 그대로이고 자격과 어긋나도 바꾸지 않는다`() {
+        val failureId = UUID.randomUUID()
+        val successId = UUID.randomUUID()
+        store.decide(attempt(start, credentialOk = true, replayed = true, id = failureId, outcome = AuthOutcome.FAILURE))
+        store.decide(attempt(start.plusSeconds(1), credentialOk = false, replayed = true, id = successId, outcome = AuthOutcome.SUCCESS))
+        val rows = allRows().associateBy { it.id }
+        assertEquals(AuthOutcome.FAILURE, rows.getValue(failureId).outcome)
+        assertEquals(AuthOutcome.SUCCESS, rows.getValue(successId).outcome)
+        assertEquals(0, store.lockStatus(start.plusSeconds(2)).failures)
+    }
+
+    @Test
+    fun `replayed locked 를 여러 번 보내도 횟수·잠금이 바뀌지 않는다`() {
+        (0 until 4).forEach { fail(start.plusSeconds(it.toLong())) }
+        (0 until 3).forEach { store.decide(attempt(start.plusSeconds(10L + it), credentialOk = false, replayed = true, outcome = AuthOutcome.LOCKED)) }
+        val status = store.lockStatus(start.plusSeconds(20))
+        assertEquals(Triple(false, null, 4), Triple(status.locked, status.lockedUntil, status.failures))
+        assertTrue(fail(start.plusSeconds(30)).lockStarted, "replayed 를 빼면 이것이 다섯 번째 실패다")
+    }
+
+    @Test
+    fun `이미 판정받은 attempt_id 를 replayed 로 다시 보내면 처음 판정·처음 기록 그대로`() {
+        // 관측 서버가 기록하고 응답만 잃은 시도 — 어드민은 임시 제한으로 판정하고 대기열에서 replayed 로 다시 보낸다
+        val id = UUID.randomUUID()
+        val first = store.decide(attempt(start, credentialOk = false, id = id))
+        val again = store.decide(attempt(start, credentialOk = false, replayed = true, id = id, outcome = AuthOutcome.LOCKED))
+        assertEquals(first, again)
+        val row = allRows().single()
+        assertEquals(Triple(id, AuthOutcome.FAILURE, false), Triple(row.id, row.outcome, row.replayed), "재전송이 처음 기록을 덮었다")
+        assertEquals(1, store.lockStatus(start.plusSeconds(1)).failures)
+    }
+
+    @Test
+    fun `replayed 로 먼저 기록된 attempt_id 를 다른 outcome 으로 다시 보내도 처음 기록 그대로`() {
+        val id = UUID.randomUUID()
+        val first = store.decide(attempt(start, credentialOk = true, replayed = true, id = id, outcome = AuthOutcome.LOCKED))
+        val again = store.decide(attempt(start, credentialOk = true, replayed = true, id = id, outcome = AuthOutcome.SUCCESS))
+        assertEquals(first, again)
+        assertEquals(AuthOutcome.LOCKED, allRows().single().outcome)
+    }
+
+    @Test
+    fun `거절 이유 셋이 목록의 outcome 으로 구별되고 잠금 계산에 들지 않는다`() {
+        (0 until 4).forEach { fail(start.plusSeconds(it.toLong())) }
+        val reasons = mapOf("rate_limited" to AuthOutcome.RATE_LIMITED, "origin_rejected" to AuthOutcome.ORIGIN_REJECTED, "malformed" to AuthOutcome.MALFORMED)
+        val ids = reasons.keys.associateWith { UUID.randomUUID() }
+        reasons.keys.forEachIndexed { index, reason ->
+            store.recordRejected(AuthRejectedAttempt(ids.getValue(reason), start.plusSeconds(10L + index), reason, "198.51.100.9", "curl/8"))
+        }
+        val rows = allRows().associateBy { it.id }
+        for ((reason, outcome) in reasons) {
+            val row = rows.getValue(ids.getValue(reason))
+            assertEquals(outcome, row.outcome, "reason=$reason")
+            assertFalse(row.replayed)
+        }
+        assertEquals(4, store.lockStatus(start.plusSeconds(20)).failures, "거절 기록이 잠금 계산에 들어갔다")
+        assertTrue(fail(start.plusSeconds(30)).lockStarted)
+    }
+
+    @Test
+    fun `경로를 실제 저장소로 거쳐 replayed outcome 과 거절 이유가 목록에 그대로 나온다`() {
+        val secret = MockHttpServletRequest().apply { addHeader("X-Observe-Secret", "secret") }
+        val replayedId = UUID.randomUUID().toString()
+        val replayedResponse = controller.decide(secret, mapOf(
+            "attempt_id" to replayedId, "at" to start.toString(), "credential_ok" to true,
+            "ip" to "203.0.113.7", "user_agent" to "Mozilla/5.0", "replayed" to true, "outcome" to "locked",
+        ))
+        assertEquals(200, replayedResponse.statusCode.value(), "${replayedResponse.body}")
+        val missing = controller.decide(secret, mapOf(
+            "attempt_id" to UUID.randomUUID().toString(), "at" to start.toString(), "credential_ok" to true,
+            "ip" to "203.0.113.7", "user_agent" to "Mozilla/5.0", "replayed" to true,
+        ))
+        assertEquals(422, missing.statusCode.value())
+        val rejectedIds = listOf("origin_rejected", "malformed").associateWith { UUID.randomUUID().toString() }
+        rejectedIds.forEach { (reason, id) ->
+            val response = controller.rejected(secret, mapOf("attempt_id" to id, "at" to start.plusSeconds(1).toString(), "reason" to reason, "ip" to "198.51.100.9", "user_agent" to "curl/8"))
+            assertEquals(200, response.statusCode.value(), "reason=$reason ${response.body}")
+        }
+        val now = start.plus(Duration.ofHours(1))
+        val rows = readAllPages(start.minusSeconds(1), now, 50, now).associateBy { it["id"] }
+        assertEquals(3, rows.size, "422 로 거절한 요청이 기록됐거나 기록이 빠졌다")
+        assertEquals("locked" to true, rows.getValue(replayedId)["outcome"] to rows.getValue(replayedId)["replayed"])
+        rejectedIds.forEach { (reason, id) -> assertEquals(reason, rows.getValue(id)["outcome"]) }
     }
 
     @Test

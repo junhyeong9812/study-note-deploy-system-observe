@@ -63,6 +63,8 @@ enum class AuthOutcome(val wireName: String) {
     FAILURE("failure"),
     LOCKED("locked"),
     RATE_LIMITED("rate_limited"),
+    ORIGIN_REJECTED("origin_rejected"),
+    MALFORMED("malformed"),
 }
 
 /** `POST /auth/attempts` 의 본문 — 값 검증은 컨트롤러에서 끝낸다 */
@@ -73,6 +75,8 @@ data class AuthAttemptRequest(
     val ip: String,
     val userAgent: String,
     val replayed: Boolean = false,
+    /** 세부 2: `replayed:true` 일 때만 — 어드민이 임시 제한으로 실제 내린 판정(success·failure·locked). 그대로 기록한다 */
+    val outcome: AuthOutcome? = null,
 )
 
 /** `POST /auth/attempts` 의 응답 */

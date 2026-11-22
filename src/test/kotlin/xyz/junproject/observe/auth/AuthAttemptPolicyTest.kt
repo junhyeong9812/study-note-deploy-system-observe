@@ -122,6 +122,6 @@ class AuthAttemptPolicyTest {
 
     @Test
     fun `결과 낱말은 명세의 글자 그대로다`() {
-        assertEquals(listOf("success", "failure", "locked", "rate_limited"), AuthOutcome.entries.map { it.wireName })
+        assertEquals(listOf("success", "failure", "locked", "rate_limited", "origin_rejected", "malformed"), AuthOutcome.entries.map { it.wireName })
     }
 }

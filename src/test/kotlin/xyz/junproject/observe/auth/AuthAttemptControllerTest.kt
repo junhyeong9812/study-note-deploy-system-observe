@@ -108,9 +108,53 @@ class AuthAttemptControllerTest {
             AuthAttemptRequest(UUID.fromString(attemptId), Instant.parse("2026-11-22T02:59:59.500Z"), false, "203.0.113.7", "Mozilla/5.0", false),
             attempts.decided.single(),
         )
-        controller.decide(request(), attemptBody("replayed" to true, "credential_ok" to true))
+        // 세부 2: replayed:true 면 outcome 이 필수 — 이 사례는 그 계약에 맞춰 outcome 을 함께 보낸다
+        controller.decide(request(), attemptBody("replayed" to true, "credential_ok" to true, "outcome" to "success"))
         assertTrue(attempts.decided.last().replayed)
         assertTrue(attempts.decided.last().credentialOk)
+        assertNull(attempts.decided.first().outcome, "replayed:false 의 요청에 outcome 이 붙었다")
+    }
+
+    // ── 세부 2: 재전송의 결과(outcome) ─────────────────────
+
+    @Test
+    fun `replayed true 의 outcome 은 보낸 값 그대로 저장소에 넘어간다`() {
+        val expected = mapOf("success" to AuthOutcome.SUCCESS, "failure" to AuthOutcome.FAILURE, "locked" to AuthOutcome.LOCKED)
+        for ((wire, outcome) in expected) {
+            val response = controller.decide(request(), attemptBody("replayed" to true, "credential_ok" to true, "outcome" to wire))
+            assertEquals(200, response.statusCode.value(), "outcome=$wire ${response.body}")
+            assertEquals(outcome, attempts.decided.last().outcome)
+            assertTrue(attempts.decided.last().replayed)
+        }
+        assertEquals(3, attempts.decided.size)
+    }
+
+    @Test
+    fun `replayed true 인데 outcome 이 없으면 422`() {
+        for (value in listOf(null, REMOVE)) {
+            val response = controller.decide(request(), attemptBody("replayed" to true, "outcome" to value))
+            assertEquals(422, response.statusCode.value(), "outcome=$value")
+            assertEquals("invalid_request", errorCode(response))
+        }
+        assertTrue(attempts.decided.isEmpty())
+    }
+
+    @Test
+    fun `replayed true 의 outcome 은 success·failure·locked 만 받는다`() {
+        for (value in listOf("rate_limited", "origin_rejected", "malformed", "SUCCESS", "Locked", "", " success", true, 1)) {
+            val response = controller.decide(request(), attemptBody("replayed" to true, "outcome" to value))
+            assertEquals(422, response.statusCode.value(), "outcome=$value")
+        }
+        assertTrue(attempts.decided.isEmpty())
+    }
+
+    @Test
+    fun `replayed false 거나 빠졌는데 outcome 을 보내면 422`() {
+        for (value in listOf("success", "failure", "locked")) {
+            assertEquals(422, controller.decide(request(), attemptBody("replayed" to false, "outcome" to value)).statusCode.value(), "replayed=false outcome=$value")
+            assertEquals(422, controller.decide(request(), attemptBody("outcome" to value)).statusCode.value(), "replayed 없음 outcome=$value")
+        }
+        assertTrue(attempts.decided.isEmpty())
     }
 
     @Test
@@ -206,8 +250,20 @@ class AuthAttemptControllerTest {
     }
 
     @Test
-    fun `거절 사유는 rate_limited 만 받는다`() {
-        for (value in listOf("locked", "", "RATE_LIMITED", null, REMOVE)) {
+    fun `거절 사유는 rate_limited·origin_rejected·malformed 를 받아 그대로 넘긴다`() {
+        // 세부 2 기록 범위: 자격 검증 전에 거절한 것은 이 세 이유로 기록한다
+        for (reason in listOf("rate_limited", "origin_rejected", "malformed")) {
+            val response = controller.rejected(request(), rejectedBody("reason" to reason))
+            assertEquals(200, response.statusCode.value(), "reason=$reason ${response.body}")
+            assertEquals(reason, attempts.rejected.last().reason)
+        }
+        assertEquals(3, attempts.rejected.size)
+        assertTrue(attempts.decided.isEmpty())
+    }
+
+    @Test
+    fun `거절 사유는 세 낱말 밖이면 422`() {
+        for (value in listOf("locked", "success", "failure", "", "RATE_LIMITED", "Origin_Rejected", "malformed ", 1, null, REMOVE)) {
             assertEquals(422, controller.rejected(request(), rejectedBody("reason" to value)).statusCode.value(), "reason=$value")
         }
         assertTrue(attempts.rejected.isEmpty())
@@ -300,6 +356,16 @@ class AuthAttemptControllerTest {
         assertEquals(3, (partial["attempts"] as List<Any>).size)
         assertEquals(true, ((partial["attempts"] as List<*>)[2] as Map<*, *>)["replayed"])
         assertEquals("", partial["next_before"])
+    }
+
+    @Test
+    fun `목록의 outcome 은 거절 이유를 구별해 보인다`() {
+        val base = Instant.parse("2026-11-21T12:00:00Z")
+        val outcomes = listOf(AuthOutcome.RATE_LIMITED, AuthOutcome.ORIGIN_REJECTED, AuthOutcome.MALFORMED)
+        attempts.rows = { _ -> outcomes.mapIndexed { index, outcome -> AuthAttemptRow(UUID(0L, index.toLong()), base.minusSeconds(index.toLong()), outcome, "203.0.113.7", "UA", false) } }
+        @Suppress("UNCHECKED_CAST")
+        val rows = data(list(from = from, to = to))["attempts"] as List<Map<String, Any?>>
+        assertEquals(listOf("rate_limited", "origin_rejected", "malformed"), rows.map { it["outcome"] })
     }
 
     @Test
