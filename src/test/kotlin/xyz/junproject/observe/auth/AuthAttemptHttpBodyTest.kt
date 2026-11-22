@@ -70,6 +70,25 @@ class AuthAttemptHttpBodyTest {
     }
 
     @Test
+    fun `칸은 있는데 값이 null 이면 필수 칸이든 replayed 든 422 — 두 POST 경로 모두`() {
+        // 세부 4: 칸이 있으면 그 칸의 꼴이어야 한다. 칸이 없을 때의 기본값은 replayed(false) 하나뿐
+        val decideFields = listOf("attempt_id", "at", "credential_ok", "ip", "user_agent", "replayed")
+        for (field in decideFields) {
+            val body = """{"attempt_id":"${UUID.randomUUID()}","at":"2026-11-22T03:00:00Z","credential_ok":false,"ip":"203.0.113.7","user_agent":"Mozilla/5.0","replayed":false}"""
+                .replace(Regex("\"$field\":(\"[^\"]*\"|false)"), "\"$field\":null")
+            assertTrue(body.contains("\"$field\":null"), body)
+            assertEquals(422, controller.decide(post(body.toByteArray())).statusCode.value(), "decide $field=null")
+        }
+        for (field in listOf("attempt_id", "at", "reason", "ip", "user_agent")) {
+            val body = """{"attempt_id":"${UUID.randomUUID()}","at":"2026-11-22T03:00:00Z","reason":"malformed","ip":"203.0.113.7","user_agent":"curl/8"}"""
+                .replace(Regex("\"$field\":\"[^\"]*\""), "\"$field\":null")
+            assertTrue(body.contains("\"$field\":null"), body)
+            assertEquals(422, controller.rejected(post(body.toByteArray())).statusCode.value(), "rejected $field=null")
+        }
+        assertTrue(recorded.isEmpty())
+    }
+
+    @Test
     fun `깨진 Content-Type 머리글이나 JSON 뒤의 군더더기는 422`() {
         assertEquals(422, controller.decide(post(attemptJson().toByteArray(), contentType = "not a media type")).statusCode.value())
         assertEquals(422, controller.decide(post((attemptJson() + " {}").toByteArray())).statusCode.value())

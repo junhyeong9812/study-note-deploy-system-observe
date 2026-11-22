@@ -98,7 +98,7 @@ front · backend · llm · 배포 시스템 ── XADD logs ──▶ Redis(bac
 | `credential_ok` | 자격이 맞았는가(true·false). 필수 |
 | `ip` | 1~64자. 필수 |
 | `user_agent` | 200자 이하(빈 문자열 허용). 필수 |
-| `replayed` | true·false, 기본 false. true 는 관측 서버 장애 동안 어드민이 임시 제한으로 판정한 시도를 나중에 보내는 것 — **기록만 하고 잠금 계산에 넣지 않는다** |
+| `replayed` | true·false. **칸이 없을 때만** 기본 false — 칸이 있으면 null 이어도 422. true 는 관측 서버 장애 동안 어드민이 임시 제한으로 판정한 시도를 나중에 보내는 것 — **기록만 하고 잠금 계산에 넣지 않는다** |
 | `outcome` | `replayed:true` 면 **필수** — 어드민이 실제 내린 판정 `success` · `failure` · `locked`(글자 그대로) 중 하나, 그 값을 그대로 기록한다. `replayed:false`(또는 빠짐)에 이 칸이 **있으면 값이 null 이어도** 422 |
 
 응답 `data`: `{allowed, outcome("success"|"failure"|"locked"), locked_until(ISO 또는 null), lock_started, failures}`. `lock_started` 는 잠금으로 바뀐 그 한 번만 true(알림을 보낼 때). `replayed:true` 의 응답은 `allowed:false` · 보낸 `outcome` · 지금의 잠금 끝과 횟수 · `lock_started:false` 다(로그인 허용의 답이 아니다).
@@ -114,7 +114,7 @@ front · backend · llm · 배포 시스템 ── XADD logs ──▶ Redis(bac
 | HTTP | `code` | 언제 |
 |---|---|---|
 | 401 | `unauthorized` | 비밀값이 없거나 다르다(서버의 `OBSERVE_SECRET` 이 비면 전부). **본문 해석보다 먼저** 본다 — 본문이 어떤 꼴이든 401 |
-| 422 | `invalid_request` | 본문·조건의 꼴이 틀리다(`detail` 에 이유). 두 POST 경로에서는 해석할 수 없는 본문도 여기다 — Content-Type 이 JSON 이 아니거나 없음 · 본문 없음 · 빈 글자 · 깨진 JSON · JSON 뒤의 군더더기 · 객체가 아닌 JSON(배열·글자·null) · 본문 16KiB 초과. 프레임워크의 400·415 는 나가지 않는다. 저장소에 닿지 않는다(기록 없음) |
+| 422 | `invalid_request` | 본문·조건의 꼴이 틀리다(`detail` 에 이유). 칸은 있는데 값이 null 인 것도 꼴이 틀린 것이다(필수 칸 · `replayed` · `replayed:false` 의 `outcome`). 거절 기록 경로는 계약에 없는 칸을 무시한다. 두 POST 경로에서는 해석할 수 없는 본문도 여기다 — Content-Type 이 JSON 이 아니거나 없음 · 본문 없음 · 빈 글자 · 깨진 JSON · JSON 뒤의 군더더기 · 객체가 아닌 JSON(배열·글자·null) · 본문 16KiB 초과. 프레임워크의 400·415 는 나가지 않는다. 저장소에 닿지 않는다(기록 없음) |
 | 503 | `query_failed` | DB 오류 · 연결 불가 · 시간 초과(예외 문구는 응답에 넣지 않고 서버 로그에만) |
 
 | 설정(환경변수) | 기본 | 뜻 |

@@ -141,7 +141,8 @@ class AuthAttemptController(
         if (!authorized(request)) return unauthorized()
         val attempt = try {
             if (body == null) throw Invalid("본문이 없다")
-            val replayed = if (body["replayed"] == null) false else body.boolean("replayed")
+            // 세부 4: 칸이 없을 때만 기본 false — 칸이 있으면 null 이어도 Boolean 이어야 한다
+            val replayed = if (!body.containsKey("replayed")) false else body.boolean("replayed")
             AuthAttemptRequest(
                 attemptId = body.uuid("attempt_id"),
                 at = body.instant("at"),
