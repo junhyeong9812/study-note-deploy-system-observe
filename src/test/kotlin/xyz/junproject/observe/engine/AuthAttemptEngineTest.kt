@@ -45,7 +45,7 @@ class AuthAttemptEngineTest {
     private val administration: HikariDataSource = EngineSupport.dataSource(size = 2)
     private val administrationJdbc = JdbcTemplate(administration)
     private val dataSource = HikariDataSource(HikariConfig().apply {
-        jdbcUrl = EngineSupport.databaseUrl + "?currentSchema=$schema"
+        jdbcUrl = EngineSupport.databaseUrl + "?currentSchema=${this@AuthAttemptEngineTest.schema}"
         username = EngineSupport.databaseUser; password = EngineSupport.databasePassword; maximumPoolSize = 8
     })
     private val policy = AuthAttemptPolicy()
