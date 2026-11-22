@@ -114,6 +114,20 @@ class ApplicationSmokeEngineTest {
         assertNull(schedule.lastAuthRetention?.failure)
     }
 
+    @Test
+    fun `실제 서버에서 본문 상한을 넘는 POST 는 422 봉투이고 상한 안의 정상 본문은 지난다`() {
+        val oversized = """{"attempt_id":"${UUID.randomUUID()}","at":"${Instant.now()}","credential_ok":false,"ip":"203.0.113.7","user_agent":"smoke/1","padding":"${"a".repeat(64 * 1024)}"}"""
+        for (path in listOf("/auth/attempts", "/auth/attempts/rejected")) {
+            val response = call("POST", path, oversized)
+            assertEquals(422, response.statusCode(), response.body())
+            @Suppress("UNCHECKED_CAST")
+            assertEquals("invalid_request", ((json.readValue(response.body(), Map::class.java) as Map<String, Any?>)["error"] as Map<String, Any?>)["code"])
+        }
+        // 시각을 기본 목록 기간(90일) 밖에 두어 다른 사례의 목록 단언에 섞이지 않게
+        val padded = """{"attempt_id":"${UUID.randomUUID()}","at":"2000-01-01T00:00:00Z","reason":"malformed","ip":"203.0.113.7","user_agent":"smoke/1"}""".padEnd(8 * 1024)
+        assertEquals(200, call("POST", "/auth/attempts/rejected", padded).statusCode())
+    }
+
     @AfterAll
     fun dropSchema() {
         administration.execute("DROP SCHEMA IF EXISTS $SCHEMA CASCADE")

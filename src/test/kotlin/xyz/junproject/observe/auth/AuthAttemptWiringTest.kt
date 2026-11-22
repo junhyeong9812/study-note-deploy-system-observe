@@ -85,6 +85,22 @@ class AuthAttemptWiringTest {
     }
 
     @Test
+    fun `뜬 직후의 미리 만들기는 실패해도 예외를 내지 않고 다음 호출이 다시 만든다 — 성공했으면 다시 만들지 않는다`() {
+        val failing = CountingAuthAttempts().apply { schemaFailuresLeft = 1 }
+        val attempts = SchemaOnFirstUseAuthAttempts(failing)
+        attempts.prepare()                                  // DB 가 아직 없다 — 앱은 뜬다
+        assertEquals(1, failing.schemaCalls)
+        attempts.lockStatus(now)
+        assertEquals(2, failing.schemaCalls, "미리 만들기에 실패한 뒤 첫 호출이 다시 만들지 않았다")
+
+        val reachable = CountingAuthAttempts()
+        val prepared = SchemaOnFirstUseAuthAttempts(reachable)
+        prepared.prepare()
+        prepared.decide(request)
+        assertEquals(1, reachable.schemaCalls)
+    }
+
+    @Test
     fun `동시에 처음 닿아도 스키마 생성은 한 번`() {
         val inner = CountingAuthAttempts()
         val attempts = SchemaOnFirstUseAuthAttempts(inner)

@@ -99,17 +99,23 @@ front · backend · llm · 배포 시스템 ── XADD logs ──▶ Redis(bac
 | `ip` | 1~64자. 필수 |
 | `user_agent` | 200자 이하(빈 문자열 허용). 필수 |
 | `replayed` | true·false, 기본 false. true 는 관측 서버 장애 동안 어드민이 임시 제한으로 판정한 시도를 나중에 보내는 것 — **기록만 하고 잠금 계산에 넣지 않는다** |
-| `outcome` | `replayed:true` 면 **필수** — 어드민이 실제 내린 판정 `success` · `failure` · `locked`(글자 그대로) 중 하나, 그 값을 그대로 기록한다. `replayed:false`(또는 빠짐)에 보내면 422 |
+| `outcome` | `replayed:true` 면 **필수** — 어드민이 실제 내린 판정 `success` · `failure` · `locked`(글자 그대로) 중 하나, 그 값을 그대로 기록한다. `replayed:false`(또는 빠짐)에 이 칸이 **있으면 값이 null 이어도** 422 |
 
 응답 `data`: `{allowed, outcome("success"|"failure"|"locked"), locked_until(ISO 또는 null), lock_started, failures}`. `lock_started` 는 잠금으로 바뀐 그 한 번만 true(알림을 보낼 때). `replayed:true` 의 응답은 `allowed:false` · 보낸 `outcome` · 지금의 잠금 끝과 횟수 · `lock_started:false` 다(로그인 허용의 답이 아니다).
 
-`POST /auth/attempts/rejected` 본문: `{attempt_id, at, reason, ip, user_agent}` — `reason` 은 `rate_limited` · `origin_rejected` · `malformed` 중 하나, 기록의 `outcome` 이 그 낱말이다. 기록만 하고 잠금 계산은 없다. 응답 `data`: `{recorded: true}`.
+`POST /auth/attempts/rejected` 본문: `{attempt_id, at, reason, ip, user_agent}` — `reason` 은 `rate_limited` · `origin_rejected` · `malformed` 중 하나(그 밖은 422 — `not_configured` 같은 이유는 없다), 기록의 `outcome` 이 그 낱말이다. 기록만 하고 잠금 계산은 없다. 응답 `data`: `{recorded: true}`.
 
 `GET /auth/attempts?from=&to=&before=&limit=`: 기간은 ISO, 최대 90일 — 둘 다 없으면 지금까지 90일, `from` 만 있으면 지금까지, `to` 만 있으면 그 앞 90일. `limit` 1~200, 기본 50. 이어 보기는 `/logs` 와 같다(응답의 `next_before` 를 `before` 로, `from`·`to` 는 앞 응답 것을 그대로; `before` 만 넘기면 422). 응답 `data`: `{attempts: [{id, at, outcome, ip, user_agent, replayed}], next_before, from, to}` — `outcome` 은 위 여섯 낱말 중 하나.
 
 `GET /auth/lock`: 응답 `data`: `{locked, locked_until(ISO 또는 null), failures}` — 화면 표시용이고 판정에는 쓰지 않는다(판정은 `POST /auth/attempts` 한 번으로 끝난다). 잠금 끝이 지났으면 `failures` 는 0 으로 보인다.
 
-오류(네 경로 공통): 비밀값이 없거나 다르면 401 `unauthorized`(서버의 `OBSERVE_SECRET` 이 비면 전부 거절, 본문 검증보다 먼저) · 본문·조건의 꼴이 틀리면 422 `invalid_request`(`detail` 에 이유, 저장소에 닿지 않는다) · DB 오류·연결 불가·시간 초과는 503 `query_failed`(예외 문구는 응답에 넣지 않고 서버 로그에만).
+오류(네 경로 공통 — 모두 `{success: false, error: {code}}` 봉투):
+
+| HTTP | `code` | 언제 |
+|---|---|---|
+| 401 | `unauthorized` | 비밀값이 없거나 다르다(서버의 `OBSERVE_SECRET` 이 비면 전부). **본문 해석보다 먼저** 본다 — 본문이 어떤 꼴이든 401 |
+| 422 | `invalid_request` | 본문·조건의 꼴이 틀리다(`detail` 에 이유). 두 POST 경로에서는 해석할 수 없는 본문도 여기다 — Content-Type 이 JSON 이 아니거나 없음 · 본문 없음 · 빈 글자 · 깨진 JSON · JSON 뒤의 군더더기 · 객체가 아닌 JSON(배열·글자·null) · 본문 16KiB 초과. 프레임워크의 400·415 는 나가지 않는다. 저장소에 닿지 않는다(기록 없음) |
+| 503 | `query_failed` | DB 오류 · 연결 불가 · 시간 초과(예외 문구는 응답에 넣지 않고 서버 로그에만) |
 
 | 설정(환경변수) | 기본 | 뜻 |
 |---|---|---|

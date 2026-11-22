@@ -4,13 +4,18 @@ import jakarta.servlet.http.HttpServletRequest
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.dao.DataAccessException
+import org.springframework.http.InvalidMediaTypeException
+import org.springframework.http.MediaType
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.GetMapping
 import org.springframework.web.bind.annotation.PostMapping
-import org.springframework.web.bind.annotation.RequestBody
 import org.springframework.web.bind.annotation.RequestParam
 import org.springframework.transaction.TransactionException
 import org.springframework.web.bind.annotation.RestController
+import tools.jackson.core.JacksonException
+import tools.jackson.databind.DeserializationFeature
+import tools.jackson.databind.json.JsonMapper
+import java.io.IOException
 import java.security.MessageDigest
 import java.time.Duration
 import java.time.Instant
@@ -20,6 +25,10 @@ import java.util.UUID
 /**
  * 로그인 시도 경로 — 전부 `X-Observe-Secret`(설정이 비면 전부 거절). 봉투는 `{success,data}` / `{success:false,error}`.
  * 본문은 맵으로 받아 꼴이 틀리면 422 `invalid_request`. 저장소 오류는 503 `query_failed`(예외 문구는 응답에 넣지 않는다).
+ *
+ * 두 POST 경로는 본문을 Spring 의 `@RequestBody` 로 받지 않는다 — 그러면 인증보다 앞서 프레임워크가 본문을 해석해
+ * 깨진 JSON 은 400, JSON 이 아닌 Content-Type 은 415 를 비밀값 검사 전에 내보낸다(세부 3 위반). 대신 비밀값을 먼저 보고,
+ * 원문을 [MAX_BODY_BYTES] 까지만 읽어 이 컨트롤러가 해석한다. 다른 경로의 해석 규칙은 그대로다(전역 예외 처리를 두지 않는다).
  */
 @RestController
 class AuthAttemptController(
@@ -38,6 +47,36 @@ class AuthAttemptController(
     private fun invalid(detail: String) =
         ResponseEntity.status(422).body(mapOf("success" to false, "error" to mapOf("code" to "invalid_request", "detail" to detail)))
     private fun ok(data: Any) = ResponseEntity.ok(mapOf("success" to true, "data" to data))
+
+    private val json: JsonMapper = JsonMapper.builder().enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS).build()
+
+    /**
+     * HTTP 본문 → 맵. Content-Type 이 JSON 이 아니거나 없음 · 본문 없음 · 빈 글자 · 깨진 JSON · 객체가 아닌 JSON · [MAX_BODY_BYTES] 초과는
+     * [Invalid]. 인증을 통과한 뒤에만 부른다.
+     */
+    private fun readObject(request: HttpServletRequest): Map<String, Any?> {
+        val contentType = try { request.contentType?.let(MediaType::parseMediaType) } catch (_: InvalidMediaTypeException) { null }
+        if (contentType == null || !(MediaType.APPLICATION_JSON.isCompatibleWith(contentType) || contentType.subtype.endsWith("+json"))) {
+            throw Invalid("Content-Type 은 application/json 이어야 한다")
+        }
+        if (request.contentLengthLong > MAX_BODY_BYTES) throw Invalid("본문은 ${MAX_BODY_BYTES}바이트 이하")
+        val bytes = try {
+            request.inputStream.use { it.readNBytes(MAX_BODY_BYTES + 1) }   // 길이 머리글이 없거나 거짓이어도 상한까지만 읽는다
+        } catch (_: IOException) { throw Invalid("본문을 읽지 못했다") }
+        if (bytes.size > MAX_BODY_BYTES) throw Invalid("본문은 ${MAX_BODY_BYTES}바이트 이하")
+        if (bytes.isEmpty()) throw Invalid("본문이 없다")
+        val node = try { json.readTree(bytes) } catch (_: JacksonException) { throw Invalid("본문이 JSON 이 아니다") }
+        if (node == null || !node.isObject) throw Invalid("본문은 JSON 객체여야 한다")
+        @Suppress("UNCHECKED_CAST")
+        return json.treeToValue(node, Map::class.java) as Map<String, Any?>
+    }
+
+    /** HTTP 경계 — 비밀값 → 본문 해석 → [handle] 의 순서. 해석 실패는 422 이고 저장소에 닿지 않는다 */
+    private fun fromHttp(request: HttpServletRequest, handle: (HttpServletRequest, Map<String, Any?>) -> ResponseEntity<out Any>): ResponseEntity<out Any> {
+        if (!authorized(request)) return unauthorized()
+        val body = try { readObject(request) } catch (error: Invalid) { return invalid(error.detail) }
+        return handle(request, body)
+    }
 
     private class Invalid(val detail: String) : RuntimeException(detail)
 
@@ -85,7 +124,8 @@ class AuthAttemptController(
     private fun replayedOutcome(body: Map<String, Any?>, replayed: Boolean): AuthOutcome? {
         val value = body["outcome"]
         if (!replayed) {
-            if (value != null) throw Invalid("outcome 은 replayed:true 일 때만 보낸다")
+            // 세부 3: 칸이 있으면 값이 null 이어도 거절한다
+            if (body.containsKey("outcome")) throw Invalid("outcome 은 replayed:true 일 때만 보낸다")
             return null
         }
         return REPLAYED_OUTCOMES.firstOrNull { it.wireName == value }
@@ -94,7 +134,10 @@ class AuthAttemptController(
 
     /** 판정 — `{attempt_id, at, credential_ok, ip, user_agent, replayed?, outcome?}` → `{allowed, outcome, locked_until, lock_started, failures}` */
     @PostMapping("/auth/attempts")
-    fun decide(request: HttpServletRequest, @RequestBody(required = false) body: Map<String, Any?>?): ResponseEntity<out Any> {
+    fun decide(request: HttpServletRequest): ResponseEntity<out Any> = fromHttp(request) { checked, body -> decide(checked, body) }
+
+    /** 해석된 본문으로의 판정 — HTTP 경로는 위 [decide], 테스트는 이것을 직접 부른다 */
+    fun decide(request: HttpServletRequest, body: Map<String, Any?>?): ResponseEntity<out Any> {
         if (!authorized(request)) return unauthorized()
         val attempt = try {
             if (body == null) throw Invalid("본문이 없다")
@@ -120,7 +163,10 @@ class AuthAttemptController(
 
     /** 자격 검증 전에 거절한 시도의 기록 — `{attempt_id, at, reason:"rate_limited"|"origin_rejected"|"malformed", ip, user_agent}` */
     @PostMapping("/auth/attempts/rejected")
-    fun rejected(request: HttpServletRequest, @RequestBody(required = false) body: Map<String, Any?>?): ResponseEntity<out Any> {
+    fun rejected(request: HttpServletRequest): ResponseEntity<out Any> = fromHttp(request) { checked, body -> rejected(checked, body) }
+
+    /** 해석된 본문으로의 거절 기록 — HTTP 경로는 위 [rejected] */
+    fun rejected(request: HttpServletRequest, body: Map<String, Any?>?): ResponseEntity<out Any> {
         if (!authorized(request)) return unauthorized()
         val attempt = try {
             if (body == null) throw Invalid("본문이 없다")
@@ -197,7 +243,9 @@ class AuthAttemptController(
         val REPLAYED_OUTCOMES = listOf(AuthOutcome.SUCCESS, AuthOutcome.FAILURE, AuthOutcome.LOCKED)
         /** 거절 기록의 이유 — 기록의 결과 낱말이 이유와 같다 */
         val REJECTED_OUTCOMES = listOf(AuthOutcome.RATE_LIMITED, AuthOutcome.ORIGIN_REJECTED, AuthOutcome.MALFORMED)
-        const val MAX_IP_LENGTH = 64            // IPv6(영역 표시 포함)도 들어가는 길이
+        const val MAX_IP_LENGTH = 64
+        /** 두 POST 본문의 상한 — 정상 본문은 1KiB 안팎(User-Agent 200자가 가장 길다). 넘으면 읽기를 멈추고 422 */
+        const val MAX_BODY_BYTES = 16 * 1024            // IPv6(영역 표시 포함)도 들어가는 길이
         val MAX_RANGE: Duration = Duration.ofDays(90)
     }
 }

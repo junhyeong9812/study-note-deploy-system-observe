@@ -4,14 +4,15 @@ import com.zaxxer.hikari.HikariConfig
 import com.zaxxer.hikari.HikariDataSource
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Value
+import org.springframework.boot.context.event.ApplicationReadyEvent
 import org.springframework.boot.convert.DurationStyle
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
+import org.springframework.context.event.EventListener
 import org.springframework.data.redis.core.StringRedisTemplate
 import org.springframework.jdbc.core.JdbcTemplate
 import xyz.junproject.observe.auth.AuthAttemptPolicy
 import xyz.junproject.observe.auth.AuthAttemptStore
-import xyz.junproject.observe.auth.AuthAttempts
 import xyz.junproject.observe.auth.SchemaOnFirstUseAuthAttempts
 import xyz.junproject.observe.collect.CollectorHealth
 import xyz.junproject.observe.collect.LogCollector
@@ -77,9 +78,15 @@ class ObserveConfiguration {
         @Value("\${observe.db.user}") user: String,
         @Value("\${observe.db.password}") password: String,
         policy: AuthAttemptPolicy,
-    ): AuthAttempts {
+    ): SchemaOnFirstUseAuthAttempts {
         val auth = pool("observe-auth", url, user, password, size = 3, statementTimeoutMs = 4_000, connectionTimeoutMs = 3_000, validationTimeoutMs = 1_000)
         return SchemaOnFirstUseAuthAttempts(AuthAttemptStore(JdbcTemplate(auth), policy))
+    }
+
+    /** 뜬 직후 로그인 시도 표를 미리 만든다(최선 노력 — 실패해도 앱은 뜨고 첫 호출이 다시 만든다) */
+    @EventListener(ApplicationReadyEvent::class)
+    fun prepareAuthAttemptSchema(event: ApplicationReadyEvent) {
+        event.applicationContext.getBean(SchemaOnFirstUseAuthAttempts::class.java).prepare()
     }
 
     @Bean
