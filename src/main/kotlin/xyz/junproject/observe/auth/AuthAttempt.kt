@@ -13,11 +13,42 @@ data class AuthAttemptPolicy(
     val lockDuration: Duration = Duration.ofMinutes(15),
     val retention: Duration = Duration.ofDays(90),
 ) {
+    init {
+        require(failureLimit >= 1) { "failureLimit 은 1 이상" }
+        require(!lockDuration.isNegative && !lockDuration.isZero) { "lockDuration 은 0 보다 길어야 한다" }
+        require(!retention.isNegative && !retention.isZero) { "retention 은 0 보다 길어야 한다" }
+    }
+
     /**
      * 판정 규칙(순수 함수) — 저장소가 한 트랜잭션 안에서 잠금 상태 행을 잡고([state]) 이 함수로 다음 상태와 판정을 얻어 쓴다.
      * 잠금 중(`at < lockedUntil`)이면 자격이 맞아도 거절하고 상태를 바꾸지 않는다. 잠금이 풀린 뒤(`at >= lockedUntil`)에는 0 부터 센다.
      */
-    fun judge(state: AuthLockState, credentialOk: Boolean, at: Instant): AuthJudgement = TODO()
+    fun judge(state: AuthLockState, credentialOk: Boolean, at: Instant): AuthJudgement {
+        val activeUntil = state.lockedUntil?.takeIf { at.isBefore(it) }
+        if (activeUntil != null) {
+            return AuthJudgement(AuthVerdict(false, AuthOutcome.LOCKED, activeUntil, false, state.failures), state)
+        }
+        if (credentialOk) {
+            return AuthJudgement(AuthVerdict(true, AuthOutcome.SUCCESS, null, false, 0), AuthLockState(0, null))
+        }
+        // 잠금이 끝났으면(끝 시각이 남아 있어도) 0 부터 센다
+        val failures = (if (state.lockedUntil != null) 0 else state.failures) + 1
+        val lockedUntil = if (failures >= failureLimit) at.plus(lockDuration) else null
+        return AuthJudgement(
+            AuthVerdict(false, AuthOutcome.FAILURE, lockedUntil, lockedUntil != null, failures),
+            AuthLockState(failures, lockedUntil),
+        )
+    }
+
+    /** [now] 기준 화면 표시용 상태 — 잠금이 끝났으면 다음 실패가 0 부터 세므로 횟수도 0 으로 보인다 */
+    fun status(state: AuthLockState, now: Instant): AuthLockStatus {
+        val activeUntil = state.lockedUntil?.takeIf { now.isBefore(it) }
+        return when {
+            activeUntil != null -> AuthLockStatus(true, activeUntil, state.failures)
+            state.lockedUntil != null -> AuthLockStatus(false, null, 0)
+            else -> AuthLockStatus(false, null, state.failures)
+        }
+    }
 }
 
 /** 유일 계정의 잠금 상태 — 연속 실패 횟수와 잠금 끝 시각(없으면 null) */
@@ -75,13 +106,25 @@ data class AuthAttemptRow(
 /** 목록 이어 보기의 기준 — 응답의 `next_before` 글자와 오간다. 이 항목보다 오래된 것부터 */
 data class AuthAttemptCursor(val at: Instant, val id: UUID) {
     /** `next_before` 로 나가는 글자 — [parse] 가 되읽는다 */
-    override fun toString(): String = TODO()
+    override fun toString(): String = "${at}_$id"
 
     companion object {
         /** 응답의 `next_before` 꼴이 아니면 null */
-        fun parse(text: String): AuthAttemptCursor? = TODO()
+        fun parse(text: String): AuthAttemptCursor? {
+            val parts = text.split('_')
+            if (parts.size != 2) return null
+            val at = try { Instant.parse(parts[0]) } catch (_: java.time.format.DateTimeParseException) { return null }
+            val id = parseUuid(parts[1]) ?: return null
+            return AuthAttemptCursor(at, id)
+        }
     }
 }
+
+/** 표준 꼴(8-4-4-4-12 의 16진수)만 받는다 — `UUID.fromString` 은 `1-1-1-1-1` 같은 꼴도 받아 들인다 */
+internal fun parseUuid(text: String): UUID? =
+    if (UUID_FORM.matches(text)) UUID.fromString(text) else null
+
+private val UUID_FORM = Regex("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 /** 목록 조건 — 값 검증은 API 경계에서 끝낸다 */
 data class AuthAttemptQuery(

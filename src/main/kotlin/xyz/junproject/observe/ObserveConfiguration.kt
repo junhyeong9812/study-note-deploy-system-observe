@@ -4,10 +4,15 @@ import com.zaxxer.hikari.HikariConfig
 import com.zaxxer.hikari.HikariDataSource
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Value
+import org.springframework.boot.convert.DurationStyle
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
 import org.springframework.data.redis.core.StringRedisTemplate
 import org.springframework.jdbc.core.JdbcTemplate
+import xyz.junproject.observe.auth.AuthAttemptPolicy
+import xyz.junproject.observe.auth.AuthAttemptStore
+import xyz.junproject.observe.auth.AuthAttempts
+import xyz.junproject.observe.auth.SchemaOnFirstUseAuthAttempts
 import xyz.junproject.observe.collect.CollectorHealth
 import xyz.junproject.observe.collect.LogCollector
 import xyz.junproject.observe.collect.RedisLogStreamSource
@@ -52,6 +57,31 @@ class ObserveConfiguration {
         return LogStore(JdbcTemplate(ingest), JdbcTemplate(query), JdbcTemplate(health))
     }
 
+    /** 잠금 수치 — 기본값이 명세(5회·15분·90일). 시간은 `15m`·`90d` 꼴 */
+    @Bean
+    fun authAttemptPolicy(
+        @Value("\${observe.auth.failure-limit:5}") failureLimit: Int,
+        @Value("\${observe.auth.lock-duration:15m}") lockDuration: String,
+        @Value("\${observe.auth.retention:90d}") retention: String,
+    ) = AuthAttemptPolicy(failureLimit, DurationStyle.detectAndParse(lockDuration), DurationStyle.detectAndParse(retention))
+
+    /**
+     * 로그인 시도 저장·잠금 판정 — 전용 연결 풀(3개). 수집 풀(2개)을 같이 쓰면 판정이 몰릴 때 로그 저장이 밀리고,
+     * 조회 풀(4개·10초)을 같이 쓰면 무거운 로그 검색 뒤에서 로그인이 기다린다. 판정은 상태 행에서 한 줄로 서므로 연결이 많아도 빨라지지 않는다.
+     * 문장은 4초에서 끊는다 — 어드민이 5초에 포기하기 전에 답이 가게(포기하면 같은 attempt_id 로 다시 묻는다).
+     * 스키마는 처음 닿을 때 만든다([SchemaOnFirstUseAuthAttempts]).
+     */
+    @Bean
+    fun authAttempts(
+        @Value("\${observe.db.url}") url: String,
+        @Value("\${observe.db.user}") user: String,
+        @Value("\${observe.db.password}") password: String,
+        policy: AuthAttemptPolicy,
+    ): AuthAttempts {
+        val auth = pool("observe-auth", url, user, password, size = 3, statementTimeoutMs = 4_000, connectionTimeoutMs = 3_000, validationTimeoutMs = 1_000)
+        return SchemaOnFirstUseAuthAttempts(AuthAttemptStore(JdbcTemplate(auth), policy))
+    }
+
     @Bean
     fun logStreamSource(
         redis: StringRedisTemplate,
@@ -67,5 +97,6 @@ class ObserveConfiguration {
 
     @Bean
     fun collectorHealth(collector: LogCollector, source: RedisLogStreamSource, store: LogStore, schedule: ObserveSchedule) =
-        CollectorHealth(collector, { source.unacknowledgedCount() }, { source.lag() }, { store.latestStoredAt() }, { schedule.lastRetention })
+        CollectorHealth(collector, { source.unacknowledgedCount() }, { source.lag() }, { store.latestStoredAt() }, { schedule.lastRetention },
+            lastAuthRetention = { schedule.lastAuthRetention })
 }
