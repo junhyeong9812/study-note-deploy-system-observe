@@ -78,19 +78,35 @@ class AuthAttemptController(
     private fun parseInstant(name: String, text: String): Instant =
         try { Instant.parse(text) } catch (_: DateTimeParseException) { throw Invalid("$name 은 ISO 시각이어야 한다(예: 2026-11-22T03:00:00Z)") }
 
-    /** 판정 — `{attempt_id, at, credential_ok, ip, user_agent, replayed?}` → `{allowed, outcome, locked_until, lock_started, failures}` */
+    /**
+     * 세부 2 — `outcome` 은 `replayed:true` 일 때만, 그리고 반드시(어드민이 임시 제한으로 실제 내린 판정). 글자는 정확히 같아야 한다.
+     * `replayed:false`(또는 빠짐)인데 보내면 422 — 지금 판정을 받는 요청이 결과를 정해 보내는 것은 계약 위반이다.
+     */
+    private fun replayedOutcome(body: Map<String, Any?>, replayed: Boolean): AuthOutcome? {
+        val value = body["outcome"]
+        if (!replayed) {
+            if (value != null) throw Invalid("outcome 은 replayed:true 일 때만 보낸다")
+            return null
+        }
+        return REPLAYED_OUTCOMES.firstOrNull { it.wireName == value }
+            ?: throw Invalid("replayed:true 면 outcome 은 ${REPLAYED_OUTCOMES.joinToString("·") { it.wireName }} 중 하나(필수)")
+    }
+
+    /** 판정 — `{attempt_id, at, credential_ok, ip, user_agent, replayed?, outcome?}` → `{allowed, outcome, locked_until, lock_started, failures}` */
     @PostMapping("/auth/attempts")
     fun decide(request: HttpServletRequest, @RequestBody(required = false) body: Map<String, Any?>?): ResponseEntity<out Any> {
         if (!authorized(request)) return unauthorized()
         val attempt = try {
             if (body == null) throw Invalid("본문이 없다")
+            val replayed = if (body["replayed"] == null) false else body.boolean("replayed")
             AuthAttemptRequest(
                 attemptId = body.uuid("attempt_id"),
                 at = body.instant("at"),
                 credentialOk = body.boolean("credential_ok"),
                 ip = body.ip(),
                 userAgent = body.userAgent(),
-                replayed = if (body["replayed"] == null) false else body.boolean("replayed"),
+                replayed = replayed,
+                outcome = replayedOutcome(body, replayed),
             )
         } catch (error: Invalid) { return invalid(error.detail) }
         return answering("decide") {
@@ -102,14 +118,15 @@ class AuthAttemptController(
         }
     }
 
-    /** 속도 제한 거절의 기록 — `{attempt_id, at, reason:"rate_limited", ip, user_agent}` */
+    /** 자격 검증 전에 거절한 시도의 기록 — `{attempt_id, at, reason:"rate_limited"|"origin_rejected"|"malformed", ip, user_agent}` */
     @PostMapping("/auth/attempts/rejected")
     fun rejected(request: HttpServletRequest, @RequestBody(required = false) body: Map<String, Any?>?): ResponseEntity<out Any> {
         if (!authorized(request)) return unauthorized()
         val attempt = try {
             if (body == null) throw Invalid("본문이 없다")
-            if (body["reason"] != AuthOutcome.RATE_LIMITED.wireName) throw Invalid("reason 은 ${AuthOutcome.RATE_LIMITED.wireName} 만")
-            AuthRejectedAttempt(body.uuid("attempt_id"), body.instant("at"), AuthOutcome.RATE_LIMITED.wireName, body.ip(), body.userAgent())
+            val reason = REJECTED_OUTCOMES.firstOrNull { it.wireName == body["reason"] }
+                ?: throw Invalid("reason 은 ${REJECTED_OUTCOMES.joinToString("·") { it.wireName }} 중 하나")
+            AuthRejectedAttempt(body.uuid("attempt_id"), body.instant("at"), reason.wireName, body.ip(), body.userAgent())
         } catch (error: Invalid) { return invalid(error.detail) }
         return answering("record rejected") {
             attempts.recordRejected(attempt)
@@ -176,6 +193,10 @@ class AuthAttemptController(
         const val MAX_LIMIT = 200
         const val DEFAULT_LIMIT = 50
         const val MAX_USER_AGENT_LENGTH = 200
+        /** 재전송(`replayed:true`)이 보낼 수 있는 결과 — 자격 검증에 이른 시도의 낱말 */
+        val REPLAYED_OUTCOMES = listOf(AuthOutcome.SUCCESS, AuthOutcome.FAILURE, AuthOutcome.LOCKED)
+        /** 거절 기록의 이유 — 기록의 결과 낱말이 이유와 같다 */
+        val REJECTED_OUTCOMES = listOf(AuthOutcome.RATE_LIMITED, AuthOutcome.ORIGIN_REJECTED, AuthOutcome.MALFORMED)
         const val MAX_IP_LENGTH = 64            // IPv6(영역 표시 포함)도 들어가는 길이
         val MAX_RANGE: Duration = Duration.ofDays(90)
     }

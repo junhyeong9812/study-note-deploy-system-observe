@@ -15,7 +15,7 @@ import java.util.UUID
  *
  * 표 둘(추가만 — `log_entry` 는 건드리지 않는다):
  * - `auth_attempt`: 시도 한 건 = 한 행, 기본 키가 `attempt_id`. 판정 경로로 들어온 행은 돌려준 판정(`verdict_*`)을 함께 남겨
- *   같은 ID 의 재전송에 그대로 돌려준다. 속도 제한 거절 행은 판정 칸이 비어 있다.
+ *   같은 ID 의 재전송에 그대로 돌려준다. 거절 행(rate_limited·origin_rejected·malformed)은 판정 칸이 비어 있다.
  * - `auth_lock_state`: 유일 계정의 잠금 상태 한 행(`account = 1`). 판정은 이 행을 `FOR UPDATE` 로 잡고 시작한다 —
  *   판정끼리 이 행에서 한 줄로 서므로 동시에 들어온 실패도 횟수가 겹치지 않고, 잠금 시작은 한 번뿐이며,
  *   같은 ID 의 동시 재전송도 앞선 판정이 커밋된 뒤에 그 행을 보게 되어 유일 제약 충돌이 나지 않는다.
@@ -61,9 +61,12 @@ class AuthAttemptStore(private val jdbc: JdbcTemplate, private val policy: AuthA
         recordedVerdict(request.attemptId)?.let { return@execute it }
 
         val verdict = if (request.replayed) {
-            // 감사 기록만 — 잠금 계산에 넣지 않고 상태도 바꾸지 않는다. 지금 로그인을 허용하는 답이 아니므로 allowed 는 거짓
+            // 감사 기록만 — 잠금 계산에 넣지 않고 상태도 바꾸지 않는다. 결과는 어드민이 임시 제한으로 실제 내린 판정 그대로(세부 2).
+            // 지금 로그인을 허용하는 답이 아니므로 allowed 는 거짓
+            val outcome = requireNotNull(request.outcome) { "replayed 시도에는 outcome 이 있어야 한다" }
+            require(outcome in REPLAYED_OUTCOMES) { "replayed 의 outcome 은 success·failure·locked 중 하나" }
             val status = policy.status(state, request.at)
-            AuthVerdict(false, if (request.credentialOk) AuthOutcome.SUCCESS else AuthOutcome.FAILURE, status.lockedUntil, false, status.failures)
+            AuthVerdict(false, outcome, status.lockedUntil, false, status.failures)
         } else {
             val judgement = policy.judge(state, request.credentialOk, request.at)
             if (judgement.nextState != state) {
@@ -100,7 +103,7 @@ class AuthAttemptStore(private val jdbc: JdbcTemplate, private val policy: AuthA
         jdbc.update(
             """INSERT INTO auth_attempt (id, at, outcome, ip, user_agent, replayed) VALUES (?,?,?,?,?,false)
                ON CONFLICT (id) DO NOTHING""",
-            attempt.attemptId, timestamp(attempt.at), AuthOutcome.RATE_LIMITED.wireName, attempt.ip, attempt.userAgent,
+            attempt.attemptId, timestamp(attempt.at), rejectedOutcome(attempt.reason).wireName, attempt.ip, attempt.userAgent,
         )
     }
 
@@ -137,6 +140,13 @@ class AuthAttemptStore(private val jdbc: JdbcTemplate, private val policy: AuthA
         fun timestamp(instant: Instant): OffsetDateTime = OffsetDateTime.ofInstant(instant, ZoneOffset.UTC)
 
         fun ResultSet.instantOrNull(column: String): Instant? = getObject(column, OffsetDateTime::class.java)?.toInstant()
+
+        val REPLAYED_OUTCOMES = setOf(AuthOutcome.SUCCESS, AuthOutcome.FAILURE, AuthOutcome.LOCKED)
+
+        /** 거절 이유 → 기록의 결과 낱말(같은 글자) — 세 이유 밖이면 계약 위반 */
+        fun rejectedOutcome(reason: String): AuthOutcome =
+            setOf(AuthOutcome.RATE_LIMITED, AuthOutcome.ORIGIN_REJECTED, AuthOutcome.MALFORMED).firstOrNull { it.wireName == reason }
+                ?: throw IllegalArgumentException("거절 이유가 아니다: $reason")
 
         fun outcome(wireName: String): AuthOutcome =
             AuthOutcome.entries.firstOrNull { it.wireName == wireName } ?: throw IllegalStateException("알 수 없는 결과 낱말: $wireName")
