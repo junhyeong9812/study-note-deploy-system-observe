@@ -107,6 +107,11 @@ enum class MetricDropReason(val wireName: String) {
      * GPU 온도는 −50~150, 바이트 수·재시작 횟수·`interval_ms` 는 정수(컨테이너 CPU 는 코어 하나 = 100 이라 위 상한이 없다)
      */
     INVALID_VALUE("invalid_value"),
+    /**
+     * 측정 시각이 수신 시각보다 6일 넘게 뒤다(§15.1 — 원본 보관 7일과 하루의 여유). 원본이 이미 지워진 구간의 5분 평균이
+     * 그 한 건으로 덮어써지지 않게 버린다. 정확히 6일은 받는다(리뷰 루프 1 — 구현 전)
+     */
+    TOO_OLD("too_old"),
 }
 
 /** 스트림 항목 하나를 해석한 결과 */

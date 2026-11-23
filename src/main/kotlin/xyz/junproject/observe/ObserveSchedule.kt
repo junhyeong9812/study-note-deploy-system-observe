@@ -18,6 +18,7 @@ import xyz.junproject.observe.metric.MetricRollupResult
 import xyz.junproject.observe.metric.MetricStore
 import java.time.Duration
 import java.time.Instant
+import xyz.junproject.observe.threshold.DispatchOutcome
 import xyz.junproject.observe.threshold.ThresholdRound
 import xyz.junproject.observe.threshold.ThresholdRoundResult
 
@@ -204,6 +205,16 @@ class ObserveSchedule(
 
     /** [now] 로 한 바퀴([ThresholdRound.runOnce]) — 예외를 내지 않는다. [thresholdRound] 가 없으면 null */
     internal fun judgeThresholds(now: Instant): ThresholdRoundResult? = thresholdRound?.runOnce(now)
+
+    /**
+     * 알림 보내기(§15 · §15.1 — 판정과 따로 돈다. 구현 전). 구현 때 `@Scheduled(fixedDelayString = "\${observe.alert.dispatch-interval-ms:30000}")`
+     * (환경 변수 `ALERT_DISPATCH_INTERVAL_MS`) — 판정과 서로 기다리지 않게 예약 실행기의 스레드가 하나여도 막히지 않아야 한다.
+     * 구현 때 [judgeThresholds] 는 판정만([ThresholdRound.judgeOnce]) 하고 보내기를 부르지 않는다.
+     */
+    fun dispatchAlerts(): Unit = TODO("not implemented")
+
+    /** [now] 로 보내기 한 바퀴([ThresholdRound.dispatchOnce]) — 예외를 내지 않는다. [thresholdRound] 가 없으면 null (구현 전) */
+    internal fun dispatchAlerts(now: Instant): DispatchOutcome? = TODO("not implemented")
 
     companion object {
         val RETENTION: Duration = Duration.ofDays(30)

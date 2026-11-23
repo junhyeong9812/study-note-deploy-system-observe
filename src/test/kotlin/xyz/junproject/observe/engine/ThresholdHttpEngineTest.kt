@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.boot.test.context.SpringBootTest
+import org.springframework.test.annotation.DirtiesContext
 import org.springframework.core.env.Environment
 import org.springframework.data.redis.core.StringRedisTemplate
 import org.springframework.jdbc.core.JdbcTemplate
@@ -35,6 +36,7 @@ import java.util.concurrent.atomic.AtomicInteger
 @Tag("engine")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@DirtiesContext   // 클래스가 끝나면 문맥(연결 풀 19개)을 닫는다 — 문맥이 쌓이면 테스트 DB 의 연결 상한(100)을 넘는다
 class ThresholdHttpEngineTest {
     @Autowired private lateinit var environment: Environment
     @Autowired private lateinit var redis: StringRedisTemplate

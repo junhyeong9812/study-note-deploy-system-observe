@@ -37,6 +37,12 @@ class MetricHealth(
      * 판정 · 보내기의 실패는 `metrics.status` 를 바꾸지 않는다. 없으면 칸도 없다(기존 칸 그대로).
      */
     private val thresholds: ThresholdRound? = null,
+    /**
+     * 리뷰 루프 1(§15.1 — 구현 전): 서버마다 측정 시각이 가장 늦은 항목(헬스용 연결로 짧게 읽는다). 있으면 `clock_behind` 칸 —
+     * 그 항목의 수신 − 측정이 [ClockBehind.LIMIT] 을 넘는 서버 이름(이름순). 처음 그렇게 된 서버는 로그 1줄, 풀리면 1줄.
+     * 읽지 못하면 빈 목록. [thresholds] 가 있으면 `silent_judging`(지금 끊김을 판정하는가)도 더한다.
+     */
+    private val latestSamples: (() -> List<ResourceSample>)? = null,
 ) {
     private val log = LoggerFactory.getLogger("observe")
     @Volatile private var lastLoggedProblem: String? = null

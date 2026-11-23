@@ -33,3 +33,4 @@ observe:
     events-url: ${ALERT_EVENTS_URL:}
     secret: ${ALERT_SECRET:}
     timeout-ms: ${ALERT_TIMEOUT_MS:3000}
+    dispatch-interval-ms: ${ALERT_DISPATCH_INTERVAL_MS:30000}   # 알림 보내기 바퀴의 간격 — 판정과 따로 돈다

@@ -91,6 +91,13 @@ class AlertDispatcher(
     private val queue: AlertQueue,
     private val sender: AlertSender,
     private val batchSize: Int = 50,
+    /**
+     * 리뷰 루프 1(§15.1 — 구현 전): 한 바퀴의 보내기가 [clock] 으로 잰 합계 [roundBudget] 를 **넘기면**(같으면 아직) 다음 건을 보내지 않고 멈춘다.
+     * "다시 시도"가 나온 알림과 같은 대상(서버 · 규칙 · 대상 이름)의 뒤 알림은 그 바퀴에 보내지도 표시하지도 않는다(같은 대상 안의 순서 유지) —
+     * 다른 대상은 계속 보낸다. "거절"은 건너뛰고 계속한다(같은 대상의 뒤 알림도 보낸다).
+     */
+    private val roundBudget: Duration = Duration.ofSeconds(30),
+    private val clock: () -> Instant = Instant::now,
 ) {
     fun dispatch(now: Instant): DispatchOutcome = queue.whileHoldingDispatchLock {
         var delivered = 0

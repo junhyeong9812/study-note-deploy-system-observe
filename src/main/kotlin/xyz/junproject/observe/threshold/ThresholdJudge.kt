@@ -129,6 +129,11 @@ data class JudgeInput(
     val samples: List<ResourceSample>,
     val lastReceivedAt: Map<String, Instant>,
     val expectedServers: Set<String>,
+    /**
+     * 끊김 규칙을 판정하는가(§15.1 — [SilentGate]). false 면 끊김은 보류다: 새로 울리지도, 울리던 것을 해소하지도, 다시 알리지도 않는다.
+     * 다른 규칙은 그대로 판정한다(리뷰 루프 1 — 구현 전)
+     */
+    val silentJudging: Boolean = true,
 )
 
 /** 판정 결과 — [states] 는 판정 뒤의 **모든** 상태(앞 상태 중 이번에 보지 않은 것도 그대로 싣는다), [events] 는 이번에 만든 알림 */
