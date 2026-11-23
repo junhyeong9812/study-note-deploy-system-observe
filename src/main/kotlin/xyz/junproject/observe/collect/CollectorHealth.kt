@@ -18,7 +18,7 @@ import java.time.Instant
  * - `starting`(503): 뜬 지 [stallAfter] 가 안 됐고 아직 한 바퀴도 성공하지 못했다. 배포의 헬스 게이트는 첫 200 에서 통과하므로
  *   한 번도 수집하지 못한 자리를 통과시키지 않게 503 이다.
  * - `stalled`(503): 그 밖 — 바퀴가 [stallAfter] 넘게 끝나지 않는다(첫 바퀴 전 포함).
- * 밀린 건수(lag)와 30일 삭제 결과는 본문에만 낸다 — 밀림은 장애가 아니라 진행 상황이고, 삭제 실패는 수집과 무관하다.
+ * 밀린 건수(lag)와 30일 삭제·로그인 시도 90일 삭제 결과는 본문에만 낸다 — 밀림은 장애가 아니라 진행 상황이고, 삭제 실패는 수집과 무관하다.
  * 실패 사유는 예외 종류 이름만 낸다(헬스는 인증이 없다). 문구는 서버 로그에만.
  */
 class CollectorHealth(
@@ -27,6 +27,7 @@ class CollectorHealth(
     private val lag: () -> Long?,                     // 그룹에 아직 전달되지 않은 건수 — 셀 수 없으면 null, 실패해도 판정에 넣지 않는다
     private val latestStoredAt: () -> Instant?,       // DB 의 가장 최근 행의 시각(비었으면 null) — 닿지 못하면 예외
     private val lastRetention: () -> RetentionResult?,
+    private val lastAuthRetention: () -> RetentionResult? = { null },   // 로그인 시도 기록 90일 삭제 — 본문에만, 판정에 넣지 않는다
     private val stallAfter: Duration = Duration.ofSeconds(60),
     private val startedAt: Instant = Instant.now(),
 ) {
@@ -52,6 +53,7 @@ class CollectorHealth(
             else -> "stalled"
         }
         val retention = lastRetention()
+        val authRetention = lastAuthRetention()
         val body = mapOf(
             "status" to status,
             "last_loop_at" to (lastLoopAt?.toString() ?: ""),
@@ -63,6 +65,9 @@ class CollectorHealth(
             "last_retention_at" to (retention?.ranAt?.toString() ?: ""),
             "last_retention_deleted" to (retention?.deleted ?: -1),
             "last_retention_failure" to (retention?.failure ?: ""),
+            "last_auth_retention_at" to (authRetention?.ranAt?.toString() ?: ""),
+            "last_auth_retention_deleted" to (authRetention?.deleted ?: -1),
+            "last_auth_retention_failure" to (authRetention?.failure ?: ""),
         )
         return Report(status == "ok", body)
     }

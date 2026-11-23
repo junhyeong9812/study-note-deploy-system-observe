@@ -1,6 +1,6 @@
 # study-note-deploy-system-observe
 
-관측 서버 — 네 서비스(front · backend · llm · 배포 시스템)가 Redis 스트림 `logs` 로 보내는 요청 단위 로그를 받아 30일 동안 보관하고, 조회 API 로 찾아보게 한다. Kotlin · Spring Boot · PostgreSQL.
+관측 서버 — 네 서비스(front · backend · llm · 배포 시스템)가 Redis 스트림 `logs` 로 보내는 요청 단위 로그를 받아 30일 동안 보관하고, 조회 API 로 찾아보게 한다. 어드민의 로그인 시도를 기록하고 잠금을 판정한다(아래 "로그인 시도와 잠금"). Kotlin · Spring Boot · PostgreSQL.
 
 ```
 front · backend · llm · 배포 시스템 ── XADD logs ──▶ Redis(backend 서버의 것, 상한 약 1만 건)
@@ -29,6 +29,10 @@ front · backend · llm · 배포 시스템 ── XADD logs ──▶ Redis(bac
 | `GET /logs` | `X-Observe-Secret` | 로그 조회(최신순). 조건은 아래 |
 | `GET /logs/stats` | `X-Observe-Secret` | 기간 안의 시간·서비스·레벨별 건수(`counts: [{hour, service, level, count}]`). 기간을 주지 않으면 최근 24시간 |
 | `GET /health` | 없음 | 수집이 살아 있는가 — 아래 "헬스" |
+| `POST /auth/attempts` | `X-Observe-Secret` | 로그인 시도의 기록과 잠금 판정 — 아래 "로그인 시도와 잠금" |
+| `POST /auth/attempts/rejected` | `X-Observe-Secret` | 자격 검증 전에 거절한 시도의 기록 |
+| `GET /auth/attempts` | `X-Observe-Secret` | 시도 기록 목록(최신순) |
+| `GET /auth/lock` | `X-Observe-Secret` | 지금의 잠금 상태(화면 표시용) |
 
 `GET /logs` 의 조건(모두 선택):
 
@@ -71,6 +75,53 @@ front · backend · llm · 배포 시스템 ── XADD logs ──▶ Redis(bac
 | `lag` | 그룹에 아직 전달되지 않은 밀린 건수(`XINFO GROUPS` 의 lag, 읽지 못하면 -1). 판정에는 넣지 않는다 — 밀림은 진행 상황 |
 | `failure` | 실패 사유 — 예외 종류 이름만(헬스는 인증이 없어 문구는 서버 로그에만). 정상이면 빈 문자열 |
 | `last_retention_at` · `last_retention_deleted` · `last_retention_failure` | 마지막 30일 삭제의 실행 시각 · 지운 건수 · 실패 종류(뜬 뒤 아직 안 돌았으면 빈 문자열 · -1 · 빈 문자열, 실패면 건수 -1). 판정에는 넣지 않는다 |
+| `last_auth_retention_at` · `last_auth_retention_deleted` · `last_auth_retention_failure` | 마지막 로그인 시도 기록 삭제(보관 기간, 기본 90일)의 같은 세 칸. 판정에는 넣지 않는다 |
+
+## 로그인 시도와 잠금
+
+어드민(계정 하나)의 로그인 시도를 기록하고, 연속 실패에 따른 잠금을 판정한다. 어드민 자리가 둘이어도 같은 답을 보게 판정은 여기서 한다.
+
+- **잠금**: 연속 `OBSERVE_AUTH_FAILURE_LIMIT`(기본 5)회 실패 → `OBSERVE_AUTH_LOCK_DURATION`(기본 15분) 잠금. 잠금 중에는 자격이 맞아도 `locked` 로 거절하고, 그 시도는 횟수를 늘리지도 잠금을 연장하지도 않는다(기록만). 성공하면 횟수 0. 잠금 끝 시각이 지나면 0 부터 센다. 시각은 요청의 `at` 기준이다.
+- **판정은 PostgreSQL 트랜잭션 한 건**: 잠금 상태 행을 `SELECT … FOR UPDATE` 로 잡고 기록 · 횟수 갱신 · 판정을 함께 커밋한다. 동시에 들어온 실패도 횟수가 겹치지 않고 잠금 시작(`lock_started:true`)은 한 번뿐이다.
+- **같은 `attempt_id`** 를 다시 보내면 새로 세지 않고 처음의 판정·처음의 기록을 그대로 돌려준다(응답을 잃은 재시도용 — 동시 재전송도 같다). 거절 기록도 같은 ID 면 한 건.
+- **보관**: `OBSERVE_AUTH_RETENTION`(기본 90일). 30일 로그 삭제와 같은 예약 실행(매일 03:40 서울)에서 따로 돈다 — 한쪽이 실패해도 다른 쪽은 돌고, 결과는 헬스의 `last_auth_retention_*` 와 서버 로그에 남는다.
+- **표**: `auth_attempt`(시도 한 건 = 한 행) · `auth_lock_state`(잠금 상태 한 행). `log_entry` 는 건드리지 않는다. 표는 **관측 서버가 뜬 뒤 이 경로들에 처음 닿는 호출(또는 예약 삭제)이 만든다**(`CREATE … IF NOT EXISTS`) — 뜰 때 DB 가 없어도 앱은 죽지 않고, 만들지 못한 동안의 호출은 503 이며 다음 호출이 다시 만든다. 두 자리가 동시에 처음 만들면 한쪽 호출 하나가 실패하고 다음 호출에 회복한다.
+- **연결**: 전용 연결 풀(3개, 문장 4초 제한) — 수집·로그 조회와 다투지 않는다.
+- 입력한 ID·비밀번호는 받지도 저장하지도 않는다(자격이 맞았는가만). IP·User-Agent 는 이 표에만 있고 서버 로그에는 적지 않는다.
+
+`POST /auth/attempts` 본문:
+
+| 칸 | 뜻 |
+|---|---|
+| `attempt_id` | UUID(표준 꼴 8-4-4-4-12). 필수 |
+| `at` | 시도 시각, ISO(예: `2026-11-22T03:00:00Z`). 필수 |
+| `credential_ok` | 자격이 맞았는가(true·false). 필수 |
+| `ip` | 1~64자. 필수 |
+| `user_agent` | 200자 이하(빈 문자열 허용). 필수 |
+| `replayed` | true·false. **칸이 없을 때만** 기본 false — 칸이 있으면 null 이어도 422. true 는 관측 서버 장애 동안 어드민이 임시 제한으로 판정한 시도를 나중에 보내는 것 — **기록만 하고 잠금 계산에 넣지 않는다** |
+| `outcome` | `replayed:true` 면 **필수** — 어드민이 실제 내린 판정 `success` · `failure` · `locked`(글자 그대로) 중 하나, 그 값을 그대로 기록한다. `replayed:false`(또는 빠짐)에 이 칸이 **있으면 값이 null 이어도** 422 |
+
+응답 `data`: `{allowed, outcome("success"|"failure"|"locked"), locked_until(ISO 또는 null), lock_started, failures}`. `lock_started` 는 잠금으로 바뀐 그 한 번만 true(알림을 보낼 때). `replayed:true` 의 응답은 `allowed:false` · 보낸 `outcome` · 지금의 잠금 끝과 횟수 · `lock_started:false` 다(로그인 허용의 답이 아니다).
+
+`POST /auth/attempts/rejected` 본문: `{attempt_id, at, reason, ip, user_agent}` — `reason` 은 `rate_limited` · `origin_rejected` · `malformed` 중 하나(그 밖은 422 — `not_configured` 같은 이유는 없다), 기록의 `outcome` 이 그 낱말이다. 기록만 하고 잠금 계산은 없다. 응답 `data`: `{recorded: true}`.
+
+`GET /auth/attempts?from=&to=&before=&limit=`: 기간은 ISO, 최대 90일 — 둘 다 없으면 지금까지 90일, `from` 만 있으면 지금까지, `to` 만 있으면 그 앞 90일. `limit` 1~200, 기본 50. 이어 보기는 `/logs` 와 같다(응답의 `next_before` 를 `before` 로, `from`·`to` 는 앞 응답 것을 그대로; `before` 만 넘기면 422). 응답 `data`: `{attempts: [{id, at, outcome, ip, user_agent, replayed}], next_before, from, to}` — `outcome` 은 위 여섯 낱말 중 하나.
+
+`GET /auth/lock`: 응답 `data`: `{locked, locked_until(ISO 또는 null), failures}` — 화면 표시용이고 판정에는 쓰지 않는다(판정은 `POST /auth/attempts` 한 번으로 끝난다). 잠금 끝이 지났으면 `failures` 는 0 으로 보인다.
+
+오류(네 경로 공통 — 모두 `{success: false, error: {code}}` 봉투):
+
+| HTTP | `code` | 언제 |
+|---|---|---|
+| 401 | `unauthorized` | 비밀값이 없거나 다르다(서버의 `OBSERVE_SECRET` 이 비면 전부). **본문 해석보다 먼저** 본다 — 본문이 어떤 꼴이든 401 |
+| 422 | `invalid_request` | 본문·조건의 꼴이 틀리다(`detail` 에 이유). 칸은 있는데 값이 null 인 것도 꼴이 틀린 것이다(필수 칸 · `replayed` · `replayed:false` 의 `outcome`). 거절 기록 경로는 계약에 없는 칸을 무시한다. 두 POST 경로에서는 해석할 수 없는 본문도 여기다 — Content-Type 이 JSON 이 아니거나 없음 · 본문 없음 · 빈 글자 · 깨진 JSON · JSON 뒤의 군더더기 · 객체가 아닌 JSON(배열·글자·null) · 본문 16KiB 초과. 프레임워크의 400·415 는 나가지 않는다. 저장소에 닿지 않는다(기록 없음) |
+| 503 | `query_failed` | DB 오류 · 연결 불가 · 시간 초과(예외 문구는 응답에 넣지 않고 서버 로그에만) |
+
+| 설정(환경변수) | 기본 | 뜻 |
+|---|---|---|
+| `OBSERVE_AUTH_FAILURE_LIMIT` | `5` | 잠금까지의 연속 실패 횟수 |
+| `OBSERVE_AUTH_LOCK_DURATION` | `15m` | 잠금 시간 |
+| `OBSERVE_AUTH_RETENTION` | `90d` | 시도 기록 보관 기간 |
 
 ## 무중단 배포와 두 자리
 
@@ -78,7 +129,8 @@ front · backend · llm · 배포 시스템 ── XADD logs ──▶ Redis(bac
 
 - 두 자리는 같은 소비자 그룹을 같은 소비자 이름으로 읽는다. 새 항목은 Redis 가 한쪽에만 준다.
 - 한쪽이 저장하다 죽어 확인하지 못한 항목은 같은 이름의 미확인분이라 다른 쪽이 기동 직후와 1분마다 다시 받아 저장한다(따로 넘겨받는 절차가 없다). 그 사이 양쪽이 같은 항목을 저장해도 기본 키가 한 번만 남긴다.
-- 30일 삭제가 두 자리에서 함께 돌아도 결과가 같다.
+- 30일 삭제(와 로그인 시도 기록 삭제)가 두 자리에서 함께 돌아도 결과가 같다.
+- 로그인 잠금 판정은 두 자리가 같은 DB 의 같은 상태 행을 잡으므로 어느 자리가 받아도 같다.
 - 조회는 nginx 가 보내는 자리 하나가 받는다. 두 자리는 같은 DB 를 본다.
 
 ## 구동
