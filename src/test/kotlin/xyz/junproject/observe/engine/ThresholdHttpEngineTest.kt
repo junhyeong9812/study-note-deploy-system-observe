@@ -113,6 +113,15 @@ class ThresholdHttpEngineTest {
     }
 
     @Test
+    fun `한 번도 보내지 않은 기대 서버의 끊김이 latest 의 firing 에 나온다`() {
+        val silent = eventually("firing 에 ci-agent-164 의 끊김이 나오기") {
+            @Suppress("UNCHECKED_CAST")
+            (data(call("/metrics/latest"))["firing"] as List<Map<String, Any?>>).firstOrNull { it["server"] == "ci-agent-164" && it["rule"] == "silent" }
+        }
+        assertEquals("warning", silent["severity"])
+    }
+
+    @Test
     fun `latest 의 firing 에 지금 넘어 있는 규칙이 나온다`() {
         sendFiveMinutesOfHighMemory()
         val memory = eventually("firing 에 메모리가 나오기") {

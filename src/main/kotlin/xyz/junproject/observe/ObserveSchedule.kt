@@ -196,14 +196,14 @@ class ObserveSchedule(
             .getOrNull()
     }
 
-    /**
-     * 임계값 판정과 보내기(task 04 — 구현 전). 구현 때 `@Scheduled(fixedDelayString = "\${observe.metrics.judge-interval-ms:30000}")` —
-     * 지금 시각으로 [judgeThresholds] 를 부른다.
-     */
-    fun judgeThresholds(): Unit = TODO("not implemented")
+    /** 임계값 판정과 보내기 — 지금 시각으로 [judgeThresholds]. 판정 · 보내기는 다른 예약 실행(5분 평균 · 삭제)과 잠금을 나누지 않는다 */
+    @Scheduled(fixedDelayString = "\${observe.metrics.judge-interval-ms:30000}")
+    fun judgeThresholds() {
+        judgeThresholds(Instant.now())
+    }
 
     /** [now] 로 한 바퀴([ThresholdRound.runOnce]) — 예외를 내지 않는다. [thresholdRound] 가 없으면 null */
-    internal fun judgeThresholds(now: Instant): ThresholdRoundResult? = TODO("not implemented")
+    internal fun judgeThresholds(now: Instant): ThresholdRoundResult? = thresholdRound?.runOnce(now)
 
     companion object {
         val RETENTION: Duration = Duration.ofDays(30)

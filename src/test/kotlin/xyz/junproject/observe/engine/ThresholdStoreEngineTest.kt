@@ -3,6 +3,7 @@ package xyz.junproject.observe.engine
 import com.zaxxer.hikari.HikariConfig
 import com.zaxxer.hikari.HikariDataSource
 import org.junit.jupiter.api.AfterAll
+import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Tag
@@ -53,15 +54,18 @@ class ThresholdStoreEngineTest {
     private val schema = "threshold_engine"
     private val administration: HikariDataSource = EngineSupport.dataSource(size = 2)
     private val administrationJdbc = JdbcTemplate(administration)
-    private val openedPools = mutableListOf<HikariDataSource>()
+    /** 사례 안에서 만든 여분의 풀 — 사례가 끝나면 닫는다(쌓이면 테스트 DB 의 연결 상한을 넘는다) */
+    private val testPools = mutableListOf<HikariDataSource>()
 
-    /** 자리 하나에 해당하는 연결 풀 — 저장소 둘을 서로 다른 풀로 만들어 두 인스턴스를 흉내 낸다 */
-    private fun pool(size: Int = 4) = HikariDataSource(HikariConfig().apply {
+    private fun newPool(size: Int) = HikariDataSource(HikariConfig().apply {
         jdbcUrl = EngineSupport.databaseUrl + "?currentSchema=${this@ThresholdStoreEngineTest.schema}"
         username = EngineSupport.databaseUser; password = EngineSupport.databasePassword; maximumPoolSize = size
-    }).also { openedPools += it }
+    })
 
-    private val dataSource = pool(8)
+    /** 자리 하나에 해당하는 연결 풀 — 저장소 둘을 서로 다른 풀로 만들어 두 인스턴스를 흉내 낸다. 그 사례가 끝나면 닫힌다 */
+    private fun pool(size: Int = 4) = newPool(size).also { testPools += it }
+
+    private val dataSource = newPool(8)
     private val store = ThresholdStore(JdbcTemplate(dataSource))
     private val metricStore = JdbcTemplate(dataSource).let { MetricStore(it, it, it) }
     private val now = Instant.parse("2026-11-24T03:00:00Z")
@@ -76,10 +80,16 @@ class ThresholdStoreEngineTest {
         metricStore.createSchema()
     }
 
+    @AfterEach
+    fun closeTestPools() {
+        testPools.forEach { it.close() }
+        testPools.clear()
+    }
+
     @AfterAll
     fun close() {
         administrationJdbc.execute("DROP SCHEMA IF EXISTS $schema CASCADE")
-        openedPools.forEach { it.close() }
+        dataSource.close()
         administration.close()
     }
 

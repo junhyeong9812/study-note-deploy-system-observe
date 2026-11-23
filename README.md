@@ -125,10 +125,11 @@ front · backend · llm · 배포 시스템 ── XADD logs ──▶ Redis(bac
 
 ## 자원 지표
 
-서버마다 도는 ci-cd agent 가 30초마다 그 서버의 자원 값(서버 전체 · 이 프로젝트의 컨테이너 · GPU)을 한 묶음으로 Redis 스트림 `metrics` 에 넣는다(로그와 같은 Redis, 스트림만 다르다). 관측 서버가 그것을 받아 원본 7일 · 5분 평균 30일 보관하고, 어드민이 조회한다. 임계값 판정과 알림은 아직 없다(`firing` 은 늘 빈 배열).
+서버마다 도는 ci-cd agent 가 30초마다 그 서버의 자원 값(서버 전체 · 이 프로젝트의 컨테이너 · GPU)을 한 묶음으로 Redis 스트림 `metrics` 에 넣는다(로그와 같은 Redis, 스트림만 다르다). 관측 서버가 그것을 받아 원본 7일 · 5분 평균 30일 보관하고, 30초마다 임계값을 판정해 넘거나 풀리면 알림 서버로 알리고(아래 "임계값과 알림"), 어드민이 조회한다.
 
 ```
 ci-cd agent(서버마다, 30초) ── XADD metrics ──▶ Redis ──▶ 관측 서버(지표 전용 수집 스레드) ──▶ PostgreSQL
+                                                                 ├─ 임계값 판정(30초) ── POST /events ──▶ 알림 서버
                                                                  └─ GET /metrics/latest · /metrics/series · /metrics/containers ◀── 어드민
 ```
 
@@ -174,7 +175,7 @@ ci-cd agent(서버마다, 30초) ── XADD metrics ──▶ Redis ──▶ �
 
 | 경로 | 설명 |
 |---|---|
-| `GET /metrics/latest` | `{servers: [{server, at, received_at, age_ms, stale, host, containers, gpus, missing}], firing: []}` — 최근 24시간에 받은 서버마다 측정 시각이 가장 늦은 묶음. `at` 은 측정 시각, `age_ms` 는 수신 시각부터, `stale` 은 3분 초과. `METRICS_EXPECTED_SERVERS` 의 서버 중 24시간 안에 받은 것이 없으면 "수신 없음"(`at` · `received_at` · `age_ms` · `host` 가 null, `stale` true). 이름순. 컨테이너에는 `series_name`(자리 이름을 뗀 이름)이 붙는다 |
+| `GET /metrics/latest` | `{servers: [{server, at, received_at, age_ms, stale, host, containers, gpus, missing}], firing: [{server, rule, target, severity, since, last_value}]}` — `firing` 은 지금 넘어 있는 규칙(아래 "임계값과 알림"). `servers` 는 최근 24시간에 받은 서버마다 측정 시각이 가장 늦은 묶음. `at` 은 측정 시각, `age_ms` 는 수신 시각부터, `stale` 은 3분 초과. `METRICS_EXPECTED_SERVERS` 의 서버 중 24시간 안에 받은 것이 없으면 "수신 없음"(`at` · `received_at` · `age_ms` · `host` 가 null, `stale` true). 이름순. 컨테이너에는 `series_name`(자리 이름을 뗀 이름)이 붙는다 |
 | `GET /metrics/series?server=&scope=&name=&from=&to=` | 계열 하나의 점 — `{server, scope, name, from, to, step_ms, source, points: [{at, <값>, <값>_max, …}]}` |
 | `GET /metrics/containers?server=&at=` | 그 서버에서 보인 컨테이너(자리 이름을 뗀 이름)와 마지막으로 보인 측정 시각 — `{server, from, to, containers: [{name, last_seen_at}]}`. `at` 이 없으면 최근 24시간, 있으면 그 시각 앞뒤 5분(연관 로그가 "그때 그 서비스가 있던 서버"를 고를 때) |
 
@@ -204,6 +205,11 @@ ci-cd agent(서버마다, 30초) ── XADD metrics ──▶ Redis ──▶ �
 | `last_received_at` | 서버 이름 → 마지막 수신 시각(읽지 못하면 빈 객체) |
 | `last_rollup_at` · `last_rollup_failure` | 5분 평균의 마지막 **성공** 시각 · 마지막 바퀴가 실패했으면 그 종류(성공이면 빈 문자열) |
 | `last_retention_at` · `last_retention_raw_deleted` · `last_retention_rollup_deleted` · `last_retention_failure` | 마지막 지표 삭제의 시각 · 지운 원본 항목 수 · 지운 (서버, 5분 구간) 수 · 실패 종류(안 돌았거나 실패면 빈 문자열 · -1) |
+| `last_judged_at` | 이 자리가 마지막으로 판정 잠금을 얻어 판정한 시각(없으면 빈 문자열 — 다른 자리가 판정 중이면 오래돼 보인다) |
+| `last_judge_failure` · `last_dispatch_failure` | 마지막 바퀴의 판정 · 보내기 단계가 실패했으면 그 종류(성공이면 빈 문자열) |
+| `undelivered_alerts` · `rejected_alerts` | 아직 보내지 못한 알림 수 · 알림 서버가 거절해 다시 보내지 않는 알림 수(읽지 못하면 -1) |
+
+판정 · 보내기의 실패도 `metrics.status` 와 로그 수집의 `status` 를 바꾸지 않는다 — 위 칸에만 나온다.
 
 ### 설정
 
@@ -213,9 +219,55 @@ ci-cd agent(서버마다, 30초) ── XADD metrics ──▶ Redis ──▶ �
 | `METRICS_GROUP` | `observe` | 소비자 그룹 이름 |
 | `METRICS_EXPECTED_SERVERS` | (없음) | 지표를 보내야 하는 서버 이름, 쉼표로 — 한 번도 보내지 않은 서버도 `GET /metrics/latest` 에 "수신 없음"으로 |
 | `METRICS_ROLLUP_INTERVAL_MS` | `60000` | 5분 평균 바퀴의 간격(밀리초) |
+| `METRICS_JUDGE_INTERVAL_MS` | `30000` | 임계값 판정 · 알림 보내기 바퀴의 간격(밀리초) |
+| `ALERT_EVENTS_URL` | (없음) | 알림 서버의 `/events` 까지 적은 주소(ci-cd 와 같은 이름). 비면 보내지 않고 못 보낸 알림으로 남긴다(`not_configured`) |
+| `ALERT_SECRET` | (없음) | 알림 서버의 `X-Alert-Secret` 값 — 비밀값, 서버 `.env` 에만 |
+| `ALERT_TIMEOUT_MS` | `3000` | 알림 하나를 보내는 기한(연결과 응답 전체) |
+| `METRICS_ALERT_*` | 위 규칙표 | 임계값 — 아래 "임계값과 알림"의 키 |
+
+### 임계값과 알림
+
+30초마다(`METRICS_JUDGE_INTERVAL_MS`) 저장된 최근 10분의 표본으로 **지금의 상태**만 판정한다. 밀린 항목이 한꺼번에 들어와도, 관측 서버가 꺼져 있다 돌아와도 지난 구간의 넘음 · 해소를 되짚어 알리지 않는다. 지속 시간은 측정 시각으로, 끊김은 수신 시각으로 잰다.
+
+| 규칙(`rule`) | 넘음(알림) | 해소 | 알림 `severity` |
+|---|---|---|---|
+| `disk_warning` | 루트 디스크 사용률이 최근 2분 안의 가장 최근 2회 모두 85% 이상 | 2회 모두 82% 아래 | warning |
+| `disk_critical` | 2회 모두 95% 이상(정상에서 곧바로도 — 경고를 따로 보내지 않는다) | 2회 모두 92% 아래 → 경고로 내려옴("위험 해소, 경고 유지", warning) · 82% 아래면 곧바로 정상(info) | critical |
+| `memory` | 메모리 사용률(`mem_used ÷ mem_total`)이 5분 동안 모두 90% 이상 | 5분 동안 모두 85% 아래 | warning |
+| `cpu` | 서버 CPU 사용률이 10분 동안 모두 90% 이상 | 5분 동안 모두 80% 아래 | warning |
+| `restarts` | 한 컨테이너(ID 별)의 재시작 횟수가 10분 안에 3 이상 늘어남 | 10분 동안 늘지 않음 · 그 컨테이너가 사라지고 서버는 계속 보냄(새 컨테이너로 바뀜) | warning |
+| `silent` | 서버의 마지막 수신이 3분 넘게 전이거나 한 번도 없음(기대 서버 + 한 번이라도 보낸 서버) — 정확히 3분은 아니다 | 다시 들어옴 | warning |
+
+- **결측은 미룬다**: 창 안의 값(null 제외)이 기대 수(창 ÷ 30초)의 절반에 못 미치거나, 가장 오래된 값이 창의 시작에서 30초 안에 있지 않으면(창을 덮지 못함 — 막 들어오기 시작한 서버) 그 규칙은 상태를 그대로 둔다. 결측은 넘음도 해소도 아니다. 디스크는 최근 2분 안에 값이 2개 있어야 한다. 재시작의 넘음은 창을 덮지 않아도 되지만 절반 규칙은 따른다.
+- **재시작은 컨테이너 ID 별**이다 — 배포로 컨테이너가 새로 만들어지면 새 기준이라 배포가 재시작으로 세지지 않는다.
+- **알림 key**: `resource:<서버>:<규칙>[:<컨테이너 이름>]`, 해소는 그 뒤에 `:resolved`(알림 서버가 같은 key 를 10분에 한 번만 보내므로 넘음과 해소의 key 를 나눈다). 디스크는 단계마다 규칙이 다르다(`disk_warning` · `disk_critical` — 경고 뒤에 오는 위험 알림이 억제되지 않게). key 는 120자를 넘지 않는다(길면 앞부분과 해시로 줄인다). `kind` 는 `resource_disk` · `resource_memory` · `resource_cpu` · `resource_restarts` · `resource_silent`, `source` 는 `observe`.
+- **알리는 때**: 넘을 때 1회, 해소될 때 1회(`info` — 디스크 위험에서 경고로 내려올 때만 `warning`), 넘어 있는 채로 마지막 알림에서 1시간이 지나면 같은 key 로 다시 1회(처음 넘은 시각은 그대로).
+- **판정 상태는 PostgreSQL 에**(`resource_rule_state`) — 관측 서버가 재시작하거나 자리를 바꿔도 같은 알림을 다시 만들지 않고 해소를 놓치지 않는다. 상태 변경과 보낼 알림(`resource_alert_outbox` — 알림마다 고유 키)은 **한 트랜잭션**에 기록한다.
+- **한 자리만 판정 · 한 자리만 보낸다**: 판정과 보내기는 각각 PostgreSQL 의 권고 잠금(기다리지 않고 시도)을 얻은 자리만 돈다. 표 잠금이 아니라서 지표 저장 · 조회 · 5분 평균 · 로그와 서로 막지 않는다. 보내기 잠금은 보내는 동안(한 바퀴 최대 50건 × 기한 3초) 쥔다 — 그동안 막히는 것은 다른 자리의 보내기뿐이다.
+- **보내기의 결과**: 2xx = 전달(표에서 지운다). 5xx · 429 · 401 · 403 · 연결 실패 · 기한 초과 · 주소 없음(`not_configured`) = 남겨 두고 다음 바퀴에 다시(헬스의 `undelivered_alerts`; 401 · 403 은 비밀값을 고치면 풀린다). 그 밖의 4xx = 거절 — 다시 보내지 않고 `rejected_alerts` 로 센다. 실패 사유는 HTTP 코드나 예외 종류 이름만 남긴다(주소 · 비밀값은 로그 · 헬스에 나오지 않는다).
+- 판정 · 보내기의 어떤 실패도 지표 수집 · 로그 수집 · 5분 평균 · 헬스의 기존 판정을 막거나 바꾸지 않는다.
+
+임계값 설정 — 설정 키 `observe.metrics.alert.<이름>` 또는 환경 변수 `METRICS_ALERT_<이름>`(비우면 기본값, 말이 안 되는 값이면 뜰 때 실패한다. 시간은 `5m` · `1h` 꼴):
+
+| 환경 변수 | 기본 | 뜻 |
+|---|---|---|
+| `METRICS_ALERT_DISK_WARNING_PCT` · `METRICS_ALERT_DISK_CRITICAL_PCT` | `85` · `95` | 디스크 경고 · 위험 기준(%) |
+| `METRICS_ALERT_DISK_RESOLVE_MARGIN_PCT` | `3` | 디스크 해소의 되돌림 폭(%p) |
+| `METRICS_ALERT_DISK_CONSECUTIVE` · `METRICS_ALERT_DISK_RECENT` | `2` · `2m` | 디스크의 연속 횟수 · 그 값을 찾는 최근 구간 |
+| `METRICS_ALERT_MEMORY_PCT` · `METRICS_ALERT_MEMORY_FOR` | `90` · `5m` | 메모리 넘음 기준 · 지속 |
+| `METRICS_ALERT_MEMORY_RESOLVE_PCT` · `METRICS_ALERT_MEMORY_RESOLVE_FOR` | `85` · `5m` | 메모리 해소 기준 · 지속 |
+| `METRICS_ALERT_CPU_PCT` · `METRICS_ALERT_CPU_FOR` | `90` · `10m` | CPU 넘음 기준 · 지속 |
+| `METRICS_ALERT_CPU_RESOLVE_PCT` · `METRICS_ALERT_CPU_RESOLVE_FOR` | `80` · `5m` | CPU 해소 기준 · 지속 |
+| `METRICS_ALERT_RESTART_INCREASE` · `METRICS_ALERT_RESTART_WINDOW` | `3` · `10m` | 재시작 증가 수 · 창 |
+| `METRICS_ALERT_SILENT_AFTER` | `3m` | 끊김 기준 |
+| `METRICS_ALERT_REMIND_EVERY` | `1h` | 다시 알림 간격 |
+| `METRICS_ALERT_SAMPLE_INTERVAL` | `30s` | agent 의 수집 간격 — 창의 기대 표본 수와 "창을 덮었는가"의 기준 |
 
 ### 알려진 한계
 
+- **알림이 한 번 더 갈 수 있다**: 알림 서버는 같은 key 를 10분 동안만 한 건으로 본다(중복 방지용 고유 번호를 받지 않는다). 관측 서버가 알림을 "보냈지만 보냈다고 적기 전"에 죽고 10분 넘게 지나 돌아오면 그 알림이 한 번 더 간다. 없애려면 알림 서버를 고쳐야 한다.
+- **빠른 재발생**: 같은 규칙이 10분 안에 해소됐다 다시 넘으면 알림 서버가 같은 key 를 억제해 두 번째 "넘음"은 발송되지 않는다. `firing` 에는 보인다.
+- 거절된 알림(`rejected_alerts`)은 표에 남는다(드물다 — 지우는 예약은 아직 없다).
 - **스트림 유실**: 스트림 상한(agent 의 `MAXLEN ~ 20000`, 약 2.3일분)을 넘게 관측 서버가 꺼져 있거나 Redis 가 재시작하면 그 구간의 지표는 사라진다 — 그래프에 빈 구간으로 보인다. 밀린 건수는 헬스의 `metrics.lag` 에.
 - 측정 시각이 늦은 항목(뒤처진 시계 · 밀린 항목)은 받는다. 다만 원본을 이미 지운(7일 지난) 5분 구간에 원본이 새로 들어오면 그 구간의 평균은 새로 들어온 원본만으로 다시 계산된다.
 - 큰 간격으로 묶을 때 5분 평균은 구간의 **시작 시각**이 든 칸에 통째로 들어간다(간격이 5분의 배수가 아니면 칸 경계에 걸친 구간이 한쪽에 몰린다).

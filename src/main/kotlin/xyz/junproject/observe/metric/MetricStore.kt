@@ -313,23 +313,50 @@ class MetricStore(
             head.copy(
                 containers = query.query(
                     "SELECT * FROM metric_container WHERE stream_ms = ? AND stream_seq = ? ORDER BY position",
-                    { row, _ ->
-                        ContainerValues(row.getString("name"), row.getString("container_id"), row.getString("project"), row.nullableDouble("cpu_pct"),
-                            row.nullableLong("mem_used"), row.nullableLong("restarts"), row.getString("state"))
-                    },
+                    { row, _ -> row.toContainer() },
                     head.id.millis, head.id.sequence,
                 ),
                 gpus = query.query(
                     "SELECT * FROM metric_gpu WHERE stream_ms = ? AND stream_seq = ? ORDER BY position",
-                    { row, _ ->
-                        GpuValues(row.getInt("gpu_index"), row.nullableDouble("util_pct"), row.nullableLong("mem_used"), row.nullableLong("mem_total"),
-                            row.nullableDouble("temp_c"))
-                    },
+                    { row, _ -> row.toGpu() },
                     head.id.millis, head.id.sequence,
                 ),
             )
         }
     }
+
+    /**
+     * 임계값 판정의 입력 — 측정 시각이 `(from, to]` 인 항목을 컨테이너 · GPU 까지(서버 · 측정 시각순). 조회 풀로 읽는다.
+     * 읽기만이라 5분 평균이 원본 표에 거는 SHARE 잠금에 막히지 않는다(읽기의 ACCESS SHARE 는 그것과 충돌하지 않는다).
+     */
+    override fun samplesMeasuredBetween(from: Instant, to: Instant): List<ResourceSample> {
+        ensureSchema()
+        val heads = query.query(
+            "SELECT * FROM metric_sample WHERE measured_ms > ? AND measured_ms <= ? ORDER BY server, measured_ms, stream_ms, stream_seq",
+            { row, _ -> row.toSampleHead() }, from.toEpochMilli(), to.toEpochMilli(),
+        )
+        if (heads.isEmpty()) return heads
+        fun <T> children(table: String, read: (ResultSet) -> T): Map<StreamId, List<T>> = query.query(
+            "SELECT * FROM $table WHERE measured_ms > ? AND measured_ms <= ? ORDER BY stream_ms, stream_seq, position",
+            { row, _ -> StreamId(row.getLong("stream_ms"), row.getInt("stream_seq")) to read(row) }, from.toEpochMilli(), to.toEpochMilli(),
+        ).groupBy({ it.first }, { it.second })
+        val containers = children("metric_container") { it.toContainer() }
+        val gpus = children("metric_gpu") { it.toGpu() }
+        return heads.map { it.copy(containers = containers[it.id].orEmpty(), gpus = gpus[it.id].orEmpty()) }
+    }
+
+    /** 서버별 마지막 수신 시각(판정용 — 조회 풀). 보관 중인 원본 전체에서 본다(하루 넘게 끊긴 서버도 든다) */
+    override fun lastReceivedOfEveryServer(): Map<String, Instant> {
+        ensureSchema()
+        return query.query("SELECT server, max(received_ms) AS last_received FROM metric_sample GROUP BY server",
+            { row, _ -> row.getString("server") to Instant.ofEpochMilli(row.getLong("last_received")) }).toMap()
+    }
+
+    private fun ResultSet.toContainer() = ContainerValues(getString("name"), getString("container_id"), getString("project"), nullableDouble("cpu_pct"),
+        nullableLong("mem_used"), nullableLong("restarts"), getString("state"))
+
+    private fun ResultSet.toGpu() = GpuValues(getInt("gpu_index"), nullableDouble("util_pct"), nullableLong("mem_used"), nullableLong("mem_total"),
+        nullableDouble("temp_c"))
 
     override fun containers(server: String, from: Instant, to: Instant): List<SeenContainer> {
         ensureSchema()
@@ -437,10 +464,6 @@ class MetricStore(
         gpus = emptyList(),
         missing = (getArray("missing").array as Array<*>).map { it as String },
     )
-
-    // resource-metrics task 04 — 임계값 판정이 읽는 면(구현 전)
-    override fun samplesMeasuredBetween(from: Instant, to: Instant): List<ResourceSample> = TODO("not implemented")
-    override fun lastReceivedOfEveryServer(): Map<String, Instant> = TODO("not implemented")
 
     companion object {
         val RAW_RETENTION: Duration = Duration.ofDays(7)

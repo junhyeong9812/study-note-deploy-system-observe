@@ -22,6 +22,15 @@ import xyz.junproject.observe.metric.MetricCollector
 import xyz.junproject.observe.metric.MetricHealth
 import xyz.junproject.observe.metric.MetricStore
 import xyz.junproject.observe.metric.RedisMetricStreamSource
+import xyz.junproject.observe.threshold.AlertDispatcher
+import xyz.junproject.observe.threshold.HttpAlertSender
+import xyz.junproject.observe.threshold.ResourceThresholds
+import xyz.junproject.observe.threshold.ThresholdJudge
+import xyz.junproject.observe.threshold.ThresholdRound
+import xyz.junproject.observe.threshold.ThresholdStore
+import org.springframework.core.env.Environment
+import java.time.Duration
+import kotlin.reflect.full.primaryConstructor
 
 /** 조립 — 연결 정보는 환경변수에서. DB 비밀번호 같은 값은 로그에 내지 않는다. */
 @Configuration
@@ -134,9 +143,72 @@ class ObserveConfiguration {
     fun metricCollector(source: RedisMetricStreamSource, store: MetricStore) = MetricCollector(source, store)
 
     @Bean
-    fun metricHealth(collector: MetricCollector, source: RedisMetricStreamSource, store: MetricStore, schedule: ObserveSchedule) =
+    fun metricHealth(collector: MetricCollector, source: RedisMetricStreamSource, store: MetricStore, schedule: ObserveSchedule, thresholdRound: ThresholdRound) =
         MetricHealth(collector, { source.unacknowledgedCount() }, { source.lag() }, { store.latestStoredAt() }, { store.lastReceivedByServer() },
-            { schedule.lastMetricRollup }, { schedule.lastMetricRollupSuccessAt }, { schedule.lastMetricRetention })
+            { schedule.lastMetricRollup }, { schedule.lastMetricRollupSuccessAt }, { schedule.lastMetricRetention }, thresholds = thresholdRound)
+
+    /**
+     * 임계값 수치 — 칸마다 설정 키 `observe.metrics.alert.<케밥꼴>` 또는 환경 변수 `METRICS_ALERT_<대문자 밑줄꼴>`(앞이 우선), 없으면
+     * [ResourceThresholds] 의 기본값(명세). 시간은 `5m` · `1h` 꼴. 말이 안 되는 값이면 뜰 때 실패한다.
+     */
+    @Bean
+    fun resourceThresholds(environment: Environment): ResourceThresholds {
+        val constructor = requireNotNull(ResourceThresholds::class.primaryConstructor)
+        val given = constructor.parameters.mapNotNull { parameter ->
+            val name = requireNotNull(parameter.name)
+            val words = name.split(Regex("(?=[A-Z])")).map { it.lowercase() }
+            val text = environment.getProperty("observe.metrics.alert.${words.joinToString("-")}")
+                ?: environment.getProperty("METRICS_ALERT_${words.joinToString("_").uppercase()}")
+                ?: return@mapNotNull null
+            val value: Any = when (parameter.type.classifier) {
+                Double::class -> text.trim().toDouble()
+                Int::class -> text.trim().toInt()
+                Duration::class -> DurationStyle.detectAndParse(text.trim())
+                else -> throw IllegalStateException("알 수 없는 임계값 칸: $name")
+            }
+            parameter to value
+        }.toMap()
+        return constructor.callBy(given).also { log.info("observe:observe:resource thresholds {}", it) }
+    }
+
+    /** 판정 · 알림 표 — 전용 연결 풀(4개 · 문장 10초): 판정 한 바퀴 · 보내기 잠금 · 보내기 표시 · 헬스 건수와 firing 이 함께 쓸 수 있게 */
+    @Bean
+    fun thresholdStore(
+        @Value("\${observe.db.url}") url: String,
+        @Value("\${observe.db.user}") user: String,
+        @Value("\${observe.db.password}") password: String,
+    ) = ThresholdStore(JdbcTemplate(pool("observe-threshold", url, user, password, size = 4, statementTimeoutMs = 10_000)))
+
+    /** 뜬 직후 판정 · 알림 표를 미리 만든다(최선 노력 — 실패해도 첫 바퀴 · 첫 조회가 다시 만든다) */
+    @EventListener(ApplicationReadyEvent::class)
+    fun prepareThresholdSchema(event: ApplicationReadyEvent) {
+        try {
+            event.applicationContext.getBean(ThresholdStore::class.java).prepareSchema()
+        } catch (error: Exception) {
+            log.error("observe:observe:threshold schema failed — will retry on first use: {}: {}", error.javaClass.simpleName, error.message?.take(200))
+        }
+    }
+
+    /** 알림 서버 `POST /events` — 주소 · 비밀값은 로그에 내지 않는다(주소가 있는지만) */
+    @Bean
+    fun httpAlertSender(
+        @Value("\${observe.alert.events-url:}") eventsUrl: String,
+        @Value("\${observe.alert.secret:}") secret: String,
+        @Value("\${observe.alert.timeout-ms:3000}") timeoutMs: Long,
+    ): HttpAlertSender {
+        if (eventsUrl.isBlank()) log.warn("observe:observe:alert events url is not configured — alerts stay undelivered")
+        return HttpAlertSender(eventsUrl, secret, Duration.ofMillis(timeoutMs))
+    }
+
+    @Bean
+    fun alertDispatcher(store: ThresholdStore, sender: HttpAlertSender) = AlertDispatcher(store, sender)
+
+    @Bean
+    fun thresholdRound(
+        metricStore: MetricStore, store: ThresholdStore, thresholds: ResourceThresholds, dispatcher: AlertDispatcher,
+        @Value("\${observe.metrics.expected-servers:}") expectedServers: String,
+    ) = ThresholdRound(metricStore, store, ThresholdJudge(thresholds), dispatcher, store,
+        expectedServers.split(',').map { it.trim() }.filter { it.isNotEmpty() }.toSet())
 
     @Bean
     fun logStreamSource(

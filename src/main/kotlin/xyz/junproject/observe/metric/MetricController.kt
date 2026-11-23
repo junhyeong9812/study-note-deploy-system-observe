@@ -27,7 +27,7 @@ import xyz.junproject.observe.threshold.FiringSource
  *   - 24시간 안에 받은 것이 없는 기대 서버("수신 없음"): `at`·`received_at`·`age_ms`·`host` 는 null, `stale` true, `containers`·`gpus`·`missing` 는 빈 배열.
  *   - `host`: 스트림 `body.host` 와 같은 칸 이름(없으면 null). `containers[]`: `{name, series_name, id, project, cpu_pct, mem_used, restarts, state}`
  *     (`series_name` = 자리 이름을 뗀 이름). `gpus[]`: `{index, util_pct, mem_used, mem_total, temp_c}`. 값이 없으면 JSON null.
- *   - `firing`: 이번 task 에서는 늘 빈 배열(임계값 판정은 task 04).
+ *   - `firing`: 지금 넘어 있는 규칙 `[{server, rule, target, severity, since, last_value}]`(판정을 붙이지 않았으면 빈 배열).
  * - `GET /metrics/series?server=&scope=&name=&from=&to=` → `{server, scope, name, from, to, step_ms, source, points}`
  *   - `server` 필수([MetricEntryParser.SERVER_NAME] 꼴). `scope` 필수(host·container·gpu). `name`: host 는 주면 422,
  *     container 는 필수(`[A-Za-z0-9][A-Za-z0-9_.-]{0,127}`), gpu 는 필수(숫자 1~3자리).
@@ -42,7 +42,7 @@ class MetricController(
     private val reader: MetricReader,
     @Value("\${observe.secret:}") private val secret: String,
     @Value("\${observe.metrics.expected-servers:}") private val expectedServers: String,
-    /** 지금 넘어 있는 규칙(task 04) — 있으면 `firing` 에 싣는다(구현 전). 없으면 늘 빈 배열 */
+    /** 지금 넘어 있는 규칙 — 있으면 `firing` 에 싣는다. 없으면 늘 빈 배열 */
     private val firingSource: FiringSource? = null,
 ) {
     private val log = LoggerFactory.getLogger("observe")
@@ -88,7 +88,11 @@ class MetricController(
         return answering("latest") {
             val received = reader.latest(now.minus(LATEST_WINDOW)).associateBy { it.server }
             val servers = (received.keys + expected).sorted().map { name -> received[name]?.let { latestServer(it, now) } ?: silentServer(name) }
-            ok(mapOf("servers" to servers, "firing" to emptyList<Any>()))   // 임계값 판정은 다음 task
+            val firing = firingSource?.firing().orEmpty().map {
+                mapOf("server" to it.server, "rule" to it.rule, "target" to it.target, "severity" to it.severity,
+                    "since" to it.since.toString(), "last_value" to it.lastValue)
+            }
+            ok(mapOf("servers" to servers, "firing" to firing))
         }
     }
 

@@ -1,7 +1,15 @@
 package xyz.junproject.observe.threshold
 
+import tools.jackson.databind.json.JsonMapper
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
 import java.time.Duration
 import java.time.Instant
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 
 /** 한 번 보낸 결과 */
 sealed interface SendOutcome {
@@ -30,7 +38,45 @@ class HttpAlertSender(
     private val secret: String,
     private val timeout: Duration = Duration.ofSeconds(3),
 ) : AlertSender {
-    override fun send(alert: ResourceAlert): SendOutcome = TODO("not implemented")
+    private val client = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).connectTimeout(timeout).build()
+    private val json = JsonMapper.builder().build()
+
+    override fun send(alert: ResourceAlert): SendOutcome {
+        if (eventsUrl.isBlank()) return SendOutcome.Retry(NOT_CONFIGURED)
+        return try {
+            val request = HttpRequest.newBuilder(URI(eventsUrl.trim())).timeout(timeout)
+                .header("Content-Type", "application/json").header("X-Alert-Secret", secret)
+                .POST(HttpRequest.BodyPublishers.ofString(json.writeValueAsString(alert.eventBody()))).build()
+            // 연결 · 응답 전체를 기한 하나로 — 응답 머리 뒤에 본문이 늦어도 기한에서 끊는다
+            val pending = client.sendAsync(request, HttpResponse.BodyHandlers.discarding())
+            val status = try {
+                pending.get(timeout.toMillis(), TimeUnit.MILLISECONDS).statusCode()
+            } catch (error: TimeoutException) {
+                pending.cancel(true)
+                throw error
+            }
+            outcome(status)
+        } catch (error: ExecutionException) {
+            SendOutcome.Retry((error.cause ?: error).javaClass.simpleName)             // 주소 · 문구는 싣지 않는다
+        } catch (error: InterruptedException) {
+            Thread.currentThread().interrupt()
+            SendOutcome.Retry(error.javaClass.simpleName)
+        } catch (error: Exception) {
+            SendOutcome.Retry(error.javaClass.simpleName)
+        }
+    }
+
+    private fun outcome(status: Int): SendOutcome = when {
+        status in 200..299 -> SendOutcome.Delivered
+        status >= 500 || status in RETRYABLE_CLIENT_ERRORS -> SendOutcome.Retry("http $status")       // 401 · 403 은 비밀값을 고치면 풀린다
+        status in 400..499 -> SendOutcome.Rejected("http $status")                                    // 같은 본문을 다시 보내도 같은 답
+        else -> SendOutcome.Retry("http $status")                                                     // 넘겨주기(3xx) 등 — 주소 설정의 문제
+    }
+
+    private companion object {
+        const val NOT_CONFIGURED = "not_configured"
+        val RETRYABLE_CLIENT_ERRORS = setOf(401, 403, 429)
+    }
 }
 
 /** 보내기 한 바퀴의 결과 — 잠금을 얻지 못했으면 [lockAcquired] 가 false 이고 아무것도 보내지 않았다 */
@@ -46,5 +92,17 @@ class AlertDispatcher(
     private val sender: AlertSender,
     private val batchSize: Int = 50,
 ) {
-    fun dispatch(now: Instant): DispatchOutcome = TODO("not implemented")
+    fun dispatch(now: Instant): DispatchOutcome = queue.whileHoldingDispatchLock {
+        var delivered = 0
+        var retrying = 0
+        var rejected = 0
+        for (queued in queue.pendingAlerts(batchSize)) {
+            when (val outcome = runCatching { sender.send(queued.alert) }.getOrElse { SendOutcome.Retry(it.javaClass.simpleName) }) {
+                SendOutcome.Delivered -> { queue.markDelivered(queued.id, now); delivered++ }
+                is SendOutcome.Retry -> { queue.markRetry(queued.id, now, outcome.reason); retrying++ }
+                is SendOutcome.Rejected -> { queue.markRejected(queued.id, now, outcome.reason); rejected++ }
+            }
+        }
+        DispatchOutcome(true, delivered, retrying, rejected)
+    } ?: DispatchOutcome(false, 0, 0, 0)
 }

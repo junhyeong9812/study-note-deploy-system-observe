@@ -123,7 +123,8 @@ class MetricHttpEngineTest {
         }
         assertEquals(Instant.ofEpochMilli(measuredAt.toEpochMilli()).toString(), server["at"])
         assertEquals(false, server["stale"])
-        assertEquals(emptyList<Any>(), data(call("GET", "/metrics/latest"))["firing"])
+        @Suppress("UNCHECKED_CAST")
+        assertEquals(emptyList<Any>(), (data(call("GET", "/metrics/latest"))["firing"] as List<Map<String, Any?>>).filter { it["server"] == "ci-agent-158" })
 
         val series = data(call("GET", "/metrics/series?server=ci-agent-158&scope=host"))
         assertEquals("raw", series["source"])

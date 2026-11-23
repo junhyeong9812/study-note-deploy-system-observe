@@ -1,5 +1,6 @@
 package xyz.junproject.observe.threshold
 
+import org.slf4j.LoggerFactory
 import xyz.junproject.observe.metric.MetricSampleSource
 import java.time.Instant
 
@@ -32,8 +33,31 @@ class ThresholdRound(
     @Volatile var lastResult: ThresholdRoundResult? = null; private set
     @Volatile var lastJudgedAt: Instant? = null; private set
 
-    fun runOnce(now: Instant): ThresholdRoundResult = TODO("not implemented")
+    private val log = LoggerFactory.getLogger("observe")
+
+    fun runOnce(now: Instant): ThresholdRoundResult {
+        // 판정과 보내기는 서로 따로 — 한쪽의 실패가 다른 쪽을 막지 않는다. Throwable 까지 잡는다(예약 실행을 죽이지 않게)
+        val judged = runCatching {
+            val recent = samples.samplesMeasuredBetween(now.minus(judge.lookback), now)
+            val received = samples.lastReceivedOfEveryServer()
+            states.judgeRound(now) { previous -> judge.judge(JudgeInput(now, recent, received, expectedServers), previous) }
+        }.onFailure { logFailure("judge", it) }
+        val dispatched = runCatching { dispatcher.dispatch(now) }.onFailure { logFailure("dispatch", it) }
+        val outcome = judged.getOrNull()
+        if (outcome?.judged == true) lastJudgedAt = now
+        val dispatch = dispatched.getOrNull()
+        if (outcome != null && outcome.eventsCreated > 0) log.info("observe:observe:threshold round created {} alerts", outcome.eventsCreated)
+        if (dispatch != null && dispatch.delivered + dispatch.retrying + dispatch.rejected > 0) {
+            log.info("observe:observe:alerts delivered {} · retrying {} · rejected {}", dispatch.delivered, dispatch.retrying, dispatch.rejected)
+        }
+        return ThresholdRoundResult(now, outcome?.judged == true, outcome?.eventsCreated ?: 0, judged.exceptionOrNull()?.javaClass?.simpleName,
+            dispatch, dispatched.exceptionOrNull()?.javaClass?.simpleName).also { lastResult = it }
+    }
+
+    /** 실패의 문구는 서버 로그에만(헬스에는 종류 이름만). 알림 서버의 주소 · 비밀값은 보내는 쪽이 문구에 싣지 않는다 */
+    private fun logFailure(stage: String, error: Throwable) =
+        log.error("observe:observe:threshold {} failed: {}: {}", stage, error.javaClass.simpleName, error.message?.take(200))
 
     /** 보낼 표의 건수(헬스용) — 읽지 못하면 null */
-    fun alertCounts(): AlertCounts? = TODO("not implemented")
+    fun alertCounts(): AlertCounts? = runCatching { queue.alertCounts() }.getOrNull()
 }

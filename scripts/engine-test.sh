@@ -14,7 +14,7 @@ database_password="observe-test-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"  
 
 cleanup() {
 	# 이 실행이 띄운 것만 지운다 — 이름에 접미사가 붙어 다른 컨테이너를 건드리지 않는다
-	docker rm -f "$runner" "$database" "$redis" >/dev/null 2>&1 || true
+	docker rm -f -v "$runner" "$database" "$redis" >/dev/null 2>&1 || true   # -v: 익명 볼륨(DB 데이터)까지 — 안 지우면 실행마다 약 1GB 가 남는다
 	docker network rm "$network" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT

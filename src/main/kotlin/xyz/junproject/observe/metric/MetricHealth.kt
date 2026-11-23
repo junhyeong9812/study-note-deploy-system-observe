@@ -32,7 +32,7 @@ class MetricHealth(
     private val stallAfter: Duration = Duration.ofSeconds(60),
     private val startedAt: Instant = Instant.now(),
     /**
-     * 임계값 판정 · 보내기(task 04 — 구현 전). 있으면 `metrics` 객체에 칸을 더한다: `last_judged_at`(마지막으로 판정한 시각, 없으면 빈 글자) ·
+     * 임계값 판정 · 보내기. 있으면 `metrics` 객체에 칸을 더한다: `last_judged_at`(마지막으로 판정한 시각, 없으면 빈 글자) ·
      * `last_judge_failure` · `last_dispatch_failure`(마지막 바퀴의 예외 종류, 없으면 빈 글자) · `undelivered_alerts` · `rejected_alerts`(읽지 못하면 -1).
      * 판정 · 보내기의 실패는 `metrics.status` 를 바꾸지 않는다. 없으면 칸도 없다(기존 칸 그대로).
      */
@@ -59,7 +59,18 @@ class MetricHealth(
         val dropped = collector.droppedCounts()
         val rollup = runCatching(lastRollup).getOrNull()
         val retention = runCatching(lastRetention).getOrNull()
-        return mapOf(
+        val judging = thresholds?.let { round ->
+            val result = round.lastResult
+            val counts = round.alertCounts()
+            mapOf(
+                "last_judged_at" to (round.lastJudgedAt?.toString() ?: ""),
+                "last_judge_failure" to (result?.judgeFailure ?: ""),
+                "last_dispatch_failure" to (result?.dispatchFailure ?: ""),
+                "undelivered_alerts" to (counts?.undelivered ?: -1L),
+                "rejected_alerts" to (counts?.rejected ?: -1L),
+            )
+        }.orEmpty()
+        return judging + mapOf(
             "status" to status,
             "last_loop_at" to (lastLoopAt?.toString() ?: ""),
             "last_stored_at" to (stored.getOrNull()?.toString() ?: ""),
