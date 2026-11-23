@@ -10,7 +10,12 @@ data class MetricAggregate(val average: Double, val maximum: Double, val samples
          * 더 큰 간격으로 묶기(§11.3) — 표본 수로 가중한 평균과 최댓값의 최댓값, 표본 수의 합.
          * 표본이 0 인 조각은 빼고, 남는 것이 없으면 null.
          */
-        fun combine(parts: List<MetricAggregate>): MetricAggregate? = TODO("not implemented")
+        fun combine(parts: List<MetricAggregate>): MetricAggregate? {
+            val counted = parts.filter { it.samples > 0 }
+            if (counted.isEmpty()) return null
+            val samples = counted.sumOf { it.samples }
+            return MetricAggregate(counted.sumOf { it.average * it.samples } / samples, counted.maxOf { it.maximum }, samples)
+        }
     }
 }
 
@@ -32,6 +37,21 @@ data class SeriesPlan(val step: Duration, val source: SeriesSource, val rawSince
         val ROLLUP_STEP: Duration = Duration.ofMinutes(5)
         val RAW_KEPT: Duration = Duration.ofDays(7)
 
-        fun choose(from: Instant, to: Instant, now: Instant): SeriesPlan = TODO("not implemented")
+        fun choose(from: Instant, to: Instant, now: Instant): SeriesPlan {
+            val rawSince = floorTo(now.minus(RAW_KEPT), ROLLUP_STEP)
+            val source = when {
+                !from.isBefore(rawSince) -> SeriesSource.RAW
+                !to.isAfter(rawSince) -> SeriesSource.ROLLUP
+                else -> SeriesSource.MIXED
+            }
+            val unit = STEP_UNIT.toMillis()
+            val perPoint = Math.ceilDiv(Duration.between(from, to).toMillis().coerceAtLeast(0), MAX_POINTS.toLong())
+            var step = Math.ceilDiv(perPoint, unit).coerceAtLeast(1) * unit
+            if (source != SeriesSource.RAW) step = step.coerceAtLeast(ROLLUP_STEP.toMillis())
+            return SeriesPlan(Duration.ofMillis(step), source, rawSince)
+        }
+
+        /** [at] 을 [unit] 단위(UTC epoch 기준)로 내린 시각 */
+        fun floorTo(at: Instant, unit: Duration): Instant = Instant.ofEpochMilli(Math.floorDiv(at.toEpochMilli(), unit.toMillis()) * unit.toMillis())
     }
 }

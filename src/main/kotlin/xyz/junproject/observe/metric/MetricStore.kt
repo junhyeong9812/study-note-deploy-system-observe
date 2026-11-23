@@ -1,6 +1,13 @@
 package xyz.junproject.observe.metric
 
 import org.springframework.jdbc.core.JdbcTemplate
+import org.springframework.jdbc.core.RowCallbackHandler
+import org.springframework.jdbc.datasource.DataSourceTransactionManager
+import org.springframework.transaction.support.TransactionTemplate
+import xyz.junproject.observe.log.StreamId
+import java.sql.PreparedStatement
+import java.sql.ResultSet
+import java.sql.Types
 import java.time.Duration
 import java.time.Instant
 
@@ -83,31 +90,390 @@ interface MetricMaintenance {
 /**
  * PostgreSQL 저장소 — 로그와 같은 DB, 표는 추가만(`log_entry` · `auth_*` 는 건드리지 않는다). 수집·조회·헬스의 연결 풀을 나눈다.
  * 표 이름과 꼴은 구현이 정한다(테스트는 이 면으로만 본다). 같은 스트림 ID 의 항목은 한 번만 남는다.
+ *
+ * 표(시각은 모두 epoch 밀리초 — 5분 구간 = `measured_ms / 300000 * 300000`):
+ * - `metric_sample`: 스트림 항목 하나 = 한 행(기본 키 = 스트림 ID). 서버 전체 값 · `missing` · 측정/수신 시각.
+ *   `insert_order` 는 DB 가 매기는 저장 순번 — 5분 평균이 "그 구간의 원본을 모두 담았는가"를 시계와 무관하게 판정한다(아래 [rollUp]).
+ * - `metric_container` · `metric_gpu`: 항목 안의 컨테이너 · GPU 하나 = 한 행(항목이 지워지면 함께 지워진다).
+ *   조회 꼴(서버 · 계열 이름 또는 번호 · 측정 시각 범위)에 맞춘 인덱스.
+ * - `metric_rollup_bucket`: (서버, 5분 구간)의 평균 계산 기록 — 계산 시각과 그때 본 마지막 저장 순번.
+ * - `metric_rollup`: (서버, 구간, 갈래, 계열 이름, 값 이름)마다 평균 · 최댓값 · 표본 수. host 의 계열 이름은 빈 글자.
  */
 class MetricStore(
     private val ingest: JdbcTemplate,
     private val query: JdbcTemplate,
     private val health: JdbcTemplate,
 ) : MetricSink, MetricReader, MetricMaintenance {
+    private val transaction = TransactionTemplate(DataSourceTransactionManager(requireNotNull(ingest.dataSource) { "JdbcTemplate 에 DataSource 가 없다" }))
+    @Volatile private var schemaReady = false
+    private val creatingSchema = Any()
 
-    override fun createSchema(): Unit = TODO("not implemented")
-    override fun insertAll(samples: List<ResourceSample>): Int = TODO("not implemented")
-    override fun series(query: SeriesQuery): List<SeriesPoint> = TODO("not implemented")
-    override fun rollups(server: String, scope: MetricScope, name: String?, from: Instant, to: Instant): List<MetricRollup> = TODO("not implemented")
-    override fun latest(receivedSince: Instant): List<ResourceSample> = TODO("not implemented")
-    override fun containers(server: String, from: Instant, to: Instant): List<SeenContainer> = TODO("not implemented")
-    override fun rollUp(now: Instant): Int = TODO("not implemented")
-    override fun deleteExpired(now: Instant): MetricDeletion = TODO("not implemented")
+    /**
+     * 스키마 — 있으면 그대로 둔다(마이그레이션 도구 없이 `IF NOT EXISTS`). 두 자리가 동시에 처음 만들면 한쪽이 고유 제약 위반으로
+     * 실패할 수 있다(`log_entry` 와 같은 한계) — 그 호출이 실패로 남고 다음 호출이 다시 만든다.
+     */
+    override fun createSchema() {
+        ingest.execute(
+            """CREATE TABLE IF NOT EXISTS metric_sample (
+                 stream_ms    bigint           NOT NULL,
+                 stream_seq   integer          NOT NULL,
+                 server       text             NOT NULL,
+                 measured_ms  bigint           NOT NULL,
+                 received_ms  bigint           NOT NULL,
+                 insert_order bigint           GENERATED ALWAYS AS IDENTITY,
+                 interval_ms  bigint,
+                 host_present boolean          NOT NULL,
+                 cpu_pct      double precision,
+                 load1        double precision,
+                 mem_total    bigint,
+                 mem_used     bigint,
+                 disk_total   bigint,
+                 disk_used    bigint,
+                 net_rx_bps   double precision,
+                 net_tx_bps   double precision,
+                 io_read_bps  double precision,
+                 io_write_bps double precision,
+                 missing      text[]           NOT NULL,
+                 PRIMARY KEY (stream_ms, stream_seq))"""
+        )
+        ingest.execute("CREATE INDEX IF NOT EXISTS metric_sample_server_measured ON metric_sample (server, measured_ms)")
+        ingest.execute("CREATE INDEX IF NOT EXISTS metric_sample_server_received ON metric_sample (server, received_ms)")
+        ingest.execute("CREATE INDEX IF NOT EXISTS metric_sample_received ON metric_sample (received_ms)")
+        ingest.execute(
+            """CREATE TABLE IF NOT EXISTS metric_container (
+                 stream_ms    bigint           NOT NULL,
+                 stream_seq   integer          NOT NULL,
+                 position     integer          NOT NULL,
+                 server       text             NOT NULL,
+                 measured_ms  bigint           NOT NULL,
+                 name         text             NOT NULL,
+                 series_name  text             NOT NULL,
+                 container_id text             NOT NULL,
+                 project      text             NOT NULL,
+                 cpu_pct      double precision,
+                 mem_used     bigint,
+                 restarts     bigint,
+                 state        text,
+                 PRIMARY KEY (stream_ms, stream_seq, position),
+                 FOREIGN KEY (stream_ms, stream_seq) REFERENCES metric_sample ON DELETE CASCADE)"""
+        )
+        ingest.execute("CREATE INDEX IF NOT EXISTS metric_container_series ON metric_container (server, series_name, measured_ms)")
+        ingest.execute("CREATE INDEX IF NOT EXISTS metric_container_seen ON metric_container (server, measured_ms)")
+        ingest.execute(
+            """CREATE TABLE IF NOT EXISTS metric_gpu (
+                 stream_ms   bigint           NOT NULL,
+                 stream_seq  integer          NOT NULL,
+                 position    integer          NOT NULL,
+                 server      text             NOT NULL,
+                 measured_ms bigint           NOT NULL,
+                 gpu_index   integer          NOT NULL,
+                 util_pct    double precision,
+                 mem_used    bigint,
+                 mem_total   bigint,
+                 temp_c      double precision,
+                 PRIMARY KEY (stream_ms, stream_seq, position),
+                 FOREIGN KEY (stream_ms, stream_seq) REFERENCES metric_sample ON DELETE CASCADE)"""
+        )
+        ingest.execute("CREATE INDEX IF NOT EXISTS metric_gpu_series ON metric_gpu (server, measured_ms)")
+        ingest.execute(
+            """CREATE TABLE IF NOT EXISTS metric_rollup_bucket (
+                 server            text   NOT NULL,
+                 bucket_ms         bigint NOT NULL,
+                 computed_ms       bigint NOT NULL,
+                 insert_order_seen bigint NOT NULL,
+                 PRIMARY KEY (server, bucket_ms))"""
+        )
+        ingest.execute("CREATE INDEX IF NOT EXISTS metric_rollup_bucket_age ON metric_rollup_bucket (bucket_ms)")
+        ingest.execute(
+            """CREATE TABLE IF NOT EXISTS metric_rollup (
+                 server     text             NOT NULL,
+                 bucket_ms  bigint           NOT NULL,
+                 scope      text             NOT NULL,
+                 name       text             NOT NULL,
+                 value_name text             NOT NULL,
+                 average    double precision NOT NULL,
+                 maximum    double precision NOT NULL,
+                 samples    bigint           NOT NULL,
+                 PRIMARY KEY (server, scope, name, bucket_ms, value_name),
+                 FOREIGN KEY (server, bucket_ms) REFERENCES metric_rollup_bucket ON DELETE CASCADE)"""
+        )
+        ingest.execute("CREATE INDEX IF NOT EXISTS metric_rollup_by_bucket ON metric_rollup (server, bucket_ms)")
+        schemaReady = true
+    }
+
+    /** 조회·예약이 먼저 닿으면 그때 만든다(수집 바퀴보다 먼저 불려도 표 없음으로 실패하지 않게). 헬스는 만들지 않는다 — 표 없음을 그대로 본다 */
+    private fun ensureSchema() {
+        if (!schemaReady) synchronized(creatingSchema) { if (!schemaReady) createSchema() }
+    }
+
+    /** 뜬 직후 한 번 미리 만든다 — 실패는 예외로(부르는 쪽이 로그만 남기고 삼킨다) */
+    fun prepareSchema() = ensureSchema()
+
+    override fun insertAll(samples: List<ResourceSample>): Int {
+        if (samples.isEmpty()) return 0
+        return transaction.execute {
+            val results = ingest.batchUpdate(INSERT_SAMPLE, samples, samples.size) { statement, sample -> bindSample(statement, sample) }
+                .flatMap { it.asList() }
+            // 새로 들어간 항목의 컨테이너 · GPU 만 넣는다 — 이미 있던 항목은 처음 받은 그대로 둔다
+            val inserted = samples.filterIndexed { index, _ -> results[index] > 0 || results[index] == java.sql.Statement.SUCCESS_NO_INFO }
+            val containers = inserted.flatMap { sample -> sample.containers.mapIndexed { position, container -> Triple(sample, position, container) } }
+            if (containers.isNotEmpty()) ingest.batchUpdate(INSERT_CONTAINER, containers, containers.size) { statement, (sample, position, container) ->
+                statement.setLong(1, sample.id.millis); statement.setInt(2, sample.id.sequence); statement.setInt(3, position)
+                statement.setString(4, sample.server); statement.setLong(5, sample.measuredAt.toEpochMilli())
+                statement.setString(6, container.name); statement.setString(7, ContainerName.seriesName(container.name))
+                statement.setString(8, container.id); statement.setString(9, container.project)
+                statement.setNullable(10, container.cpuPct, Types.DOUBLE); statement.setNullable(11, container.memUsed, Types.BIGINT)
+                statement.setNullable(12, container.restarts, Types.BIGINT); statement.setNullable(13, container.state, Types.VARCHAR)
+            }
+            val gpus = inserted.flatMap { sample -> sample.gpus.mapIndexed { position, gpu -> Triple(sample, position, gpu) } }
+            if (gpus.isNotEmpty()) ingest.batchUpdate(INSERT_GPU, gpus, gpus.size) { statement, (sample, position, gpu) ->
+                statement.setLong(1, sample.id.millis); statement.setInt(2, sample.id.sequence); statement.setInt(3, position)
+                statement.setString(4, sample.server); statement.setLong(5, sample.measuredAt.toEpochMilli()); statement.setInt(6, gpu.index)
+                statement.setNullable(7, gpu.utilPct, Types.DOUBLE); statement.setNullable(8, gpu.memUsed, Types.BIGINT)
+                statement.setNullable(9, gpu.memTotal, Types.BIGINT); statement.setNullable(10, gpu.tempC, Types.DOUBLE)
+            }
+            inserted.size
+        }!!
+    }
+
+    private fun bindSample(statement: PreparedStatement, sample: ResourceSample) {
+        val host = sample.host
+        statement.setLong(1, sample.id.millis); statement.setInt(2, sample.id.sequence); statement.setString(3, sample.server)
+        statement.setLong(4, sample.measuredAt.toEpochMilli()); statement.setLong(5, sample.receivedAt.toEpochMilli())
+        statement.setNullable(6, sample.intervalMs, Types.BIGINT); statement.setBoolean(7, host != null)
+        statement.setNullable(8, host?.cpuPct, Types.DOUBLE); statement.setNullable(9, host?.load1, Types.DOUBLE)
+        statement.setNullable(10, host?.memTotal, Types.BIGINT); statement.setNullable(11, host?.memUsed, Types.BIGINT)
+        statement.setNullable(12, host?.diskTotal, Types.BIGINT); statement.setNullable(13, host?.diskUsed, Types.BIGINT)
+        statement.setNullable(14, host?.netRxBps, Types.DOUBLE); statement.setNullable(15, host?.netTxBps, Types.DOUBLE)
+        statement.setNullable(16, host?.ioReadBps, Types.DOUBLE); statement.setNullable(17, host?.ioWriteBps, Types.DOUBLE)
+        statement.setArray(18, statement.connection.createArrayOf("text", sample.missing.toTypedArray()))
+    }
+
+    override fun series(query: SeriesQuery): List<SeriesPoint> {
+        ensureSchema()
+        val from = query.from.toEpochMilli()
+        val to = query.to.toEpochMilli()
+        val step = query.step.toMillis()
+        val rawSince = query.rawSince.toEpochMilli()
+        val name = query.name ?: ""
+        val cells = sortedMapOf<Long, MutableMap<String, MutableList<MetricAggregate>>>()
+        fun collect(row: ResultSet) {
+            cells.getOrPut(row.getLong("cell")) { linkedMapOf() }.getOrPut(row.getString("value_name")) { mutableListOf() } +=
+                MetricAggregate(row.getDouble("average"), row.getDouble("maximum"), row.getLong("samples"))
+        }
+        // 7일보다 오래된 부분은 5분 평균에서 — 칸은 구간의 시작 시각으로 정한다. 큰 칸은 표본 수로 가중한 평균과 최댓값의 최댓값
+        if (from < rawSince) this.query.query(
+            """SELECT (bucket_ms - ?) / ? AS cell, value_name,
+                      sum(average * samples) / sum(samples) AS average, max(maximum) AS maximum, sum(samples) AS samples
+               FROM metric_rollup
+               WHERE server = ? AND scope = ? AND name = ? AND bucket_ms >= ? AND bucket_ms < ?
+               GROUP BY 1, 2""",
+            RowCallbackHandler { row -> collect(row) },
+            from, step, query.server, query.scope.wireName, name, from, minOf(to, rawSince),
+        )
+        // 나머지는 원본에서 — 컨테이너는 같은 항목 안의 두 자리를 먼저 더한 것이 표본 하나
+        if (to > rawSince) this.query.query(
+            """SELECT (measured_ms - ?) / ? AS cell, value_name, avg(value) AS average, max(value) AS maximum, count(value) AS samples
+               FROM (${valueRows(query.scope)}) value_row
+               WHERE server = ? AND name = ? AND measured_ms >= ? AND measured_ms < ?
+               GROUP BY 1, 2 HAVING count(value) > 0""",
+            RowCallbackHandler { row -> collect(row) },
+            from, step, query.server, name, maxOf(from, rawSince), to,
+        )
+        return cells.mapNotNull { (cell, values) ->
+            val combined = values.mapNotNull { (valueName, parts) -> MetricAggregate.combine(parts)?.let { valueName to it } }.toMap()
+            combined.takeIf { it.isNotEmpty() }?.let { SeriesPoint(Instant.ofEpochMilli(from + cell * step), it) }
+        }
+    }
+
+    override fun rollups(server: String, scope: MetricScope, name: String?, from: Instant, to: Instant): List<MetricRollup> {
+        ensureSchema()
+        val buckets = sortedMapOf<Long, MutableMap<String, MetricAggregate>>()
+        query.query(
+            """SELECT bucket_ms, value_name, average, maximum, samples FROM metric_rollup
+               WHERE server = ? AND scope = ? AND name = ? AND bucket_ms >= ? AND bucket_ms < ?""",
+            RowCallbackHandler { row ->
+                buckets.getOrPut(row.getLong("bucket_ms")) { linkedMapOf() }[row.getString("value_name")] =
+                    MetricAggregate(row.getDouble("average"), row.getDouble("maximum"), row.getLong("samples"))
+            },
+            server, scope.wireName, name ?: "", from.toEpochMilli(), to.toEpochMilli(),
+        )
+        return buckets.map { (bucket, values) -> MetricRollup(Instant.ofEpochMilli(bucket), values) }
+    }
+
+    override fun latest(receivedSince: Instant): List<ResourceSample> {
+        ensureSchema()
+        val heads = query.query(
+            """SELECT DISTINCT ON (server) * FROM metric_sample WHERE received_ms >= ?
+               ORDER BY server, measured_ms DESC, stream_ms DESC, stream_seq DESC""",
+            { row, _ -> row.toSampleHead() },
+            receivedSince.toEpochMilli(),
+        )
+        return heads.sortedBy { it.server }.map { head ->
+            head.copy(
+                containers = query.query(
+                    "SELECT * FROM metric_container WHERE stream_ms = ? AND stream_seq = ? ORDER BY position",
+                    { row, _ ->
+                        ContainerValues(row.getString("name"), row.getString("container_id"), row.getString("project"), row.nullableDouble("cpu_pct"),
+                            row.nullableLong("mem_used"), row.nullableLong("restarts"), row.getString("state"))
+                    },
+                    head.id.millis, head.id.sequence,
+                ),
+                gpus = query.query(
+                    "SELECT * FROM metric_gpu WHERE stream_ms = ? AND stream_seq = ? ORDER BY position",
+                    { row, _ ->
+                        GpuValues(row.getInt("gpu_index"), row.nullableDouble("util_pct"), row.nullableLong("mem_used"), row.nullableLong("mem_total"),
+                            row.nullableDouble("temp_c"))
+                    },
+                    head.id.millis, head.id.sequence,
+                ),
+            )
+        }
+    }
+
+    override fun containers(server: String, from: Instant, to: Instant): List<SeenContainer> {
+        ensureSchema()
+        return query.query(
+            """SELECT series_name, max(measured_ms) AS last_seen_ms FROM metric_container
+               WHERE server = ? AND measured_ms >= ? AND measured_ms <= ? GROUP BY series_name""",
+            { row, _ -> SeenContainer(row.getString("series_name"), Instant.ofEpochMilli(row.getLong("last_seen_ms"))) },
+            server, from.toEpochMilli(), to.toEpochMilli(),
+        ).sortedBy { it.name }
+    }
+
+    /**
+     * 끝난 5분 구간 중 다시 계산할 것을 고른다: 평균이 없거나, 계산 시각이 그 구간 원본의 마지막 수신 시각보다 뒤가 아니거나,
+     * 계산 뒤에 저장된 원본(저장 순번이 그때 본 것보다 큼)이 있는 구간.
+     * 수신 시각은 수집기가 저장 **전에** 찍으므로 그것만으로는 "계산하는 동안 커밋된 원본"을 놓칠 수 있다 — 그래서 한 바퀴 동안
+     * 원본 표에 SHARE 잠금을 걸어(읽기는 막지 않고 저장만 잠시 기다리게) 진행 중인 저장을 끝낸 뒤 보고, 그때의 마지막 저장 순번을 기록한다.
+     */
+    override fun rollUp(now: Instant): Int {
+        ensureSchema()
+        val closedBefore = SeriesPlan.floorTo(now, BUCKET).toEpochMilli()
+        val bucket = BUCKET.toMillis()
+        return transaction.execute {
+            ingest.execute("LOCK TABLE metric_sample IN SHARE MODE")
+            val seen = ingest.queryForObject("SELECT coalesce(max(insert_order), 0) FROM metric_sample", Long::class.java)!!
+            val targets = ingest.query(
+                """SELECT raw.server, raw.bucket_ms FROM (
+                     SELECT server, measured_ms / ? * ? AS bucket_ms, max(received_ms) AS last_received, max(insert_order) AS last_order
+                     FROM metric_sample WHERE measured_ms < ? GROUP BY 1, 2) raw
+                   LEFT JOIN metric_rollup_bucket done ON done.server = raw.server AND done.bucket_ms = raw.bucket_ms
+                   WHERE done.server IS NULL OR done.computed_ms <= raw.last_received OR done.insert_order_seen < raw.last_order""",
+                { row, _ -> row.getString("server") to row.getLong("bucket_ms") },
+                bucket, bucket, closedBefore,
+            )
+            for ((server, bucketStart) in targets) {
+                ingest.update(
+                    """INSERT INTO metric_rollup_bucket (server, bucket_ms, computed_ms, insert_order_seen) VALUES (?,?,?,?)
+                       ON CONFLICT (server, bucket_ms) DO UPDATE SET computed_ms = EXCLUDED.computed_ms, insert_order_seen = EXCLUDED.insert_order_seen""",
+                    server, bucketStart, now.toEpochMilli(), seen,
+                )
+                ingest.update("DELETE FROM metric_rollup WHERE server = ? AND bucket_ms = ?", server, bucketStart)
+                for (scope in MetricScope.entries) {
+                    ingest.update(
+                        """INSERT INTO metric_rollup (server, bucket_ms, scope, name, value_name, average, maximum, samples)
+                           SELECT server, ?, ?, name, value_name, avg(value), max(value), count(value)
+                           FROM (${valueRows(scope)}) value_row
+                           WHERE server = ? AND measured_ms >= ? AND measured_ms < ?
+                           GROUP BY server, name, value_name HAVING count(value) > 0""",
+                        bucketStart, scope.wireName, server, bucketStart, bucketStart + bucket,
+                    )
+                }
+            }
+            targets.size
+        }!!
+    }
+
+    /**
+     * 원본: 구간 전체가 `now − 7일` 앞에 있고 그 구간의 평균이 원본을 모두 담은(계산 시각 > 마지막 수신, 그때 본 저장 순번 ≥ 마지막 저장 순번)
+     * (서버, 5분 구간)의 원본만 지운다. 구간을 걸친 원본은 다음 날 구간째 지운다 — 일부만 지운 구간을 늦은 원본이 다시 계산하면
+     * 지운 표본이 평균에서 빠지기 때문이다. 5분 평균: 구간 시작이 `now − 30일` 앞인 것. 원본을 먼저 지운다(평균이 있어야 지울 수 있으므로).
+     */
+    override fun deleteExpired(now: Instant): MetricDeletion {
+        ensureSchema()
+        val rawCutoff = now.minus(RAW_RETENTION)
+        val wholeBucketsBefore = SeriesPlan.floorTo(rawCutoff, BUCKET).toEpochMilli()
+        val bucket = BUCKET.toMillis()
+        val rawDeleted = ingest.update(
+            """DELETE FROM metric_sample sample
+               USING (
+                 SELECT done.server, done.bucket_ms FROM metric_rollup_bucket done
+                 JOIN (SELECT server, measured_ms / ? * ? AS bucket_ms, max(received_ms) AS last_received, max(insert_order) AS last_order
+                       FROM metric_sample WHERE measured_ms < ? GROUP BY 1, 2) raw
+                   ON raw.server = done.server AND raw.bucket_ms = done.bucket_ms
+                 WHERE done.computed_ms > raw.last_received AND done.insert_order_seen >= raw.last_order
+               ) rolled
+               WHERE sample.server = rolled.server
+                 AND sample.measured_ms >= rolled.bucket_ms AND sample.measured_ms < rolled.bucket_ms + ?
+                 AND sample.measured_ms < ?""",
+            bucket, bucket, wholeBucketsBefore, bucket, rawCutoff.toEpochMilli(),
+        )
+        val rollupDeleted = ingest.update("DELETE FROM metric_rollup_bucket WHERE bucket_ms < ?", now.minus(ROLLUP_RETENTION).toEpochMilli())
+        return MetricDeletion(rawDeleted, rollupDeleted)
+    }
 
     /** 가장 최근에 저장된 항목의 수신 시각(헬스용) — 없으면 null, 표가 아직 없으면 SQLSTATE 42P01 예외, DB 에 닿지 못하면 예외 */
-    fun latestStoredAt(): Instant? = TODO("not implemented")
+    fun latestStoredAt(): Instant? =
+        health.queryForObject("SELECT max(received_ms) FROM metric_sample", Long::class.javaObjectType)?.let(Instant::ofEpochMilli)
 
-    /** 서버별 마지막 수신 시각(헬스용 — §2.3) */
-    fun lastReceivedByServer(): Map<String, Instant> = TODO("not implemented")
+    /** 서버별 마지막 수신 시각(헬스용 — §2.3). 7일치 원본을 서버 · 수신 시각 인덱스로 훑는다(서버 몇 대 · 수만 행) */
+    fun lastReceivedByServer(): Map<String, Instant> =
+        health.query("SELECT server, max(received_ms) AS last_received FROM metric_sample GROUP BY server ORDER BY server",
+            { row, _ -> row.getString("server") to Instant.ofEpochMilli(row.getLong("last_received")) }).toMap()
+
+    private fun ResultSet.toSampleHead(): ResourceSample = ResourceSample(
+        id = StreamId(getLong("stream_ms"), getInt("stream_seq")),
+        server = getString("server"),
+        measuredAt = Instant.ofEpochMilli(getLong("measured_ms")),
+        receivedAt = Instant.ofEpochMilli(getLong("received_ms")),
+        intervalMs = nullableLong("interval_ms"),
+        host = if (!getBoolean("host_present")) null else HostValues(
+            nullableDouble("cpu_pct"), nullableDouble("load1"), nullableLong("mem_total"), nullableLong("mem_used"),
+            nullableLong("disk_total"), nullableLong("disk_used"), nullableDouble("net_rx_bps"), nullableDouble("net_tx_bps"),
+            nullableDouble("io_read_bps"), nullableDouble("io_write_bps"),
+        ),
+        containers = emptyList(),
+        gpus = emptyList(),
+        missing = (getArray("missing").array as Array<*>).map { it as String },
+    )
 
     companion object {
         val RAW_RETENTION: Duration = Duration.ofDays(7)
         val ROLLUP_RETENTION: Duration = Duration.ofDays(30)
         val BUCKET: Duration = Duration.ofMinutes(5)
+
+        private const val INSERT_SAMPLE =
+            """INSERT INTO metric_sample (stream_ms, stream_seq, server, measured_ms, received_ms, interval_ms, host_present,
+                 cpu_pct, load1, mem_total, mem_used, disk_total, disk_used, net_rx_bps, net_tx_bps, io_read_bps, io_write_bps, missing)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT (stream_ms, stream_seq) DO NOTHING"""
+        private const val INSERT_CONTAINER =
+            """INSERT INTO metric_container (stream_ms, stream_seq, position, server, measured_ms, name, series_name, container_id, project,
+                 cpu_pct, mem_used, restarts, state)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT (stream_ms, stream_seq, position) DO NOTHING"""
+        private const val INSERT_GPU =
+            """INSERT INTO metric_gpu (stream_ms, stream_seq, position, server, measured_ms, gpu_index, util_pct, mem_used, mem_total, temp_c)
+               VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT (stream_ms, stream_seq, position) DO NOTHING"""
+
+        /** 갈래마다 표본 하나 = 한 행으로 맞춘 원본(칸: server · measured_ms · name · 값 이름마다 한 칸) — 컨테이너는 같은 항목의 두 자리를 더한다 */
+        private fun samplesOf(scope: MetricScope): String = when (scope) {
+            MetricScope.HOST -> "SELECT server, measured_ms, '' AS name, ${scope.values.joinToString { "$it::float8 AS $it" }} FROM metric_sample"
+            MetricScope.CONTAINER ->
+                """SELECT server, measured_ms, series_name AS name, ${scope.values.joinToString { "sum($it)::float8 AS $it" }}
+                   FROM metric_container GROUP BY server, stream_ms, stream_seq, measured_ms, series_name"""
+            MetricScope.GPU -> "SELECT server, measured_ms, gpu_index::text AS name, ${scope.values.joinToString { "$it::float8 AS $it" }} FROM metric_gpu"
+        }
+
+        /** 값 이름마다 한 행으로 편 원본(칸: server · measured_ms · name · value_name · value). 값 이름은 [MetricScope.values] 의 고정 글자다(입력이 아니다) */
+        private fun valueRows(scope: MetricScope): String =
+            """SELECT sample.server, sample.measured_ms, sample.name, value_column.value_name, value_column.value
+               FROM (${samplesOf(scope)}) sample
+               CROSS JOIN LATERAL (VALUES ${scope.values.joinToString { "('$it', sample.$it)" }}) value_column (value_name, value)"""
+
+        private fun PreparedStatement.setNullable(index: Int, value: Any?, sqlType: Int) =
+            if (value == null) setNull(index, sqlType) else setObject(index, value, sqlType)
+
+        private fun ResultSet.nullableDouble(column: String): Double? = getDouble(column).takeUnless { wasNull() }
+        private fun ResultSet.nullableLong(column: String): Long? = getLong(column).takeUnless { wasNull() }
     }
 }

@@ -1,5 +1,7 @@
 package xyz.junproject.observe.metric
 
+import org.slf4j.LoggerFactory
+import java.sql.SQLException
 import java.time.Duration
 import java.time.Instant
 
@@ -29,6 +31,59 @@ class MetricHealth(
     private val stallAfter: Duration = Duration.ofSeconds(60),
     private val startedAt: Instant = Instant.now(),
 ) {
+    private val log = LoggerFactory.getLogger("observe")
+    @Volatile private var lastLoggedProblem: String? = null
+
     /** `metrics` 객체 — 예외를 내지 않는다(묻지 못한 것은 위 규칙대로 칸에 남긴다) */
-    fun report(now: Instant): Map<String, Any> = TODO("not implemented")
+    fun report(now: Instant): Map<String, Any> {
+        val lastLoopAt = collector.lastLoopAt
+        val failure = collector.lastFailure
+        val pending = runCatching(unacknowledged)
+        val stored = runCatching(latestStoredAt).recoverCatching { if (isTableMissing(it)) null else throw it }
+        val problems = listOfNotNull(pending.exceptionOrNull()?.let { "redis" to it }, stored.exceptionOrNull()?.let { "database" to it })
+        logProblems(problems)
+        val status = when {
+            problems.isNotEmpty() -> "unreachable"
+            failure != null -> "failing"
+            lastLoopAt != null && Duration.between(lastLoopAt, now) < stallAfter -> "ok"
+            lastLoopAt == null && Duration.between(startedAt, now) < stallAfter -> "starting"
+            else -> "stalled"
+        }
+        val dropped = collector.droppedCounts()
+        val rollup = runCatching(lastRollup).getOrNull()
+        val retention = runCatching(lastRetention).getOrNull()
+        return mapOf(
+            "status" to status,
+            "last_loop_at" to (lastLoopAt?.toString() ?: ""),
+            "last_stored_at" to (stored.getOrNull()?.toString() ?: ""),
+            "stored_since_start" to collector.storedTotal,
+            "unacknowledged" to (pending.getOrNull() ?: -1L),
+            "lag" to (runCatching(lag).getOrNull() ?: -1L),
+            "failure" to (problems.joinToString("; ") { (where, error) -> "$where ${error.javaClass.simpleName}" }.ifEmpty { failure ?: "" }),
+            "dropped" to MetricDropReason.entries.associate { it.wireName to (dropped[it] ?: 0L) },
+            "dropped_total" to dropped.values.sum(),
+            "skipped_other_kind" to collector.skippedOtherKind,
+            "last_received_at" to (runCatching(lastReceivedByServer).getOrNull()?.mapValues { it.value.toString() } ?: emptyMap<String, String>()),
+            "last_rollup_at" to (runCatching(lastRollupSuccessAt).getOrNull()?.toString() ?: ""),
+            "last_rollup_failure" to (rollup?.failure ?: ""),
+            "last_retention_at" to (retention?.ranAt?.toString() ?: ""),
+            "last_retention_raw_deleted" to (retention?.deletion?.rawDeleted ?: -1),
+            "last_retention_rollup_deleted" to (retention?.deletion?.rollupDeleted ?: -1),
+            "last_retention_failure" to (retention?.failure ?: ""),
+        )
+    }
+
+    private fun isTableMissing(error: Throwable) =
+        generateSequence(error) { it.cause }.any { it is SQLException && it.sqlState == UNDEFINED_TABLE }
+
+    /** 닿지 못한 이유의 전체 문구는 서버 로그에만 — 같은 이유를 헬스 요청마다 되풀이해 남기지 않는다 */
+    private fun logProblems(problems: List<Pair<String, Throwable>>) {
+        val detail = problems.joinToString("; ") { (where, error) -> "$where ${error.javaClass.simpleName}: ${error.message?.take(200)}" }.ifEmpty { null }
+        if (detail != lastLoggedProblem && detail != null) log.warn("observe:observe:metric health check unreachable: {}", detail)
+        lastLoggedProblem = detail
+    }
+
+    private companion object {
+        const val UNDEFINED_TABLE = "42P01"   // PostgreSQL: relation does not exist
+    }
 }

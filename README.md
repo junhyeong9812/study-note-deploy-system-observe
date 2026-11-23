@@ -1,6 +1,6 @@
 # study-note-deploy-system-observe
 
-관측 서버 — 네 서비스(front · backend · llm · 배포 시스템)가 Redis 스트림 `logs` 로 보내는 요청 단위 로그를 받아 30일 동안 보관하고, 조회 API 로 찾아보게 한다. 어드민의 로그인 시도를 기록하고 잠금을 판정한다(아래 "로그인 시도와 잠금"). Kotlin · Spring Boot · PostgreSQL.
+관측 서버 — 네 서비스(front · backend · llm · 배포 시스템)가 Redis 스트림 `logs` 로 보내는 요청 단위 로그를 받아 30일 동안 보관하고, 조회 API 로 찾아보게 한다. 어드민의 로그인 시도를 기록하고 잠금을 판정한다(아래 "로그인 시도와 잠금"). 서버 셋의 자원 지표를 받아 보관하고 조회하게 한다(아래 "자원 지표"). Kotlin · Spring Boot · PostgreSQL.
 
 ```
 front · backend · llm · 배포 시스템 ── XADD logs ──▶ Redis(backend 서버의 것, 상한 약 1만 건)
@@ -123,13 +123,112 @@ front · backend · llm · 배포 시스템 ── XADD logs ──▶ Redis(bac
 | `OBSERVE_AUTH_LOCK_DURATION` | `15m` | 잠금 시간 |
 | `OBSERVE_AUTH_RETENTION` | `90d` | 시도 기록 보관 기간 |
 
+## 자원 지표
+
+서버마다 도는 ci-cd agent 가 30초마다 그 서버의 자원 값(서버 전체 · 이 프로젝트의 컨테이너 · GPU)을 한 묶음으로 Redis 스트림 `metrics` 에 넣는다(로그와 같은 Redis, 스트림만 다르다). 관측 서버가 그것을 받아 원본 7일 · 5분 평균 30일 보관하고, 어드민이 조회한다. 임계값 판정과 알림은 아직 없다(`firing` 은 늘 빈 배열).
+
+```
+ci-cd agent(서버마다, 30초) ── XADD metrics ──▶ Redis ──▶ 관측 서버(지표 전용 수집 스레드) ──▶ PostgreSQL
+                                                                 └─ GET /metrics/latest · /metrics/series · /metrics/containers ◀── 어드민
+```
+
+### 받는 스트림 항목
+
+칸: `kind`(`resource`) · `v`(`1`) · `server`(agent 의 `SERVER_NAME`) · `at`(측정 시각, epoch 밀리초 — agent 의 시계) · `body`(JSON, 64KB 이하 — `interval_ms` · `host` · `containers` · `gpus` · `missing`).
+
+- **저장한 뒤에만 확인(ack)한다** — 로그와 같은 규칙. 같은 항목(스트림 ID)을 두 번 받아도 한 번만 저장된다.
+- 측정 시각과 수신 시각(관측 서버의 시계)을 둘 다 저장한다. 그래프와 5분 평균은 측정 시각, 헬스의 서버별 마지막 수신은 수신 시각으로 본다.
+- 값이 `null` 인 것(첫 수집 · 누적 값이 줄어든 경우 등 agent 가 차이를 낼 수 없었던 값)은 `null` 로 저장하고 평균에 넣지 않는다. 읽지 못한 갈래(`missing`)는 빈 채로 저장한다.
+- `kind` 가 `resource` 가 아닌 항목은 다른 종류다 — 저장하지 않고 건너뛰어 확인한다(건수는 헬스의 `skipped_other_kind`). 같은 길을 다른 종류가 쓸 수 있게 둔 것이다.
+- **버리는 항목** — 그 항목만 버리고(같은 묶음의 다른 항목은 저장한다) 이유와 항목 ID 를 서버 로그에 남기고 이유별로 센 뒤 확인한다(다시 받지 않는다). 헬스의 `metrics.dropped` 에 이유 글자 그대로 나온다:
+
+| 이유 | 언제 |
+|---|---|
+| `invalid_id` | 스트림 ID 가 `<밀리초>-<순번>` 꼴이 아니다 |
+| `trimmed` | 칸이 하나도 없다 — 확인하지 못한 채 스트림 상한에 밀려났다 |
+| `missing_field` | `kind` · `v` · `server` · `at` · `body` 중 빠진 칸(빈 글자 포함) |
+| `unsupported_version` | `v` 가 `1` 이 아니다 |
+| `invalid_server` | 서버 이름이 `a-z0-9._-`(첫 글자는 영숫자, 63자 이하) 꼴이 아니다 |
+| `invalid_at` | `at` 이 양의 epoch 밀리초가 아니다 |
+| `clock_ahead` | 측정 시각이 수신 시각보다 2분 넘게 앞선다(그 서버의 시계가 빠름 — 미래 값이 "최신"을 차지하지 않게) |
+| `body_too_large` | `body` 가 64KB(UTF-8 바이트)를 넘는다 |
+| `body_not_json` | `body` 가 JSON 이 아니다 — 맨 `NaN` · `Infinity`, 객체 뒤에 더 붙은 글자 포함 |
+| `invalid_body` | 꼴이 다르다 — 객체가 아님, 갈래가 객체·배열이 아님, 컨테이너 이름·ID 꼴, GPU 번호(0~999 정수) 등 |
+| `invalid_value` | 값이 숫자·`null` 이 아니거나(글자 `"3"` · `true` 포함) 범위 밖 — 모든 값은 0 이상, 서버 CPU·GPU 사용률은 100 이하, GPU 온도는 −50~150, 바이트 수·재시작 횟수·`interval_ms` 는 정수. 컨테이너 CPU 는 코어 하나 = 100 이라 위 상한이 없다 |
+
+- 저장(DB)이 실패하면 확인하지 않는다 — 다음 바퀴에 다시 받아 저장한다. 버린 항목은 DB 와 무관해 그대로 확인한다.
+- 지표 수집은 로그 수집과 **다른 스레드**(`observe-metric-collector`)와 다른 연결 풀로 돈다 — 지표 스트림에 무엇이 쌓이든, 지표 쪽이 실패하든 로그 수집은 그대로다.
+
+### 보관
+
+- **5분 평균**: 1분마다(`METRICS_ROLLUP_INTERVAL_MS`) 끝난 5분 구간(UTC 정각 5분 경계)마다 값별 평균 · 최댓값 · 표본 수를 만든다. 컨테이너는 자리 이름(`-blue` · `-green`)을 뗀 이름으로 묶고, 같은 항목에 두 자리가 함께 있으면 더한 것이 표본 하나다(전환 중의 실제 사용량). 평균을 만든 뒤 그 구간에 원본이 늦게 들어오면 다음 바퀴에 그 구간을 다시 계산해 덮어쓴다 — 여러 번 돌려도 결과가 같다.
+- **원본 7일**: 매일 03:40(서울)에 로그 삭제와 같은 예약 실행에서 지운다. **그 5분 구간의 평균이 원본을 모두 담은 뒤에 계산된 구간만** 지운다 — 평균이 없거나 평균 뒤에 원본이 더 들어온 구간은 남겨 두고 다음 날 다시 본다. 구간을 걸친 원본은 구간째 다음 날 지운다.
+- **5분 평균 30일**: 구간 시작이 30일 지난 것을 같은 예약에서 지운다.
+- 지표 삭제 · 로그 삭제 · 로그인 시도 삭제는 서로 따로 돈다 — 한쪽이 실패해도 나머지는 돈다. 결과는 헬스의 `metrics.last_retention_*` 와 서버 로그에.
+- **표**: `metric_sample`(스트림 항목 하나 = 한 행) · `metric_container` · `metric_gpu`(항목 안의 컨테이너 · GPU) · `metric_rollup_bucket`(5분 구간의 계산 기록) · `metric_rollup`(5분 평균). 기존 표는 건드리지 않는다. 뜬 직후 만들고, 그때 DB 가 없었으면 첫 수집 바퀴 · 첫 조회가 만든다(`CREATE … IF NOT EXISTS`).
+- 연결 풀은 지표 전용(수집 2 · 조회 2 · 헬스 1)이다. 5분 평균 한 바퀴 동안은 원본 저장이 잠시 기다린다(평균이 계산하는 사이에 커밋된 원본을 놓치지 않게 — 읽기는 막지 않는다).
+
+### 조회 API
+
+전부 GET, 전부 `X-Observe-Secret`(인증을 입력 검사보다 먼저 본다). 봉투와 오류는 `/logs` 와 같다 — 401 `unauthorized` · 422 `invalid_request`(`detail`) · 503 `query_failed` · 504 `query_timeout`.
+
+| 경로 | 설명 |
+|---|---|
+| `GET /metrics/latest` | `{servers: [{server, at, received_at, age_ms, stale, host, containers, gpus, missing}], firing: []}` — 최근 24시간에 받은 서버마다 측정 시각이 가장 늦은 묶음. `at` 은 측정 시각, `age_ms` 는 수신 시각부터, `stale` 은 3분 초과. `METRICS_EXPECTED_SERVERS` 의 서버 중 24시간 안에 받은 것이 없으면 "수신 없음"(`at` · `received_at` · `age_ms` · `host` 가 null, `stale` true). 이름순. 컨테이너에는 `series_name`(자리 이름을 뗀 이름)이 붙는다 |
+| `GET /metrics/series?server=&scope=&name=&from=&to=` | 계열 하나의 점 — `{server, scope, name, from, to, step_ms, source, points: [{at, <값>, <값>_max, …}]}` |
+| `GET /metrics/containers?server=&at=` | 그 서버에서 보인 컨테이너(자리 이름을 뗀 이름)와 마지막으로 보인 측정 시각 — `{server, from, to, containers: [{name, last_seen_at}]}`. `at` 이 없으면 최근 24시간, 있으면 그 시각 앞뒤 5분(연관 로그가 "그때 그 서비스가 있던 서버"를 고를 때) |
+
+`GET /metrics/series` 의 조건:
+
+| 이름 | 뜻 |
+|---|---|
+| `server` | 필수. 서버 이름(위 `invalid_server` 와 같은 꼴) |
+| `scope` | 필수. `host`(값: `cpu_pct` · `load1` · `mem_total` · `mem_used` · `disk_total` · `disk_used` · `net_rx_bps` · `net_tx_bps` · `io_read_bps` · `io_write_bps`) · `container`(`cpu_pct` · `mem_used`) · `gpu`(`util_pct` · `mem_used` · `mem_total` · `temp_c`) |
+| `name` | host 는 주지 않는다(주면 422). container 는 자리 이름을 뗀 이름(`front-app`), gpu 는 번호(`0`, 1~3자리) — 필수 |
+| `from` · `to` | ISO 시각. `/logs` 와 같이 둘 다 없으면 최근 1시간. 최대 31일(정확히 31일은 받는다) |
+
+- **간격**: `step_ms` = 기간 ÷ 500 을 30초 단위로 올린 것(최소 30초) — 점은 500 개를 넘지 않는다. 점의 `at` 은 `from` 에서 센 칸의 시작이다.
+- **읽는 곳**: 측정 시각이 `지금 − 7일`(5분 단위로 내림)보다 앞선 부분은 5분 평균에서(그때는 간격 최소 5분), 나머지는 원본에서 읽는다. `source` 는 `raw` · `rollup` · `mixed`(경계를 걸친 요청).
+- 칸 안의 값은 평균과 최댓값(`_max`)이다. 5분 평균을 묶을 때는 **표본 수로 가중한 평균**과 최댓값의 최댓값을 쓴다. 값이 없는 칸은 점을 만들지 않는다(0 으로 채우지 않는다). 점 안에서 표본이 없는 값은 null.
+- 컨테이너는 같은 시각에 두 자리가 있으면 합(CPU · 메모리)으로 본다.
+
+### 헬스의 `metrics` 칸
+
+`GET /health` 본문에 `metrics` 객체가 붙는다. **지표 쪽이 어떻게 실패해도 로그 수집의 `status` 와 HTTP 상태는 바뀌지 않는다** — 지표의 상태는 `metrics.status` 에만 나온다.
+
+| 칸 | 뜻 |
+|---|---|
+| `status` | 로그와 같은 낱말 · 같은 판정 순서(`unreachable` → `failing` → `ok` → `starting` → `stalled`), 지표 수집 바퀴 · 지표 스트림 · 지표 표 기준 |
+| `last_loop_at` · `last_stored_at` · `stored_since_start` · `unacknowledged` · `lag` · `failure` | 로그의 같은 칸과 같은 뜻(지표 스트림·지표 표 기준). `last_stored_at` 은 가장 최근 항목의 수신 시각 |
+| `dropped` · `dropped_total` · `skipped_other_kind` | 이 프로세스가 뜬 뒤 버린 항목 수(이유별 — 모든 이유가 0 부터) · 그 합 · 다른 종류라 건너뛴 수 |
+| `last_received_at` | 서버 이름 → 마지막 수신 시각(읽지 못하면 빈 객체) |
+| `last_rollup_at` · `last_rollup_failure` | 5분 평균의 마지막 **성공** 시각 · 마지막 바퀴가 실패했으면 그 종류(성공이면 빈 문자열) |
+| `last_retention_at` · `last_retention_raw_deleted` · `last_retention_rollup_deleted` · `last_retention_failure` | 마지막 지표 삭제의 시각 · 지운 원본 항목 수 · 지운 (서버, 5분 구간) 수 · 실패 종류(안 돌았거나 실패면 빈 문자열 · -1) |
+
+### 설정
+
+| 설정(환경변수) | 기본 | 뜻 |
+|---|---|---|
+| `METRICS_STREAM` | `metrics` | 받는 스트림(agent 의 같은 이름 설정과 같은 값) |
+| `METRICS_GROUP` | `observe` | 소비자 그룹 이름 |
+| `METRICS_EXPECTED_SERVERS` | (없음) | 지표를 보내야 하는 서버 이름, 쉼표로 — 한 번도 보내지 않은 서버도 `GET /metrics/latest` 에 "수신 없음"으로 |
+| `METRICS_ROLLUP_INTERVAL_MS` | `60000` | 5분 평균 바퀴의 간격(밀리초) |
+
+### 알려진 한계
+
+- **스트림 유실**: 스트림 상한(agent 의 `MAXLEN ~ 20000`, 약 2.3일분)을 넘게 관측 서버가 꺼져 있거나 Redis 가 재시작하면 그 구간의 지표는 사라진다 — 그래프에 빈 구간으로 보인다. 밀린 건수는 헬스의 `metrics.lag` 에.
+- 측정 시각이 늦은 항목(뒤처진 시계 · 밀린 항목)은 받는다. 다만 원본을 이미 지운(7일 지난) 5분 구간에 원본이 새로 들어오면 그 구간의 평균은 새로 들어온 원본만으로 다시 계산된다.
+- 큰 간격으로 묶을 때 5분 평균은 구간의 **시작 시각**이 든 칸에 통째로 들어간다(간격이 5분의 배수가 아니면 칸 경계에 걸친 구간이 한쪽에 몰린다).
+- `last_received_at` 과 `dropped` 는 원본 7일 안 · 이 프로세스가 뜬 뒤의 값이다.
+
 ## 무중단 배포와 두 자리
 
 배포 중에는 두 자리(blue·green)가 잠시 함께 떠 있다. 둘 다 수집하지만 결과는 하나일 때와 같다 — **자리별 활성 판정을 두지 않는다**.
 
 - 두 자리는 같은 소비자 그룹을 같은 소비자 이름으로 읽는다. 새 항목은 Redis 가 한쪽에만 준다.
 - 한쪽이 저장하다 죽어 확인하지 못한 항목은 같은 이름의 미확인분이라 다른 쪽이 기동 직후와 1분마다 다시 받아 저장한다(따로 넘겨받는 절차가 없다). 그 사이 양쪽이 같은 항목을 저장해도 기본 키가 한 번만 남긴다.
-- 30일 삭제(와 로그인 시도 기록 삭제)가 두 자리에서 함께 돌아도 결과가 같다.
+- 30일 삭제(와 로그인 시도 기록 삭제 · 지표 삭제 · 5분 평균)가 두 자리에서 함께 돌아도 결과가 같다.
+- 지표도 같은 규칙이다 — 두 자리가 같은 지표 소비자 그룹을 같은 이름으로 읽고, 같은 항목은 한 번만 남는다.
 - 로그인 잠금 판정은 두 자리가 같은 DB 의 같은 상태 행을 잡으므로 어느 자리가 받아도 같다.
 - 조회는 nginx 가 보내는 자리 하나가 받는다. 두 자리는 같은 DB 를 본다.
 

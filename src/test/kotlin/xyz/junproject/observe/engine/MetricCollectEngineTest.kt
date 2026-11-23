@@ -25,6 +25,7 @@ import xyz.junproject.observe.metric.RedisMetricStreamSource
 import xyz.junproject.observe.metric.ResourceSample
 import java.time.Duration
 import java.time.Instant
+import java.time.temporal.ChronoUnit
 import java.util.UUID
 
 /**
@@ -49,7 +50,7 @@ class MetricCollectEngineTest {
     private val producer = EngineSupport.redisTemplate(connect())
     private lateinit var stream: String
     private val group = "observe"
-    private var clock = Instant.now()
+    private var clock = Instant.now().truncatedTo(ChronoUnit.MILLIS)
 
     private fun connect() = EngineSupport.redisConnection().also { connections += it }
     private fun source(connection: LettuceConnectionFactory = connect()) = RedisMetricStreamSource(EngineSupport.redisTemplate(connection), stream, group)
@@ -79,7 +80,7 @@ class MetricCollectEngineTest {
         administrationJdbc.execute("CREATE SCHEMA $schema")
         store.createSchema()
         stream = "observe-test-metrics-${UUID.randomUUID()}"
-        clock = Instant.now()
+        clock = Instant.now().truncatedTo(ChronoUnit.MILLIS)
     }
 
     @AfterEach fun dropStream() { producer.delete(stream) }

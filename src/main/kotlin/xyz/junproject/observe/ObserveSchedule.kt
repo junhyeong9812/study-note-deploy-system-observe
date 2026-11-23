@@ -15,6 +15,7 @@ import xyz.junproject.observe.metric.MetricDeletion
 import xyz.junproject.observe.metric.MetricMaintenance
 import xyz.junproject.observe.metric.MetricRetentionResult
 import xyz.junproject.observe.metric.MetricRollupResult
+import xyz.junproject.observe.metric.MetricStore
 import java.time.Duration
 import java.time.Instant
 
@@ -22,7 +23,7 @@ import java.time.Instant
  * 도는 것들 — 수집 루프(전용 스레드), 하루 한 번 30일 지난 로그 삭제와 90일 지난 로그인 시도 기록 삭제.
  * [authAttempts] 가 없으면(로그 삭제만 보는 테스트) 시도 기록 삭제를 건너뛴다 — 앱에서는 늘 빈이 들어온다.
  *
- * 지표(resource-metrics task 03 — 구현 전): [metricCollector] 가 있으면 로그와 **다른 전용 스레드**(`observe-metric-collector`)로
+ * 지표: [metricCollector] 가 있으면 로그와 **다른 전용 스레드**(`observe-metric-collector`)로
  * 수집 바퀴를 돈다 — 지표 쪽의 어떤 실패도 로그 수집을 멈추지 않는다. [metrics] 가 있으면
  * 5분 평균을 [rollUpMetrics] 가 `@Scheduled(fixedDelayString = "\${observe.metrics.rollup-interval-ms:60000}")` 로 돌고,
  * 7일·30일 삭제는 [deleteOldLogs] 예약 실행에서 로그·로그인 시도 삭제와 **서로 따로** 돈다(한쪽이 실패해도 다른 쪽은 돈다).
@@ -39,6 +40,7 @@ class ObserveSchedule(
     private val log = LoggerFactory.getLogger("observe")
     @Volatile private var running = true
     private lateinit var thread: Thread
+    private var metricThread: Thread? = null
 
     /** 마지막 30일 삭제의 결과(헬스 본문용) — 뜬 뒤 아직 한 번도 돌지 않았으면 null. 삭제가 조용히 실패해 쌓이는 것을 보이게 한다. */
     val lastRetention: RetentionResult? get() = retention
@@ -76,13 +78,41 @@ class ObserveSchedule(
                 }
             }
         }, "observe-collector").apply { isDaemon = true; start() }
+        metricThread = metricCollector?.let { startMetricCollector(it) }
     }
+
+    /**
+     * 지표 수집 스레드 — 로그 수집 스레드와 따로 돌아 한쪽의 예외·Error 가 다른 쪽을 멈추지 않는다.
+     * 예외는 로그 수집과 같이 다시 시도한다. Error(메모리 부족 · 구현 누락의 NotImplementedError 등)는 이 스레드만 끝내고
+     * 서버 로그에 남긴다 — 그 뒤 헬스의 `metrics.status` 가 `stalled` 로 보인다(로그 수집의 판정은 그대로).
+     */
+    private fun startMetricCollector(metricCollector: MetricCollector) = Thread({
+        try {
+            while (running) {
+                try {
+                    val handled = metricCollector.runOnce()
+                    if (metricCollector.lastFailure != null) Thread.sleep(FAILURE_PAUSE_MS)
+                    else if (handled == 0) Thread.sleep(IDLE_PAUSE_MS)
+                } catch (_: InterruptedException) {
+                    break
+                } catch (error: Exception) {
+                    log.error("observe:observe:metric collector loop error — will retry: {}: {}", error.javaClass.simpleName, error.message?.take(200))
+                    try { Thread.sleep(FAILURE_PAUSE_MS) } catch (_: InterruptedException) { break }
+                }
+            }
+        } catch (error: Error) {
+            log.error("observe:observe:metric collector stopped: {}: {}", error.javaClass.simpleName, error.message?.take(200))
+            throw error
+        }
+    }, "observe-metric-collector").apply { isDaemon = true; start() }
 
     @PreDestroy
     fun stop() {
         running = false
         thread.interrupt()
+        metricThread?.interrupt()
         thread.join(5_000)
+        metricThread?.join(5_000)
     }
 
     /** 두 삭제는 서로 따로 — 한쪽이 실패해도(예외를 삼키고 결과에 남긴다) 다른 쪽은 돈다 */
@@ -91,6 +121,7 @@ class ObserveSchedule(
         val now = Instant.now()
         deleteOldLogs(now)
         deleteOldAuthAttempts(now)
+        deleteOldMetrics(now)
     }
 
     /** [now] 기준 [RETENTION] 보다 오래된 로그를 지운다 — 기준 시각의 경계를 테스트가 시계를 정해 확인할 수 있게 나눴다 */
@@ -122,16 +153,45 @@ class ObserveSchedule(
     }
 
     /** 예약이 부르는 5분 평균 — 지금 시각으로 [rollUpMetrics] */
-    fun rollUpMetrics(): Unit = TODO("not implemented")
+    @Scheduled(fixedDelayString = "\${observe.metrics.rollup-interval-ms:60000}")
+    fun rollUpMetrics() {
+        rollUpMetrics(Instant.now())
+    }
 
     /**
      * [now] 로 5분 평균 한 바퀴([MetricMaintenance.rollUp]). 결과는 [lastMetricRollup]·[lastMetricRollupSuccessAt] 와 로그에 —
      * 실패는 예외를 삼키고 종류 이름만 남긴다. [metrics] 가 없으면 null.
      */
-    internal fun rollUpMetrics(now: Instant): Int? = TODO("not implemented")
+    internal fun rollUpMetrics(now: Instant): Int? {
+        val maintenance = metrics ?: return null
+        return runCatching { maintenance.rollUp(now) }
+            .onSuccess {
+                if (it > 0) log.info("observe:observe:rolled up {} metric buckets", it)
+                metricRollup = MetricRollupResult(now, it, null)
+                metricRollupSuccessAt = now
+            }
+            .onFailure {
+                log.error("observe:observe:metric rollup failed: {}: {}", it.javaClass.simpleName, it.message?.take(200))
+                metricRollup = MetricRollupResult(now, null, it.javaClass.simpleName)
+            }
+            .getOrNull()
+    }
 
     /** [now] 기준 지표 삭제([MetricMaintenance.deleteExpired]) — 실패는 예외를 삼키고 [lastMetricRetention] 에 종류 이름. [metrics] 가 없으면 null */
-    internal fun deleteOldMetrics(now: Instant): MetricDeletion? = TODO("not implemented")
+    internal fun deleteOldMetrics(now: Instant): MetricDeletion? {
+        val maintenance = metrics ?: return null
+        return runCatching { maintenance.deleteExpired(now) }
+            .onSuccess {
+                log.info("observe:observe:deleted {} metric samples older than {} days and {} rollups older than {} days",
+                    it.rawDeleted, MetricStore.RAW_RETENTION.toDays(), it.rollupDeleted, MetricStore.ROLLUP_RETENTION.toDays())
+                metricRetention = MetricRetentionResult(now, it, null)
+            }
+            .onFailure {
+                log.error("observe:observe:metric retention failed: {}: {}", it.javaClass.simpleName, it.message?.take(200))
+                metricRetention = MetricRetentionResult(now, null, it.javaClass.simpleName)
+            }
+            .getOrNull()
+    }
 
     companion object {
         val RETENTION: Duration = Duration.ofDays(30)

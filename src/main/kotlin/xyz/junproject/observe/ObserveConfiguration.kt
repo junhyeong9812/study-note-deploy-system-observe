@@ -18,7 +18,10 @@ import xyz.junproject.observe.collect.CollectorHealth
 import xyz.junproject.observe.collect.LogCollector
 import xyz.junproject.observe.collect.RedisLogStreamSource
 import xyz.junproject.observe.log.LogStore
+import xyz.junproject.observe.metric.MetricCollector
+import xyz.junproject.observe.metric.MetricHealth
 import xyz.junproject.observe.metric.MetricStore
+import xyz.junproject.observe.metric.RedisMetricStreamSource
 
 /** 조립 — 연결 정보는 환경변수에서. DB 비밀번호 같은 값은 로그에 내지 않는다. */
 @Configuration
@@ -92,7 +95,7 @@ class ObserveConfiguration {
 
     /**
      * 지표 저장소 — 로그와 같은 DB, 연결 풀은 지표 전용(수집 2 · 조회 2 · 헬스 1). 지표가 무겁거나 실패해도 로그 수집·조회의 풀을 잡지 않는다.
-     * (resource-metrics task 03: 수집기·스트림·헬스·예약의 배선은 구현 때 — 설정 키는 `observe.metrics.*`)
+     * 5분 평균 · 보관 삭제도 수집 풀을 쓴다(평균 한 바퀴 동안 원본 저장이 잠시 기다린다 — [MetricStore.rollUp]).
      */
     @Bean
     fun metricStore(
@@ -105,6 +108,35 @@ class ObserveConfiguration {
         val health = pool("observe-metric-health", url, user, password, size = 1, statementTimeoutMs = 2_000, connectionTimeoutMs = 2_000, validationTimeoutMs = 1_000)
         return MetricStore(JdbcTemplate(ingest), JdbcTemplate(query), JdbcTemplate(health))
     }
+
+    /** 뜬 직후 지표 표를 미리 만든다(최선 노력 — 실패해도 앱은 뜨고 수집 바퀴 · 첫 조회가 다시 만든다) */
+    @EventListener(ApplicationReadyEvent::class)
+    fun prepareMetricSchema(event: ApplicationReadyEvent) {
+        try {
+            event.applicationContext.getBean(MetricStore::class.java).prepareSchema()
+            log.info("observe:observe:metric schema ready")
+        } catch (error: Exception) {
+            log.error("observe:observe:metric schema failed — will retry on first use: {}: {}", error.javaClass.simpleName, error.message?.take(200))
+        }
+    }
+
+    @Bean
+    fun metricStreamSource(
+        redis: StringRedisTemplate,
+        @Value("\${observe.metrics.stream:metrics}") stream: String,
+        @Value("\${observe.metrics.group:observe}") group: String,
+    ): RedisMetricStreamSource {
+        log.info("observe:observe:collecting metric stream '{}' as group '{}'", stream, group)
+        return RedisMetricStreamSource(redis, stream, group)
+    }
+
+    @Bean
+    fun metricCollector(source: RedisMetricStreamSource, store: MetricStore) = MetricCollector(source, store)
+
+    @Bean
+    fun metricHealth(collector: MetricCollector, source: RedisMetricStreamSource, store: MetricStore, schedule: ObserveSchedule) =
+        MetricHealth(collector, { source.unacknowledgedCount() }, { source.lag() }, { store.latestStoredAt() }, { store.lastReceivedByServer() },
+            { schedule.lastMetricRollup }, { schedule.lastMetricRollupSuccessAt }, { schedule.lastMetricRetention })
 
     @Bean
     fun logStreamSource(
@@ -120,7 +152,7 @@ class ObserveConfiguration {
     fun logCollector(source: RedisLogStreamSource, store: LogStore) = LogCollector(source, store)
 
     @Bean
-    fun collectorHealth(collector: LogCollector, source: RedisLogStreamSource, store: LogStore, schedule: ObserveSchedule) =
+    fun collectorHealth(collector: LogCollector, source: RedisLogStreamSource, store: LogStore, schedule: ObserveSchedule, metricHealth: MetricHealth) =
         CollectorHealth(collector, { source.unacknowledgedCount() }, { source.lag() }, { store.latestStoredAt() }, { schedule.lastRetention },
-            lastAuthRetention = { schedule.lastAuthRetention })
+            lastAuthRetention = { schedule.lastAuthRetention }, metrics = metricHealth)
 }

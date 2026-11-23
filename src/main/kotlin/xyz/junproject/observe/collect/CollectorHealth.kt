@@ -21,8 +21,7 @@ import java.time.Instant
  * - `stalled`(503): 그 밖 — 바퀴가 [stallAfter] 넘게 끝나지 않는다(첫 바퀴 전 포함).
  * 밀린 건수(lag)와 30일 삭제·로그인 시도 90일 삭제 결과는 본문에만 낸다 — 밀림은 장애가 아니라 진행 상황이고, 삭제 실패는 수집과 무관하다.
  * 실패 사유는 예외 종류 이름만 낸다(헬스는 인증이 없다). 문구는 서버 로그에만.
- * [metrics] 가 있으면 본문에 `metrics` 객체([MetricHealth.report])를 더한다 — 지표 쪽이 어떻게 실패해도 위 `status` 와 HTTP 상태는 바뀌지 않는다
- * (구현 전 — resource-metrics task 03).
+ * [metrics] 가 있으면 본문에 `metrics` 객체([MetricHealth.report])를 더한다 — 지표 쪽이 어떻게 실패해도 위 `status` 와 HTTP 상태는 바뀌지 않는다.
  */
 class CollectorHealth(
     private val collector: LogCollector,
@@ -73,7 +72,13 @@ class CollectorHealth(
             "last_auth_retention_deleted" to (authRetention?.deleted ?: -1),
             "last_auth_retention_failure" to (authRetention?.failure ?: ""),
         )
-        return Report(status == "ok", body)
+        // 지표 칸은 판정이 끝난 뒤에 덧붙인다 — 지표 쪽의 어떤 실패도 위 status 와 HTTP 상태에 닿지 않게(만들다 실패해도 칸에만 남긴다)
+        val metricHealth = metrics
+        val withMetrics = if (metricHealth == null) body else body + ("metrics" to runCatching { metricHealth.report(now) }.getOrElse {
+            log.error("observe:observe:metric health failed: {}: {}", it.javaClass.simpleName, it.message?.take(200))
+            mapOf("status" to "failing", "failure" to "health ${it.javaClass.simpleName}")
+        })
+        return Report(status == "ok", withMetrics)
     }
 
     private fun isTableMissing(error: Throwable) =
