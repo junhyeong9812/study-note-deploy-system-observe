@@ -22,3 +22,8 @@ observe:
     failure-limit: ${OBSERVE_AUTH_FAILURE_LIMIT:5}
     lock-duration: ${OBSERVE_AUTH_LOCK_DURATION:15m}
     retention: ${OBSERVE_AUTH_RETENTION:90d}
+  metrics:                                         # 자원 지표 — agent 가 같은 Redis 의 이 스트림으로 보낸다
+    stream: ${METRICS_STREAM:metrics}
+    group: ${METRICS_GROUP:observe}
+    expected-servers: ${METRICS_EXPECTED_SERVERS:}  # 쉼표로 나눈 서버 이름 — 한 번도 안 보낸 서버도 GET /metrics/latest 에 "수신 없음"으로
+    rollup-interval-ms: ${METRICS_ROLLUP_INTERVAL_MS:60000}   # 5분 평균 바퀴의 간격

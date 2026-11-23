@@ -10,12 +10,22 @@ import xyz.junproject.observe.auth.AuthAttempts
 import xyz.junproject.observe.collect.LogCollector
 import xyz.junproject.observe.log.LogStore
 import xyz.junproject.observe.log.RetentionResult
+import xyz.junproject.observe.metric.MetricCollector
+import xyz.junproject.observe.metric.MetricDeletion
+import xyz.junproject.observe.metric.MetricMaintenance
+import xyz.junproject.observe.metric.MetricRetentionResult
+import xyz.junproject.observe.metric.MetricRollupResult
 import java.time.Duration
 import java.time.Instant
 
 /**
  * 도는 것들 — 수집 루프(전용 스레드), 하루 한 번 30일 지난 로그 삭제와 90일 지난 로그인 시도 기록 삭제.
  * [authAttempts] 가 없으면(로그 삭제만 보는 테스트) 시도 기록 삭제를 건너뛴다 — 앱에서는 늘 빈이 들어온다.
+ *
+ * 지표(resource-metrics task 03 — 구현 전): [metricCollector] 가 있으면 로그와 **다른 전용 스레드**(`observe-metric-collector`)로
+ * 수집 바퀴를 돈다 — 지표 쪽의 어떤 실패도 로그 수집을 멈추지 않는다. [metrics] 가 있으면
+ * 5분 평균을 [rollUpMetrics] 가 `@Scheduled(fixedDelayString = "\${observe.metrics.rollup-interval-ms:60000}")` 로 돌고,
+ * 7일·30일 삭제는 [deleteOldLogs] 예약 실행에서 로그·로그인 시도 삭제와 **서로 따로** 돈다(한쪽이 실패해도 다른 쪽은 돈다).
  */
 @Component
 class ObserveSchedule(
@@ -23,6 +33,8 @@ class ObserveSchedule(
     private val store: LogStore,
     private val authAttempts: AuthAttempts? = null,
     private val authPolicy: AuthAttemptPolicy = AuthAttemptPolicy(),
+    private val metricCollector: MetricCollector? = null,
+    private val metrics: MetricMaintenance? = null,
 ) {
     private val log = LoggerFactory.getLogger("observe")
     @Volatile private var running = true
@@ -35,6 +47,18 @@ class ObserveSchedule(
     /** 마지막 로그인 시도 기록 삭제의 결과(헬스 본문용) — 뜬 뒤 아직 돌지 않았으면 null */
     val lastAuthRetention: RetentionResult? get() = authRetention
     @Volatile private var authRetention: RetentionResult? = null
+
+    /** 마지막 지표 삭제(원본 7일 · 5분 평균 30일)의 결과(헬스 본문용) — 뜬 뒤 아직 돌지 않았으면 null */
+    val lastMetricRetention: MetricRetentionResult? get() = metricRetention
+    @Volatile private var metricRetention: MetricRetentionResult? = null
+
+    /** 마지막 5분 평균 바퀴의 결과(성공·실패) — 뜬 뒤 아직 돌지 않았으면 null */
+    val lastMetricRollup: MetricRollupResult? get() = metricRollup
+    @Volatile private var metricRollup: MetricRollupResult? = null
+
+    /** 5분 평균이 마지막으로 **성공**한 시각 — 실패한 바퀴는 이 값을 바꾸지 않는다 */
+    val lastMetricRollupSuccessAt: Instant? get() = metricRollupSuccessAt
+    @Volatile private var metricRollupSuccessAt: Instant? = null
 
     @PostConstruct
     fun start() {
@@ -96,6 +120,18 @@ class ObserveSchedule(
             }
             .getOrNull()
     }
+
+    /** 예약이 부르는 5분 평균 — 지금 시각으로 [rollUpMetrics] */
+    fun rollUpMetrics(): Unit = TODO("not implemented")
+
+    /**
+     * [now] 로 5분 평균 한 바퀴([MetricMaintenance.rollUp]). 결과는 [lastMetricRollup]·[lastMetricRollupSuccessAt] 와 로그에 —
+     * 실패는 예외를 삼키고 종류 이름만 남긴다. [metrics] 가 없으면 null.
+     */
+    internal fun rollUpMetrics(now: Instant): Int? = TODO("not implemented")
+
+    /** [now] 기준 지표 삭제([MetricMaintenance.deleteExpired]) — 실패는 예외를 삼키고 [lastMetricRetention] 에 종류 이름. [metrics] 가 없으면 null */
+    internal fun deleteOldMetrics(now: Instant): MetricDeletion? = TODO("not implemented")
 
     companion object {
         val RETENTION: Duration = Duration.ofDays(30)

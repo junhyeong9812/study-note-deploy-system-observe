@@ -18,6 +18,7 @@ import xyz.junproject.observe.collect.CollectorHealth
 import xyz.junproject.observe.collect.LogCollector
 import xyz.junproject.observe.collect.RedisLogStreamSource
 import xyz.junproject.observe.log.LogStore
+import xyz.junproject.observe.metric.MetricStore
 
 /** 조립 — 연결 정보는 환경변수에서. DB 비밀번호 같은 값은 로그에 내지 않는다. */
 @Configuration
@@ -87,6 +88,22 @@ class ObserveConfiguration {
     @EventListener(ApplicationReadyEvent::class)
     fun prepareAuthAttemptSchema(event: ApplicationReadyEvent) {
         event.applicationContext.getBean(SchemaOnFirstUseAuthAttempts::class.java).prepare()
+    }
+
+    /**
+     * 지표 저장소 — 로그와 같은 DB, 연결 풀은 지표 전용(수집 2 · 조회 2 · 헬스 1). 지표가 무겁거나 실패해도 로그 수집·조회의 풀을 잡지 않는다.
+     * (resource-metrics task 03: 수집기·스트림·헬스·예약의 배선은 구현 때 — 설정 키는 `observe.metrics.*`)
+     */
+    @Bean
+    fun metricStore(
+        @Value("\${observe.db.url}") url: String,
+        @Value("\${observe.db.user}") user: String,
+        @Value("\${observe.db.password}") password: String,
+    ): MetricStore {
+        val ingest = pool("observe-metric-ingest", url, user, password, size = 2, statementTimeoutMs = 30_000)
+        val query = pool("observe-metric-query", url, user, password, size = 2, statementTimeoutMs = 10_000)
+        val health = pool("observe-metric-health", url, user, password, size = 1, statementTimeoutMs = 2_000, connectionTimeoutMs = 2_000, validationTimeoutMs = 1_000)
+        return MetricStore(JdbcTemplate(ingest), JdbcTemplate(query), JdbcTemplate(health))
     }
 
     @Bean

@@ -2,6 +2,7 @@ package xyz.junproject.observe.collect
 
 import org.slf4j.LoggerFactory
 import xyz.junproject.observe.log.RetentionResult
+import xyz.junproject.observe.metric.MetricHealth
 import java.sql.SQLException
 import java.time.Duration
 import java.time.Instant
@@ -20,6 +21,8 @@ import java.time.Instant
  * - `stalled`(503): 그 밖 — 바퀴가 [stallAfter] 넘게 끝나지 않는다(첫 바퀴 전 포함).
  * 밀린 건수(lag)와 30일 삭제·로그인 시도 90일 삭제 결과는 본문에만 낸다 — 밀림은 장애가 아니라 진행 상황이고, 삭제 실패는 수집과 무관하다.
  * 실패 사유는 예외 종류 이름만 낸다(헬스는 인증이 없다). 문구는 서버 로그에만.
+ * [metrics] 가 있으면 본문에 `metrics` 객체([MetricHealth.report])를 더한다 — 지표 쪽이 어떻게 실패해도 위 `status` 와 HTTP 상태는 바뀌지 않는다
+ * (구현 전 — resource-metrics task 03).
  */
 class CollectorHealth(
     private val collector: LogCollector,
@@ -30,6 +33,7 @@ class CollectorHealth(
     private val lastAuthRetention: () -> RetentionResult? = { null },   // 로그인 시도 기록 90일 삭제 — 본문에만, 판정에 넣지 않는다
     private val stallAfter: Duration = Duration.ofSeconds(60),
     private val startedAt: Instant = Instant.now(),
+    private val metrics: MetricHealth? = null,                          // 지표 수집의 칸 — 본문에만, 판정에 넣지 않는다
 ) {
     data class Report(val healthy: Boolean, val body: Map<String, Any>)
 
