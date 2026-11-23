@@ -4,6 +4,7 @@ import org.slf4j.LoggerFactory
 import java.sql.SQLException
 import java.time.Duration
 import java.time.Instant
+import xyz.junproject.observe.threshold.ThresholdRound
 
 /**
  * 지표 수집의 헬스 칸 — `/health` 본문의 `metrics` 객체. **로그 수집의 `status` 와 HTTP 상태에는 넣지 않는다**(§10.3).
@@ -30,6 +31,12 @@ class MetricHealth(
     private val lastRetention: () -> MetricRetentionResult?,
     private val stallAfter: Duration = Duration.ofSeconds(60),
     private val startedAt: Instant = Instant.now(),
+    /**
+     * 임계값 판정 · 보내기(task 04 — 구현 전). 있으면 `metrics` 객체에 칸을 더한다: `last_judged_at`(마지막으로 판정한 시각, 없으면 빈 글자) ·
+     * `last_judge_failure` · `last_dispatch_failure`(마지막 바퀴의 예외 종류, 없으면 빈 글자) · `undelivered_alerts` · `rejected_alerts`(읽지 못하면 -1).
+     * 판정 · 보내기의 실패는 `metrics.status` 를 바꾸지 않는다. 없으면 칸도 없다(기존 칸 그대로).
+     */
+    private val thresholds: ThresholdRound? = null,
 ) {
     private val log = LoggerFactory.getLogger("observe")
     @Volatile private var lastLoggedProblem: String? = null

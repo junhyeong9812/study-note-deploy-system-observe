@@ -14,6 +14,7 @@ import java.sql.SQLException
 import java.time.Duration
 import java.time.Instant
 import java.time.format.DateTimeParseException
+import xyz.junproject.observe.threshold.FiringSource
 
 /**
  * 지표 조회(§10.3 · §11.5 · §11.6) — 전부 GET, 전부 `X-Observe-Secret`(설정이 비면 전부 거절, 비교는 상수 시간).
@@ -41,6 +42,8 @@ class MetricController(
     private val reader: MetricReader,
     @Value("\${observe.secret:}") private val secret: String,
     @Value("\${observe.metrics.expected-servers:}") private val expectedServers: String,
+    /** 지금 넘어 있는 규칙(task 04) — 있으면 `firing` 에 싣는다(구현 전). 없으면 늘 빈 배열 */
+    private val firingSource: FiringSource? = null,
 ) {
     private val log = LoggerFactory.getLogger("observe")
     private val expected: List<String> = expectedServers.split(',').map { it.trim() }.filter { it.isNotEmpty() }.distinct()

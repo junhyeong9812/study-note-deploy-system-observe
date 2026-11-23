@@ -103,7 +103,7 @@ class MetricStore(
     private val ingest: JdbcTemplate,
     private val query: JdbcTemplate,
     private val health: JdbcTemplate,
-) : MetricSink, MetricReader, MetricMaintenance {
+) : MetricSink, MetricReader, MetricMaintenance, MetricSampleSource {
     private val transaction = TransactionTemplate(DataSourceTransactionManager(requireNotNull(ingest.dataSource) { "JdbcTemplate 에 DataSource 가 없다" }))
     @Volatile private var schemaReady = false
     private val creatingSchema = Any()
@@ -437,6 +437,10 @@ class MetricStore(
         gpus = emptyList(),
         missing = (getArray("missing").array as Array<*>).map { it as String },
     )
+
+    // resource-metrics task 04 — 임계값 판정이 읽는 면(구현 전)
+    override fun samplesMeasuredBetween(from: Instant, to: Instant): List<ResourceSample> = TODO("not implemented")
+    override fun lastReceivedOfEveryServer(): Map<String, Instant> = TODO("not implemented")
 
     companion object {
         val RAW_RETENTION: Duration = Duration.ofDays(7)

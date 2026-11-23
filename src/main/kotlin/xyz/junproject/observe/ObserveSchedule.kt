@@ -18,6 +18,8 @@ import xyz.junproject.observe.metric.MetricRollupResult
 import xyz.junproject.observe.metric.MetricStore
 import java.time.Duration
 import java.time.Instant
+import xyz.junproject.observe.threshold.ThresholdRound
+import xyz.junproject.observe.threshold.ThresholdRoundResult
 
 /**
  * 도는 것들 — 수집 루프(전용 스레드), 하루 한 번 30일 지난 로그 삭제와 90일 지난 로그인 시도 기록 삭제.
@@ -36,6 +38,7 @@ class ObserveSchedule(
     private val authPolicy: AuthAttemptPolicy = AuthAttemptPolicy(),
     private val metricCollector: MetricCollector? = null,
     private val metrics: MetricMaintenance? = null,
+    private val thresholdRound: ThresholdRound? = null,
 ) {
     private val log = LoggerFactory.getLogger("observe")
     @Volatile private var running = true
@@ -192,6 +195,15 @@ class ObserveSchedule(
             }
             .getOrNull()
     }
+
+    /**
+     * 임계값 판정과 보내기(task 04 — 구현 전). 구현 때 `@Scheduled(fixedDelayString = "\${observe.metrics.judge-interval-ms:30000}")` —
+     * 지금 시각으로 [judgeThresholds] 를 부른다.
+     */
+    fun judgeThresholds(): Unit = TODO("not implemented")
+
+    /** [now] 로 한 바퀴([ThresholdRound.runOnce]) — 예외를 내지 않는다. [thresholdRound] 가 없으면 null */
+    internal fun judgeThresholds(now: Instant): ThresholdRoundResult? = TODO("not implemented")
 
     companion object {
         val RETENTION: Duration = Duration.ofDays(30)
