@@ -241,6 +241,14 @@ class ThresholdStoreEngineTest {
     private fun enqueue(vararg eventIds: String) =
         store.judgeRound(now) { JudgeResult(listOf(state()), eventIds.mapIndexed { index, id -> alert(id, createdAt = now.plusMillis(index.toLong())) }) }
 
+    /** 알림마다 서버(대상)를 달리해 기록한다 — `server-1` · `server-2` … */
+    private fun enqueueForDifferentServers(vararg eventIds: String) =
+        store.judgeRound(now) {
+            JudgeResult(listOf(state()), eventIds.mapIndexed { index, id ->
+                alert(id, key = "resource:server-${index + 1}:memory", createdAt = now.plusMillis(index.toLong())).copy(server = "server-${index + 1}")
+            })
+        }
+
     private class ScriptedSender(private val outcomes: Map<String, SendOutcome>) : AlertSender {
         val sent = mutableListOf<String>()
         override fun send(alert: ResourceAlert): SendOutcome { synchronized(sent) { sent += alert.eventId }; return outcomes[alert.eventId] ?: SendOutcome.Delivered }
@@ -248,7 +256,7 @@ class ThresholdStoreEngineTest {
 
     @Test
     fun `받은 것은 지우고 못 보낸 것은 횟수와 사유를 남겨 다음 바퀴에 다시, 거절된 것은 세고 다시 보내지 않는다`() {
-        enqueue("e-1", "e-2", "e-3")
+        enqueueForDifferentServers("e-1", "e-2", "e-3")       // 서로 다른 대상 — 같은 대상이면 다시 시도 뒤의 알림은 그 바퀴에 가지 않는다(§15.1)
         val first = ScriptedSender(mapOf("e-2" to SendOutcome.Retry("http 503"), "e-3" to SendOutcome.Rejected("http 422")))
         assertEquals(DispatchOutcome(true, 1, 1, 1), AlertDispatcher(store, first).dispatch(now))
         val left = store.pendingAlerts(10)

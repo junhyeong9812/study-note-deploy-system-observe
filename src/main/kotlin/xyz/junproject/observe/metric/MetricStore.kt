@@ -59,6 +59,9 @@ interface MetricReader {
 
     /** [server] 에서 측정 시각이 `[from, to]`(양 끝 포함) 안인 항목에 들어 있던 컨테이너(계열 이름) — 이름순 */
     fun containers(server: String, from: Instant, to: Instant): List<SeenContainer>
+
+    /** 서버별 마지막 수신 시각(원본과 따로 남긴 값 — §15). `latest` 의 `age_ms` · `stale` 이 쓴다. 모르면 빈 지도 */
+    fun lastReceivedOfEveryServer(): Map<String, Instant> = emptyMap()
 }
 
 /** 원본 7일 · 5분 평균 30일 삭제 한 번의 결과 — [rawDeleted] 는 지운 항목(스트림 항목) 수, [rollupDeleted] 는 지운 (서버, 5분 구간) 수 */
@@ -159,6 +162,7 @@ class MetricStore(
         )
         ingest.execute("CREATE INDEX IF NOT EXISTS metric_container_series ON metric_container (server, series_name, measured_ms)")
         ingest.execute("CREATE INDEX IF NOT EXISTS metric_container_seen ON metric_container (server, measured_ms)")
+        ingest.execute("CREATE INDEX IF NOT EXISTS metric_container_measured ON metric_container (measured_ms)")   // 판정 입력(서버 섞임 · 측정 시각 범위)
         ingest.execute(
             """CREATE TABLE IF NOT EXISTS metric_gpu (
                  stream_ms   bigint           NOT NULL,
@@ -175,6 +179,7 @@ class MetricStore(
                  FOREIGN KEY (stream_ms, stream_seq) REFERENCES metric_sample ON DELETE CASCADE)"""
         )
         ingest.execute("CREATE INDEX IF NOT EXISTS metric_gpu_series ON metric_gpu (server, measured_ms)")
+        ingest.execute("CREATE INDEX IF NOT EXISTS metric_gpu_measured ON metric_gpu (measured_ms)")
         ingest.execute(
             """CREATE TABLE IF NOT EXISTS metric_rollup_bucket (
                  server            text   NOT NULL,
@@ -198,6 +203,17 @@ class MetricStore(
                  FOREIGN KEY (server, bucket_ms) REFERENCES metric_rollup_bucket ON DELETE CASCADE)"""
         )
         ingest.execute("CREATE INDEX IF NOT EXISTS metric_rollup_by_bucket ON metric_rollup (server, bucket_ms)")
+        ingest.execute(
+            """CREATE TABLE IF NOT EXISTS metric_server_receipt (
+                 server           text   PRIMARY KEY,
+                 last_received_ms bigint NOT NULL)"""
+        )
+        // 처음 채우기 — 이 표가 생기기 전부터 원본이 있던 DB 에서 비어 있지 않게. 큰 쪽으로만 바꾸므로 몇 번을, 두 자리가 함께 해도 결과가 같다
+        ingest.update(
+            """INSERT INTO metric_server_receipt (server, last_received_ms)
+               SELECT server, max(received_ms) FROM metric_sample GROUP BY server
+               ON CONFLICT (server) DO UPDATE SET last_received_ms = GREATEST(metric_server_receipt.last_received_ms, EXCLUDED.last_received_ms)"""
+        )
         schemaReady = true
     }
 
@@ -232,6 +248,12 @@ class MetricStore(
                 statement.setNullable(7, gpu.utilPct, Types.DOUBLE); statement.setNullable(8, gpu.memUsed, Types.BIGINT)
                 statement.setNullable(9, gpu.memTotal, Types.BIGINT); statement.setNullable(10, gpu.tempC, Types.DOUBLE)
             }
+            // 서버별 마지막 수신 시각 — 같은 트랜잭션에서, 큰 쪽으로만(두 자리가 엇갈려 커밋해도 옛 값이 새 값을 덮지 않는다).
+            // 서버 이름순으로 잡아 두 저장이 서로의 줄을 거꾸로 기다리지 않게
+            val receipts = samples.groupBy { it.server }.mapValues { (_, list) -> list.maxOf { it.receivedAt.toEpochMilli() } }.toSortedMap()
+            ingest.batchUpdate(UPSERT_RECEIPT, receipts.entries.toList(), receipts.size) { statement, (server, receivedMs) ->
+                statement.setString(1, server); statement.setLong(2, receivedMs)
+            }
             inserted.size
         }!!
     }
@@ -255,6 +277,9 @@ class MetricStore(
         val to = query.to.toEpochMilli()
         val step = query.step.toMillis()
         val rawSince = query.rawSince.toEpochMilli()
+        // 5분 평균을 읽는 요청은 칸을 5분 경계에서 센다 — 요청 기간과 겹치는 구간은 통째로 한 점이고 점의 시각은 구간의 시작이다
+        // (첫 점이 from 보다 최대 5분 앞설 수 있다 · §15.1). 간격([SeriesPlan])도 이 시작으로 골라져 온다
+        val origin = if (from < rawSince) SeriesPlan.floorTo(query.from, BUCKET).toEpochMilli() else from
         val name = query.name ?: ""
         val cells = sortedMapOf<Long, MutableMap<String, MutableList<MetricAggregate>>>()
         fun collect(row: ResultSet) {
@@ -266,10 +291,10 @@ class MetricStore(
             """SELECT (bucket_ms - ?) / ? AS cell, value_name,
                       sum(average * samples) / sum(samples) AS average, max(maximum) AS maximum, sum(samples) AS samples
                FROM metric_rollup
-               WHERE server = ? AND scope = ? AND name = ? AND bucket_ms >= ? AND bucket_ms < ?
+               WHERE server = ? AND scope = ? AND name = ? AND bucket_ms > ? AND bucket_ms < ?
                GROUP BY 1, 2""",
             RowCallbackHandler { row -> collect(row) },
-            from, step, query.server, query.scope.wireName, name, from, minOf(to, rawSince),
+            origin, step, query.server, query.scope.wireName, name, from - BUCKET.toMillis(), minOf(to, rawSince),
         )
         // 나머지는 원본에서 — 컨테이너는 같은 항목 안의 두 자리를 먼저 더한 것이 표본 하나
         if (to > rawSince) this.query.query(
@@ -278,11 +303,11 @@ class MetricStore(
                WHERE server = ? AND name = ? AND measured_ms >= ? AND measured_ms < ?
                GROUP BY 1, 2 HAVING count(value) > 0""",
             RowCallbackHandler { row -> collect(row) },
-            from, step, query.server, name, maxOf(from, rawSince), to,
+            origin, step, query.server, name, maxOf(from, rawSince), to,
         )
         return cells.mapNotNull { (cell, values) ->
             val combined = values.mapNotNull { (valueName, parts) -> MetricAggregate.combine(parts)?.let { valueName to it } }.toMap()
-            combined.takeIf { it.isNotEmpty() }?.let { SeriesPoint(Instant.ofEpochMilli(from + cell * step), it) }
+            combined.takeIf { it.isNotEmpty() }?.let { SeriesPoint(Instant.ofEpochMilli(origin + cell * step), it) }
         }
     }
 
@@ -345,11 +370,14 @@ class MetricStore(
         return heads.map { it.copy(containers = containers[it.id].orEmpty(), gpus = gpus[it.id].orEmpty()) }
     }
 
-    /** 서버별 마지막 수신 시각(판정용 — 조회 풀). 보관 중인 원본 전체에서 본다(하루 넘게 끊긴 서버도 든다) */
+    /**
+     * 서버별 마지막 수신 시각(판정 · `latest` 의 `age_ms` — 조회 풀). 원본과 따로 둔 작은 표에서 읽는다 — 원본이 7일 뒤 지워져도 남고
+     * 늦게 도착한 옛 항목도 "방금 받았다"로 친다(§15).
+     */
     override fun lastReceivedOfEveryServer(): Map<String, Instant> {
         ensureSchema()
-        return query.query("SELECT server, max(received_ms) AS last_received FROM metric_sample GROUP BY server",
-            { row, _ -> row.getString("server") to Instant.ofEpochMilli(row.getLong("last_received")) }).toMap()
+        return query.query("SELECT server, last_received_ms FROM metric_server_receipt",
+            { row, _ -> row.getString("server") to Instant.ofEpochMilli(row.getLong("last_received_ms")) }).toMap()
     }
 
     private fun ResultSet.toContainer() = ContainerValues(getString("name"), getString("container_id"), getString("project"), nullableDouble("cpu_pct"),
@@ -386,7 +414,8 @@ class MetricStore(
                      SELECT server, measured_ms / ? * ? AS bucket_ms, max(received_ms) AS last_received, max(insert_order) AS last_order
                      FROM metric_sample WHERE measured_ms < ? GROUP BY 1, 2) raw
                    LEFT JOIN metric_rollup_bucket done ON done.server = raw.server AND done.bucket_ms = raw.bucket_ms
-                   WHERE done.server IS NULL OR done.computed_ms <= raw.last_received OR done.insert_order_seen < raw.last_order""",
+                   WHERE done.server IS NULL OR done.computed_ms <= raw.last_received OR done.insert_order_seen < raw.last_order
+                   ORDER BY raw.server, raw.bucket_ms""",
                 { row, _ -> row.getString("server") to row.getLong("bucket_ms") },
                 bucket, bucket, closedBefore,
             )
@@ -444,10 +473,20 @@ class MetricStore(
     fun latestStoredAt(): Instant? =
         health.queryForObject("SELECT max(received_ms) FROM metric_sample", Long::class.javaObjectType)?.let(Instant::ofEpochMilli)
 
-    /** 서버별 마지막 수신 시각(헬스용 — §2.3). 7일치 원본을 서버 · 수신 시각 인덱스로 훑는다(서버 몇 대 · 수만 행) */
+    /** 서버별 마지막 수신 시각(헬스용 — §2.3) — 작은 표에서(헬스용 연결 · 표를 만들지 않는다) */
     fun lastReceivedByServer(): Map<String, Instant> =
-        health.query("SELECT server, max(received_ms) AS last_received FROM metric_sample GROUP BY server ORDER BY server",
-            { row, _ -> row.getString("server") to Instant.ofEpochMilli(row.getLong("last_received")) }).toMap()
+        health.query("SELECT server, last_received_ms FROM metric_server_receipt ORDER BY server",
+            { row, _ -> row.getString("server") to Instant.ofEpochMilli(row.getLong("last_received_ms")) }).toMap()
+
+    /**
+     * 서버마다 측정 시각이 가장 늦은 항목(컨테이너 · GPU 없이 — 헬스의 `clock_behind` 용, 헬스용 연결 · 표를 만들지 않는다).
+     * 수신이 [receivedSince] 이후인 항목에서 고른다(`latest` 와 같은 범위).
+     */
+    fun latestHeads(receivedSince: Instant): List<ResourceSample> = health.query(
+        """SELECT DISTINCT ON (server) * FROM metric_sample WHERE received_ms >= ?
+           ORDER BY server, measured_ms DESC, stream_ms DESC, stream_seq DESC""",
+        { row, _ -> row.toSampleHead() }, receivedSince.toEpochMilli(),
+    )
 
     private fun ResultSet.toSampleHead(): ResourceSample = ResourceSample(
         id = StreamId(getLong("stream_ms"), getInt("stream_seq")),
@@ -470,6 +509,9 @@ class MetricStore(
         val ROLLUP_RETENTION: Duration = Duration.ofDays(30)
         val BUCKET: Duration = Duration.ofMinutes(5)
 
+        private const val UPSERT_RECEIPT =
+            """INSERT INTO metric_server_receipt (server, last_received_ms) VALUES (?, ?)
+               ON CONFLICT (server) DO UPDATE SET last_received_ms = GREATEST(metric_server_receipt.last_received_ms, EXCLUDED.last_received_ms)"""
         private const val INSERT_SAMPLE =
             """INSERT INTO metric_sample (stream_ms, stream_seq, server, measured_ms, received_ms, interval_ms, host_present,
                  cpu_pct, load1, mem_total, mem_used, disk_total, disk_used, net_rx_bps, net_tx_bps, io_read_bps, io_write_bps, missing)

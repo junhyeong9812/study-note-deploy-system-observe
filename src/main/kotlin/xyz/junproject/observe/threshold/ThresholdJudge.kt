@@ -131,7 +131,7 @@ data class JudgeInput(
     val expectedServers: Set<String>,
     /**
      * 끊김 규칙을 판정하는가(§15.1 — [SilentGate]). false 면 끊김은 보류다: 새로 울리지도, 울리던 것을 해소하지도, 다시 알리지도 않는다.
-     * 다른 규칙은 그대로 판정한다(리뷰 루프 1 — 구현 전)
+     * 다른 규칙은 그대로 판정한다
      */
     val silentJudging: Boolean = true,
 )
@@ -179,7 +179,8 @@ class ThresholdJudge(private val thresholds: ResourceThresholds = ResourceThresh
                     thresholds.cpuResolvePct, thresholds.cpuResolveFor, "CPU")
                 judgeRestarts(server, samples)
             }
-            for (server in (input.expectedServers + input.lastReceivedAt.keys).sorted()) judgeSilent(server)
+            // 끊김을 판정하지 않는 동안(§15.1 — 막 뜬 직후)은 끊김 규칙 전체를 보류한다: 울리지도, 해소하지도, 다시 알리지도 않는다
+            if (input.silentJudging) for (server in (input.expectedServers + input.lastReceivedAt.keys).sorted()) judgeSilent(server)
         }
 
         fun result() = JudgeResult(states.values.toList(), events)
@@ -295,6 +296,9 @@ class ThresholdJudge(private val thresholds: ResourceThresholds = ResourceThresh
             val window = thresholds.restartWindow
             val start = now.minus(window)
             val inWindow = samples.filter { it.measuredAt.isAfter(start) }
+            // 컨테이너 갈래가 온전한 표본(읽지 못했거나 잘린 것이 아님) — "그 ID 가 사라짐"은 이것으로만 판단한다(§15 · §15.1)
+            val intact = inWindow.filter { sample -> sample.missing.none { it in INCOMPLETE_CONTAINERS } }
+            val seenIds = inWindow.flatMapTo(HashSet()) { sample -> sample.containers.map { it.id } }
             // 컨테이너 ID 마다 (측정 시각, 재시작 횟수, 이름) — 새 ID 는 새 기준(배포는 재시작이 아니다)
             val byContainer = LinkedHashMap<String, MutableList<Pair<Long, String>>>()
             for (sample in inWindow) for (container in sample.containers) {
@@ -303,13 +307,16 @@ class ThresholdJudge(private val thresholds: ResourceThresholds = ResourceThresh
             }
             val firing = states.values.filter { it.server == server && it.rule == ResourceRule.RESTARTS && it.firing }
             for (state in firing) {
-                val counts = byContainer[state.target]
-                if (counts == null) {
-                    // 울리던 컨테이너가 사라지고 서버는 계속 보낸다 — 새 컨테이너로 바뀌었다(§14)
-                    if (enough(inWindow.size, window)) resolve(state, null, "$server 컨테이너 ${state.targetName} 재시작 해소 — 컨테이너가 바뀜",
-                        "최근 ${minutes(window)} 에 그 컨테이너(${state.target})가 보이지 않는다")
+                if (state.target !in seenIds) {
+                    // 울리던 컨테이너가 사라지고 서버는 계속 보낸다 — 새 컨테이너로 바뀌었다(§14). 온전한 표본이 절반 이상이고
+                    // 가장 최근 표본도 온전할 때만 — 컨테이너를 읽지 못한 것은 넘음도 해소도 아니다(보류)
+                    if (enough(intact.size, window) && inWindow.lastOrNull()?.missing?.none { it in INCOMPLETE_CONTAINERS } == true) {
+                        resolve(state, null, "$server 컨테이너 ${state.targetName} 재시작 해소 — 컨테이너가 바뀜",
+                            "최근 ${minutes(window)} 에 그 컨테이너(${state.target})가 보이지 않는다")
+                    }
                     continue
                 }
+                val counts = byContainer[state.target] ?: continue            // 보이지만 재시작 횟수를 읽지 못했다 — 보류
                 if (!enough(counts.size, window)) continue
                 val increase = (counts.last().first - counts.first().first).toDouble()
                 if (increase <= 0) resolve(state, 0.0, "$server 컨테이너 ${state.targetName} 재시작 해소", "최근 ${minutes(window)} 동안 재시작이 늘지 않았다")
@@ -346,6 +353,8 @@ class ThresholdJudge(private val thresholds: ResourceThresholds = ResourceThresh
 
     private companion object {
         const val RESOLVED = ":resolved"
+        /** 이 낱말이 `missing` 에 있으면 그 표본의 컨테이너 목록은 온전하지 않다 */
+        val INCOMPLETE_CONTAINERS = setOf("containers", "containers_truncated")
         const val MAX_KEY = 120
         /** 넘음 key 의 최대 길이 — 뒤에 `:resolved` 가 붙어도 [MAX_KEY] 를 넘지 않게 */
         val MAX_BASE_KEY = MAX_KEY - RESOLVED.length

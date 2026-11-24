@@ -109,7 +109,7 @@ enum class MetricDropReason(val wireName: String) {
     INVALID_VALUE("invalid_value"),
     /**
      * 측정 시각이 수신 시각보다 6일 넘게 뒤다(§15.1 — 원본 보관 7일과 하루의 여유). 원본이 이미 지워진 구간의 5분 평균이
-     * 그 한 건으로 덮어써지지 않게 버린다. 정확히 6일은 받는다(리뷰 루프 1 — 구현 전)
+     * 그 한 건으로 덮어써지지 않게 버린다. 정확히 6일은 받는다
      */
     TOO_OLD("too_old"),
 }
@@ -134,6 +134,8 @@ object MetricEntryParser {
     const val VERSION = "1"
     const val MAX_BODY_BYTES = 64 * 1024
     val MAX_CLOCK_AHEAD: Duration = Duration.ofMinutes(2)
+    /** 측정 시각이 수신 시각보다 이만큼 넘게 뒤면 버린다(§15.1 — 원본 보관 7일과 하루의 여유) */
+    val MAX_LATENESS: Duration = Duration.ofDays(6)
     /** agent 의 `SERVER_NAME`(예: `ci-agent-158`) — 조회의 `server` 도 같은 꼴 */
     val SERVER_NAME = Regex("^[a-z0-9][a-z0-9._-]{0,62}$")
 
@@ -168,6 +170,7 @@ object MetricEntryParser {
             ?: return MetricEntryParse.Dropped(MetricDropReason.INVALID_AT)
         val measuredAt = Instant.ofEpochMilli(measuredMillis)
         if (measuredAt.isAfter(receivedAt.plus(MAX_CLOCK_AHEAD))) return MetricEntryParse.Dropped(MetricDropReason.CLOCK_AHEAD)
+        if (measuredAt.isBefore(receivedAt.minus(MAX_LATENESS))) return MetricEntryParse.Dropped(MetricDropReason.TOO_OLD)
         val body = fields.getValue("body")
         if (body.toByteArray(Charsets.UTF_8).size > MAX_BODY_BYTES) return MetricEntryParse.Dropped(MetricDropReason.BODY_TOO_LARGE)
         val tree = try { json.readTree(body) } catch (_: JacksonException) { return MetricEntryParse.Dropped(MetricDropReason.BODY_NOT_JSON) }

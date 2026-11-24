@@ -197,24 +197,26 @@ class ObserveSchedule(
             .getOrNull()
     }
 
-    /** 임계값 판정과 보내기 — 지금 시각으로 [judgeThresholds]. 판정 · 보내기는 다른 예약 실행(5분 평균 · 삭제)과 잠금을 나누지 않는다 */
+    /** 임계값 판정 — 지금 시각으로 [judgeThresholds]. 보내기는 [dispatchAlerts] 가 따로 돈다(§15) */
     @Scheduled(fixedDelayString = "\${observe.metrics.judge-interval-ms:30000}")
     fun judgeThresholds() {
         judgeThresholds(Instant.now())
     }
 
-    /** [now] 로 한 바퀴([ThresholdRound.runOnce]) — 예외를 내지 않는다. [thresholdRound] 가 없으면 null */
-    internal fun judgeThresholds(now: Instant): ThresholdRoundResult? = thresholdRound?.runOnce(now)
+    /** [now] 로 판정만 한 바퀴([ThresholdRound.judgeOnce]) — 예외를 내지 않는다. [thresholdRound] 가 없으면 null */
+    internal fun judgeThresholds(now: Instant): ThresholdRoundResult? = thresholdRound?.judgeOnce(now)
 
     /**
-     * 알림 보내기(§15 · §15.1 — 판정과 따로 돈다. 구현 전). 구현 때 `@Scheduled(fixedDelayString = "\${observe.alert.dispatch-interval-ms:30000}")`
-     * (환경 변수 `ALERT_DISPATCH_INTERVAL_MS`) — 판정과 서로 기다리지 않게 예약 실행기의 스레드가 하나여도 막히지 않아야 한다.
-     * 구현 때 [judgeThresholds] 는 판정만([ThresholdRound.judgeOnce]) 하고 보내기를 부르지 않는다.
+     * 알림 보내기(§15 · §15.1 — 판정과 따로 돈다. 환경 변수 `ALERT_DISPATCH_INTERVAL_MS`). 예약 실행기는 여러 스레드라
+     * ([ObserveConfiguration.taskScheduler]) 한 건에 3초씩 걸리는 보내기 동안에도 판정 · 5분 평균 · 삭제가 제 주기에 돈다.
      */
-    fun dispatchAlerts(): Unit = TODO("not implemented")
+    @Scheduled(fixedDelayString = "\${observe.alert.dispatch-interval-ms:30000}")
+    fun dispatchAlerts() {
+        dispatchAlerts(Instant.now())
+    }
 
-    /** [now] 로 보내기 한 바퀴([ThresholdRound.dispatchOnce]) — 예외를 내지 않는다. [thresholdRound] 가 없으면 null (구현 전) */
-    internal fun dispatchAlerts(now: Instant): DispatchOutcome? = TODO("not implemented")
+    /** [now] 로 보내기 한 바퀴([ThresholdRound.dispatchOnce]) — 예외를 내지 않는다. [thresholdRound] 가 없으면 null */
+    internal fun dispatchAlerts(now: Instant): DispatchOutcome? = thresholdRound?.dispatchOnce(now)
 
     companion object {
         val RETENTION: Duration = Duration.ofDays(30)

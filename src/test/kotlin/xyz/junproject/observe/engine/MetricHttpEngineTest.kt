@@ -139,6 +139,16 @@ class MetricHttpEngineTest {
     }
 
     @Test
+    fun `뜬 직후에는(기본 3분) 한 번도 안 보낸 기대 서버가 있어도 끊김을 알리지 않고 헬스의 silent_judging 이 false 다`() {
+        @Suppress("UNCHECKED_CAST")
+        val firing = data(call("GET", "/metrics/latest"))["firing"] as List<Map<String, Any?>>
+        assertFalse(firing.any { it["server"] == "ci-agent-164" && it["rule"] == "silent" }, "뜬 직후에 끊김을 알렸다: $firing")
+        @Suppress("UNCHECKED_CAST")
+        val metrics = envelope(call("GET", "/health", secret = null))["metrics"] as Map<String, Any?>
+        assertEquals(false, metrics["silent_judging"], "뜬 직후인데 끊김을 판정하는 중이다: $metrics")
+    }
+
+    @Test
     fun `기대 서버로 설정한 서버는 한 번도 보내지 않았어도 수신 없음으로 나온다`() {
         @Suppress("UNCHECKED_CAST")
         val silent = (data(call("GET", "/metrics/latest"))["servers"] as List<Map<String, Any?>>).firstOrNull { it["server"] == "ci-agent-164" }

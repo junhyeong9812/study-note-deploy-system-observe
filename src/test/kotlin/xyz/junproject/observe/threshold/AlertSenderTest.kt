@@ -124,8 +124,9 @@ class HttpAlertSenderTest {
 class AlertDispatcherTest {
     private val now = Instant.parse("2026-11-24T03:00:00Z")
 
-    private fun alert(number: Int) = ResourceAlert("event-$number", "resource:ci-agent-158:memory", "resource_memory", AlertSeverity.WARNING,
-        "t$number", "d", "ci-agent-158", ResourceRule.MEMORY, null, now.minusSeconds(100L - number))
+    /** 알림마다 다른 대상(서버) — "다시 시도 · 예외가 나도 다른 대상은 계속 보낸다"(§15.1 — 같은 대상의 뒤 알림은 그 바퀴에 멈춘다) */
+    private fun alert(number: Int) = ResourceAlert("event-$number", "resource:ci-agent-$number:memory", "resource_memory", AlertSeverity.WARNING,
+        "t$number", "d", "ci-agent-$number", ResourceRule.MEMORY, null, now.minusSeconds(100L - number))
 
     private class FakeQueue(var queued: MutableList<QueuedAlert>) : AlertQueue {
         val marks = mutableListOf<String>()

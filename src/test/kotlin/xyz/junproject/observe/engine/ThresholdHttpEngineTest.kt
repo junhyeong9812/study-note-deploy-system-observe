@@ -212,6 +212,8 @@ class ThresholdHttpEngineTest {
             registry.add("observe.metrics.group") { "threshold-http-$suffix" }
             registry.add("observe.metrics.expected-servers") { "ci-agent-164" }
             registry.add("observe.metrics.judge-interval-ms") { "300" }
+            registry.add("observe.alert.dispatch-interval-ms") { "300" }               // 보내기는 판정과 따로 도는 예약(§15) — 다시 보내기가 30초 안에 보이게
+            registry.add("observe.metrics.alert.silent-warm-up") { "1s" }               // 끊김 판정의 시작(§15.1)을 짧게 — 기본 3분
             registry.add("observe.metrics.alert.memory-pct") { "50" }
             registry.add("observe.metrics.alert.memory-resolve-pct") { "40" }
             registry.add("observe.alert.events-url") { "http://127.0.0.1:${alertServer.address.port}/events" }

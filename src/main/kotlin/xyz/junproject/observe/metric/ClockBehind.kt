@@ -6,6 +6,7 @@ import java.time.Duration
 object ClockBehind {
     val LIMIT: Duration = Duration.ofMinutes(1)
 
-    /** [latest] 는 서버마다 측정 시각이 가장 늦은 항목 — 이름순으로 돌려준다(리뷰 루프 1 — 구현 전) */
-    fun servers(latest: List<ResourceSample>): List<String> = TODO("not implemented")
+    /** [latest] 는 서버마다 측정 시각이 가장 늦은 항목 — 이름순으로 돌려준다 */
+    fun servers(latest: List<ResourceSample>): List<String> =
+        latest.filter { Duration.between(it.measuredAt, it.receivedAt) > LIMIT }.map { it.server }.distinct().sorted()
 }

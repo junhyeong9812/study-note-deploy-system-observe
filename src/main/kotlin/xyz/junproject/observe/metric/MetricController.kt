@@ -87,7 +87,10 @@ class MetricController(
         if (!authorized(request)) return unauthorized()
         return answering("latest") {
             val received = reader.latest(now.minus(LATEST_WINDOW)).associateBy { it.server }
-            val servers = (received.keys + expected).sorted().map { name -> received[name]?.let { latestServer(it, now) } ?: silentServer(name) }
+            val lastReceived = reader.lastReceivedOfEveryServer()
+            val servers = (received.keys + expected).sorted().map { name ->
+                received[name]?.let { latestServer(it, lastReceived[name], now) } ?: silentServer(name)
+            }
             val firing = firingSource?.firing().orEmpty().map {
                 mapOf("server" to it.server, "rule" to it.rule, "target" to it.target, "severity" to it.severity,
                     "since" to it.since.toString(), "last_value" to it.lastValue)
@@ -96,8 +99,9 @@ class MetricController(
         }
     }
 
-    private fun latestServer(sample: ResourceSample, now: Instant): Map<String, Any?> {
-        val age = Duration.between(sample.receivedAt, now)
+    /** 값은 측정 시각이 가장 늦은 항목, `age_ms` · `stale` 은 그 서버의 마지막 수신(늦게 도착한 옛 항목 포함 — §15) */
+    private fun latestServer(sample: ResourceSample, lastReceived: Instant?, now: Instant): Map<String, Any?> {
+        val age = Duration.between(listOfNotNull(sample.receivedAt, lastReceived).max(), now)
         return mapOf(
             "server" to sample.server,
             "at" to sample.measuredAt.toString(),
@@ -152,7 +156,10 @@ class MetricController(
             val start = instant("from", from) ?: end.minus(DEFAULT_RANGE)
             if (start.isAfter(end)) throw Invalid("from 이 to 보다 늦다")
             if (Duration.between(start, end) > MAX_RANGE) throw Invalid("기간은 최대 ${MAX_RANGE.toDays()}일")
-            val plan = SeriesPlan.choose(start, end, now)
+            // 5분 평균을 읽는 요청은 칸을 5분 경계에서 센다(겹치는 구간을 통째로 — 저장소와 같은 시작) — 간격도 그 시작으로 고른다
+            val plan = SeriesPlan.choose(start, end, now).let { first ->
+                if (first.source == SeriesSource.RAW) first else SeriesPlan.choose(SeriesPlan.floorTo(start, SeriesPlan.ROLLUP_STEP), end, now)
+            }
             SeriesQuery(checkedServer, checkedScope, checkedName, start, end, plan.step, plan.rawSince) to plan
         } catch (error: Invalid) { return invalid(error.detail) }
         return answering("series") {

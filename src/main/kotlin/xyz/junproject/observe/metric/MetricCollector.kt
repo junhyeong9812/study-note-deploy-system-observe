@@ -54,7 +54,7 @@ class MetricCollector(
     @Volatile var skippedOtherKind: Long = 0; private set
     /**
      * 이 프로세스가 뜬 뒤 처음으로 "따라잡은" 시각 — 새 항목을 읽었는데 하나도 없던 첫 바퀴가 끝난 시각([clock]). 그 뒤로는 바뀌지 않는다.
-     * 끊김 판정의 시작 조건(§15.1)에 쓴다(리뷰 루프 1 — 구현 전, 지금은 늘 null)
+     * 끊김 판정의 시작 조건(§15.1)에 쓴다
      */
     @Volatile var caughtUpAt: Instant? = null; private set
 
@@ -94,8 +94,10 @@ class MetricCollector(
             }
             lastUnacknowledgedCheck = now
         }
-        handled += storeAndAcknowledge(source.readNew(batchSize, block))
+        val fresh = source.readNew(batchSize, block)
+        handled += storeAndAcknowledge(fresh)
         lastLoopAt = clock()
+        if (fresh.isEmpty() && caughtUpAt == null) caughtUpAt = lastLoopAt          // 뜬 뒤 처음으로 밀린 것이 없었다
         lastFailure = null
         lastFailureDetail = null
         return handled

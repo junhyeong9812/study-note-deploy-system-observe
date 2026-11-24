@@ -85,28 +85,36 @@ data class DispatchOutcome(val lockAcquired: Boolean, val delivered: Int, val re
 /**
  * 보낼 표를 읽어 보낸다 — 보내기 잠금을 얻은 자리만(같은 알림을 두 자리가 함께 보내지 않는다). 오래된 것부터 [batchSize] 건.
  * Delivered → [AlertQueue.markDelivered], Retry → [AlertQueue.markRetry], Rejected → [AlertQueue.markRejected].
- * 보내는 쪽이 예외를 내도 Retry 로 보고 나머지를 계속 보낸다.
+ * 보내는 쪽이 예외를 내도 Retry 로 본다. 보내기 잠금은 한 바퀴 동안 쥔다 — 그 길이는 [roundBudget] 에 한 건의 기한(3초)을 더한 만큼까지.
  */
 class AlertDispatcher(
     private val queue: AlertQueue,
     private val sender: AlertSender,
     private val batchSize: Int = 50,
     /**
-     * 리뷰 루프 1(§15.1 — 구현 전): 한 바퀴의 보내기가 [clock] 으로 잰 합계 [roundBudget] 를 **넘기면**(같으면 아직) 다음 건을 보내지 않고 멈춘다.
+     * §15.1: 한 바퀴의 보내기가 [clock] 으로 잰 합계 [roundBudget] 를 **넘기면**(같으면 아직) 다음 건을 보내지 않고 멈춘다.
      * "다시 시도"가 나온 알림과 같은 대상(서버 · 규칙 · 대상 이름)의 뒤 알림은 그 바퀴에 보내지도 표시하지도 않는다(같은 대상 안의 순서 유지) —
      * 다른 대상은 계속 보낸다. "거절"은 건너뛰고 계속한다(같은 대상의 뒤 알림도 보낸다).
      */
     private val roundBudget: Duration = Duration.ofSeconds(30),
     private val clock: () -> Instant = Instant::now,
 ) {
+    /** 알림의 대상 — 같은 대상 안에서는 순서를 지킨다 */
+    private data class Target(val server: String, val rule: ResourceRule, val targetName: String?)
+
     fun dispatch(now: Instant): DispatchOutcome = queue.whileHoldingDispatchLock {
+        val started = clock()
         var delivered = 0
         var retrying = 0
         var rejected = 0
+        val held = HashSet<Target>()                       // 이번 바퀴에 "다시 시도"가 나온 대상 — 그 뒤 알림은 다음 바퀴로
         for (queued in queue.pendingAlerts(batchSize)) {
+            if (Duration.between(started, clock()) > roundBudget) break        // 정각은 아직 — 넘기면 남은 것은 다음 바퀴로
+            val target = Target(queued.alert.server, queued.alert.rule, queued.alert.targetName)
+            if (target in held) continue
             when (val outcome = runCatching { sender.send(queued.alert) }.getOrElse { SendOutcome.Retry(it.javaClass.simpleName) }) {
                 SendOutcome.Delivered -> { queue.markDelivered(queued.id, now); delivered++ }
-                is SendOutcome.Retry -> { queue.markRetry(queued.id, now, outcome.reason); retrying++ }
+                is SendOutcome.Retry -> { queue.markRetry(queued.id, now, outcome.reason); retrying++; held += target }
                 is SendOutcome.Rejected -> { queue.markRejected(queued.id, now, outcome.reason); rejected++ }
             }
         }
