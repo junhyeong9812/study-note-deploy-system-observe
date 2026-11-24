@@ -58,6 +58,7 @@ class ThresholdRoundSplitTest {
         override fun markRejected(id: Long, at: Instant, reason: String) { calls += "rejected" }
         override fun <T> whileHoldingDispatchLock(block: () -> T): T? { calls += "lock"; return block() }
         override fun alertCounts(): AlertCounts { calls += "counts"; return AlertCounts(3, 1) }
+        override fun pendingByTarget(perTarget: Int): List<TargetQueue> { calls += "pending"; return emptyList() }
     }
 
     private val samples = CountingSamples()

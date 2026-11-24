@@ -137,6 +137,7 @@ class AlertDispatcherTest {
         override fun markRejected(id: Long, at: Instant, reason: String) { marks += "rejected:$id:$reason"; queued.removeIf { it.id == id } }
         override fun <T> whileHoldingDispatchLock(block: () -> T): T? = if (lockAvailable) block() else null
         override fun alertCounts() = AlertCounts(queued.size.toLong(), 0)
+        override fun pendingByTarget(perTarget: Int) = targetQueues(queued, emptyMap(), perTarget)   // §16 — 대상마다 줄의 머리(알림마다 대상이 다르다)
     }
 
     private val queue = FakeQueue((1..4).map { QueuedAlert(it.toLong(), alert(it), 0, null) }.toMutableList())

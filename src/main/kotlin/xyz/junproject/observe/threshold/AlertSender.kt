@@ -98,6 +98,13 @@ class AlertDispatcher(
      */
     private val roundBudget: Duration = Duration.ofSeconds(30),
     private val clock: () -> Instant = Instant::now,
+    /**
+     * 리뷰 루프 2(§16 · §16.1 — 구현 전): 한 건의 기한. 한 바퀴는 "지금까지 쓴 시간 + 이 기한"이 [roundBudget] 를 **넘게 되면**(같으면 아직) 새로 보내지 않는다 —
+     * 바퀴 전체가 [roundBudget] 를 넘지 않는다. 보낼 알림은 [AlertQueue.pendingByTarget] 의 대상마다 줄의 머리만: 대상의 차례는 마지막 시도가
+     * 가장 오래된 대상부터(시도한 적 없는 대상이 맨 앞 — 그끼리는 머리가 오래된 순), 머리가 전달 · 거절이면 같은 바퀴에 그 대상의 다음 건이 머리가 되고,
+     * "다시 시도"면 그 대상은 이번 바퀴에 더 보내지 않는다. 표시의 `at` 은 그 건을 보낸 시각([clock]).
+     */
+    private val sendTimeout: Duration = Duration.ofSeconds(3),
 ) {
     /** 알림의 대상 — 같은 대상 안에서는 순서를 지킨다 */
     private data class Target(val server: String, val rule: ResourceRule, val targetName: String?)

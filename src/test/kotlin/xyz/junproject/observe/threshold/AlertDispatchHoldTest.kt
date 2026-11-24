@@ -20,11 +20,15 @@ class AlertDispatchHoldTest {
     private class FakeQueue(alerts: List<ResourceAlert>) : AlertQueue {
         val queued = alerts.mapIndexed { index, alert -> QueuedAlert(index + 1L, alert, 0, null) }.toMutableList()
         val marks = mutableListOf<String>()
+        /** 대상마다 마지막으로 시도한 시각(§16.1 — 표시의 `at`) */
+        val lastAttempt = mutableMapOf<AlertTarget, Instant>()
         private fun idOf(id: Long) = queued.first { it.id == id }.alert.eventId
+        private fun attempted(id: Long, at: Instant) { lastAttempt[targetOf(queued.first { it.id == id }.alert)] = at }
         override fun pendingAlerts(limit: Int) = queued.take(limit)
-        override fun markDelivered(id: Long, at: Instant) { marks += "delivered:${idOf(id)}"; queued.removeIf { it.id == id } }
-        override fun markRetry(id: Long, at: Instant, reason: String) { marks += "retry:${idOf(id)}" }
-        override fun markRejected(id: Long, at: Instant, reason: String) { marks += "rejected:${idOf(id)}"; queued.removeIf { it.id == id } }
+        override fun pendingByTarget(perTarget: Int) = targetQueues(queued, lastAttempt, perTarget)
+        override fun markDelivered(id: Long, at: Instant) { attempted(id, at); marks += "delivered:${idOf(id)}"; queued.removeIf { it.id == id } }
+        override fun markRetry(id: Long, at: Instant, reason: String) { attempted(id, at); marks += "retry:${idOf(id)}" }
+        override fun markRejected(id: Long, at: Instant, reason: String) { attempted(id, at); marks += "rejected:${idOf(id)}"; queued.removeIf { it.id == id } }
         override fun <T> whileHoldingDispatchLock(block: () -> T): T? = block()
         override fun alertCounts() = AlertCounts(queued.size.toLong(), 0)
     }
@@ -95,7 +99,8 @@ class AlertDispatchHoldTest {
     }
 
     @Test
-    fun `정확히 30초는 넘긴 것이 아니다`() {
-        assertEquals(listOf("alert-1", "alert-2", "alert-3", "alert-4"), budgetRun(Duration.ofSeconds(10)).first)
+    fun `지금까지 쓴 시간에 한 건의 기한(3초)을 더해 30초를 넘게 되면 새로 보내지 않는다 — 10초씩이면 세 건`() {
+        // §16.1 이 §15.1 의 "정확히 30초는 넘긴 것이 아니다(네 건)"를 고쳤다 — 30초에 3초를 더하면 넘으므로 네 번째는 보내지 않는다
+        assertEquals(listOf("alert-1", "alert-2", "alert-3"), budgetRun(Duration.ofSeconds(10)).first)
     }
 }

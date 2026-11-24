@@ -49,7 +49,28 @@ interface AlertQueue {
     /** 보내기 잠금(자리 둘 중 한쪽만)을 기다리지 않고 시도해 얻으면 [block] 을 돌리고 그 값을, 얻지 못하면 null */
     fun <T> whileHoldingDispatchLock(block: () -> T): T?
     fun alertCounts(): AlertCounts
+
+    /**
+     * 리뷰 루프 2(§16 · §16.1 — 구현 전): 대상([AlertTarget])마다 아직 보내지 못했고 거절되지 않은 알림의 가장 오래된 [perTarget] 건(오래된 것부터)과
+     * 그 대상을 마지막으로 시도한 시각(보낸 적 없으면 null). 대상 수에는 제한이 없다 — 한 대상에 알림이 아무리 많아도 다른 대상의 머리가 읽힌다.
+     * 마지막 시도 시각은 [markDelivered] · [markRetry] · [markRejected] 의 `at` 이다(받은 · 거절된 알림이 지워져도 대상의 시각은 남는다).
+     */
+    fun pendingByTarget(perTarget: Int): List<TargetQueue> = TODO("not implemented")
 }
+
+/**
+ * 보내기의 대상(§16) — 서버 · 규칙의 묶음 · 대상 이름. 디스크 경고와 위험은 한 묶음(`"disk"`), 그 밖은 규칙 글자 그대로.
+ * 대상 이름은 재시작 규칙의 컨테이너 이름, 그 밖은 null.
+ */
+data class AlertTarget(val server: String, val ruleGroup: String, val targetName: String?) {
+    companion object {
+        /** 알림 하나의 대상(구현 전) */
+        fun of(alert: ResourceAlert): AlertTarget = TODO("not implemented")
+    }
+}
+
+/** 한 대상의 줄 — [alerts] 는 오래된 것부터, [lastAttemptAt] 은 그 대상을 마지막으로 시도한 시각(없으면 null) */
+data class TargetQueue(val target: AlertTarget, val lastAttemptAt: Instant?, val alerts: List<QueuedAlert>)
 
 /**
  * PostgreSQL 저장소 — 표는 추가만(로그 · 로그인 시도 · 지표 표는 건드리지 않는다). 표 이름과 꼴은 구현이 정한다.

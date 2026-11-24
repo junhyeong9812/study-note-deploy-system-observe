@@ -71,7 +71,10 @@ data class MetricDeletion(val rawDeleted: Int, val rollupDeleted: Int)
 data class MetricRetentionResult(val ranAt: Instant, val deletion: MetricDeletion?, val failure: String?)
 
 /** 5분 평균 한 바퀴의 결과(헬스용) — 실패면 [buckets] 는 null 이고 [failure] 에 예외 종류 이름 */
-data class MetricRollupResult(val ranAt: Instant, val buckets: Int?, val failure: String?)
+data class MetricRollupResult(val ranAt: Instant, val buckets: Int?, val failure: String?, val failedBuckets: Int = 0)
+
+/** 5분 평균 한 바퀴의 구간 수(§16 — 리뷰 루프 2) — [computed] 는 확정한 (서버, 구간), [failed] 는 계산에 실패해 표시 없이 남긴 (서버, 구간) */
+data class RollupOutcome(val computed: Int, val failed: Int)
 
 /** 예약 실행이 쓰는 면 — 5분 평균과 보관 삭제. 시각은 늘 인자로 받는다(테스트가 시계를 정한다) */
 interface MetricMaintenance {
@@ -81,6 +84,13 @@ interface MetricMaintenance {
      * 원본 값이 모두 null 인 구간도 "계산함"으로 남긴다(그래야 그 원본을 지울 수 있다).
      */
     fun rollUp(now: Instant): Int
+
+    /**
+     * 리뷰 루프 2(§16 · §16.1 — 구현 전): [rollUp] 과 같은 일을 **구간마다 따로** 한다 — 한 (서버, 구간)의 계산 실패가 다른 구간의 결과를 되돌리지 않고,
+     * 그 구간의 평균 값과 "계산함" 표시는 같은 트랜잭션에서 확정된다(실패한 구간에는 표시가 없다). 한 바퀴는 가장 오래 시도하지 않은 구간부터
+     * 200 구간까지. 예외는 구간 밖의 실패(DB 에 닿지 못함 등)만 낸다. 기본 동작은 [rollUp] 을 그대로 부르는 것(가짜 저장소용).
+     */
+    fun rollUpBuckets(now: Instant): RollupOutcome = RollupOutcome(rollUp(now), 0)
 
     /**
      * 원본: 측정 시각이 `now − 7일` 보다 앞서고, **그 (서버, 5분 구간)의 평균 계산 시각이 그 구간 원본의 마지막 수신 시각보다 뒤인** 것만 지운다
@@ -106,6 +116,11 @@ class MetricStore(
     private val ingest: JdbcTemplate,
     private val query: JdbcTemplate,
     private val health: JdbcTemplate,
+    /**
+     * 리뷰 루프 2(§16 — 구현 전): 임계값 판정이 읽는 연결([samplesMeasuredBetween] · [lastReceivedOfEveryServer] 를 판정이 부를 때) — 어드민 조회가
+     * [query] 를 다 잡아도 판정이 기다리지 않게. 없으면 [query].
+     */
+    private val judge: JdbcTemplate = query,
 ) : MetricSink, MetricReader, MetricMaintenance, MetricSampleSource {
     private val transaction = TransactionTemplate(DataSourceTransactionManager(requireNotNull(ingest.dataSource) { "JdbcTemplate 에 DataSource 가 없다" }))
     @Volatile private var schemaReady = false

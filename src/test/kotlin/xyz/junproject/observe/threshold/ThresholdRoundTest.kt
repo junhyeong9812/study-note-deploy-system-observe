@@ -67,6 +67,7 @@ class ThresholdRoundTest {
         override fun markRejected(id: Long, at: Instant, reason: String) { pending.removeIf { it.id == id } }
         override fun <T> whileHoldingDispatchLock(block: () -> T): T? = block()
         override fun alertCounts(): AlertCounts { countsFailure?.let { throw it }; return AlertCounts(pending.size.toLong(), 2) }
+        override fun pendingByTarget(perTarget: Int): List<TargetQueue> { failure?.let { throw it }; return targetQueues(pending, emptyMap(), perTarget) }
     }
 
     private val samples = FakeSamples()
