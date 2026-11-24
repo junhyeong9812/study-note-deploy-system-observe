@@ -1,11 +1,13 @@
 package xyz.junproject.observe.threshold
 
+import org.springframework.dao.DataAccessException
 import org.springframework.jdbc.core.JdbcTemplate
 import org.springframework.jdbc.datasource.DataSourceTransactionManager
 import org.springframework.jdbc.datasource.DataSourceUtils
 import org.springframework.transaction.support.TransactionTemplate
 import java.sql.PreparedStatement
 import java.sql.ResultSet
+import java.sql.SQLException
 import java.sql.Types
 import java.time.Instant
 
@@ -110,11 +112,8 @@ class ThresholdStore(
     private val creatingSchema = Any()
 
     /** 표를 만든다(있으면 그대로). 실패는 예외 */
-    fun createSchema() = createSchema(jdbc)
-
-    /** [using] 연결로 표를 만든다 — 어드민 조회([firing])의 길은 조회용 연결로 확인한다(§16.2) */
-    private fun createSchema(using: JdbcTemplate) {
-        using.execute(
+    fun createSchema() {
+        jdbc.execute(
             """CREATE TABLE IF NOT EXISTS resource_rule_state (
                  server           text             NOT NULL,
                  rule             text             NOT NULL,
@@ -126,7 +125,7 @@ class ThresholdStore(
                  last_value       double precision,
                  PRIMARY KEY (server, rule, target))"""
         )
-        using.execute(
+        jdbc.execute(
             """CREATE TABLE IF NOT EXISTS resource_alert_outbox (
                  id              bigint  GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
                  event_id        text    NOT NULL UNIQUE,
@@ -144,8 +143,8 @@ class ThresholdStore(
                  last_attempt_ms bigint,
                  rejected_ms     bigint)"""
         )
-        using.execute("CREATE INDEX IF NOT EXISTS resource_alert_outbox_pending ON resource_alert_outbox (created_ms, id) WHERE rejected_ms IS NULL")
-        using.execute(
+        jdbc.execute("CREATE INDEX IF NOT EXISTS resource_alert_outbox_pending ON resource_alert_outbox (created_ms, id) WHERE rejected_ms IS NULL")
+        jdbc.execute(
             """CREATE TABLE IF NOT EXISTS resource_alert_target (
                  server          text   NOT NULL,
                  rule_group      text   NOT NULL,
@@ -157,8 +156,8 @@ class ThresholdStore(
     }
 
     /** 처음 닿을 때 만든다 — 뜬 직후 DB 가 없었어도 다음 바퀴 · 조회가 만든다 */
-    private fun ensureSchema(using: JdbcTemplate = jdbc) {
-        if (!schemaReady) synchronized(creatingSchema) { if (!schemaReady) createSchema(using) }
+    private fun ensureSchema() {
+        if (!schemaReady) synchronized(creatingSchema) { if (!schemaReady) createSchema() }
     }
 
     /** 뜬 직후 한 번 미리 만든다 — 실패는 예외로(부르는 쪽이 로그만 남기고 삼킨다) */
@@ -293,10 +292,16 @@ class ThresholdStore(
         )!!
     }
 
-    /** 지금 넘어 있는 규칙 — 조회용 연결로(표 확인까지), 커밋된 판정 상태를 읽는다(§16.2 — 판정 · 알림 연결이 다 잡혀도 답한다) */
+    /** 지금 넘어 있는 규칙 — 조회용 연결로 커밋된 판정 상태를 읽는다(§16.2 — 판정 · 알림 연결이 다 잡혀도 답한다) */
     override fun firing(): List<FiringRule> {
-        ensureSchema(query)
-        return query.query("SELECT * FROM resource_rule_state WHERE firing", { row, _ -> row.toRuleState() })
+        // 표를 만들지도, 표 만들기 잠금을 쥐지도 않는다(§16.3) — 표가 아직 없으면(42P01) 울리는 것이 없다. 그 밖의 오류는 그대로 전한다
+        val states = try {
+            query.query("SELECT * FROM resource_rule_state WHERE firing", { row, _ -> row.toRuleState() })
+        } catch (error: DataAccessException) {
+            if (generateSequence<Throwable>(error) { it.cause }.any { it is SQLException && it.sqlState == UNDEFINED_TABLE }) return emptyList()
+            throw error
+        }
+        return states
             .map { state ->
                 FiringRule(state.server, state.rule.wireName, state.targetName.takeIf { state.rule == ResourceRule.RESTARTS },
                     (if (state.rule == ResourceRule.DISK_CRITICAL) AlertSeverity.CRITICAL else AlertSeverity.WARNING).wireName,
@@ -310,6 +315,7 @@ class ThresholdStore(
         const val JUDGE_LOCK = 7_310_420_001L
         const val DISPATCH_LOCK = 7_310_420_002L
         const val MAX_REASON = 200
+        const val UNDEFINED_TABLE = "42P01"   // PostgreSQL: relation does not exist
         /** 규칙의 묶음(SQL) — [AlertTarget.groupOf] 와 같은 규칙. 글자는 고정값이다(입력이 아니다) */
         val RULE_GROUP = "CASE WHEN rule IN ('${ResourceRule.DISK_WARNING.wireName}', '${ResourceRule.DISK_CRITICAL.wireName}') THEN '${AlertTarget.DISK_GROUP}' ELSE rule END"
 
