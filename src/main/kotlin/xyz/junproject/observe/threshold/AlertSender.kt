@@ -83,46 +83,49 @@ class HttpAlertSender(
 data class DispatchOutcome(val lockAcquired: Boolean, val delivered: Int, val retrying: Int, val rejected: Int)
 
 /**
- * 보낼 표를 읽어 보낸다 — 보내기 잠금을 얻은 자리만(같은 알림을 두 자리가 함께 보내지 않는다). 오래된 것부터 [batchSize] 건.
+ * 보낼 표를 읽어 보낸다 — 보내기 잠금을 얻은 자리만(같은 알림을 두 자리가 함께 보내지 않는다). 대상마다 줄의 머리만([AlertQueue.pendingByTarget] —
+ * 대상마다 오래된 [batchSize] 건), 한 바퀴에 합쳐 [batchSize] 건까지.
  * Delivered → [AlertQueue.markDelivered], Retry → [AlertQueue.markRetry], Rejected → [AlertQueue.markRejected].
- * 보내는 쪽이 예외를 내도 Retry 로 본다. 보내기 잠금은 한 바퀴 동안 쥔다 — 그 길이는 [roundBudget] 에 한 건의 기한(3초)을 더한 만큼까지.
+ * 보내는 쪽이 예외를 내도 Retry 로 본다. 보내기 잠금은 한 바퀴 동안 쥔다 — 그 길이는 [roundBudget] 를 넘지 않는다.
  */
 class AlertDispatcher(
     private val queue: AlertQueue,
     private val sender: AlertSender,
     private val batchSize: Int = 50,
     /**
-     * §15.1: 한 바퀴의 보내기가 [clock] 으로 잰 합계 [roundBudget] 를 **넘기면**(같으면 아직) 다음 건을 보내지 않고 멈춘다.
-     * "다시 시도"가 나온 알림과 같은 대상(서버 · 규칙 · 대상 이름)의 뒤 알림은 그 바퀴에 보내지도 표시하지도 않는다(같은 대상 안의 순서 유지) —
-     * 다른 대상은 계속 보낸다. "거절"은 건너뛰고 계속한다(같은 대상의 뒤 알림도 보낸다).
+     * 한 바퀴의 상한(§16.1 — [sendTimeout] 참고).
      */
     private val roundBudget: Duration = Duration.ofSeconds(30),
     private val clock: () -> Instant = Instant::now,
     /**
-     * 리뷰 루프 2(§16 · §16.1 — 구현 전): 한 건의 기한. 한 바퀴는 "지금까지 쓴 시간 + 이 기한"이 [roundBudget] 를 **넘게 되면**(같으면 아직) 새로 보내지 않는다 —
+     * §16 · §16.1: 한 건의 기한. 한 바퀴는 "지금까지 쓴 시간 + 이 기한"이 [roundBudget] 를 **넘게 되면**(같으면 아직) 새로 보내지 않는다 —
      * 바퀴 전체가 [roundBudget] 를 넘지 않는다. 보낼 알림은 [AlertQueue.pendingByTarget] 의 대상마다 줄의 머리만: 대상의 차례는 마지막 시도가
      * 가장 오래된 대상부터(시도한 적 없는 대상이 맨 앞 — 그끼리는 머리가 오래된 순), 머리가 전달 · 거절이면 같은 바퀴에 그 대상의 다음 건이 머리가 되고,
      * "다시 시도"면 그 대상은 이번 바퀴에 더 보내지 않는다. 표시의 `at` 은 그 건을 보낸 시각([clock]).
      */
     private val sendTimeout: Duration = Duration.ofSeconds(3),
 ) {
-    /** 알림의 대상 — 같은 대상 안에서는 순서를 지킨다 */
-    private data class Target(val server: String, val rule: ResourceRule, val targetName: String?)
-
     fun dispatch(now: Instant): DispatchOutcome = queue.whileHoldingDispatchLock {
         val started = clock()
         var delivered = 0
         var retrying = 0
         var rejected = 0
-        val held = HashSet<Target>()                       // 이번 바퀴에 "다시 시도"가 나온 대상 — 그 뒤 알림은 다음 바퀴로
-        for (queued in queue.pendingAlerts(batchSize)) {
-            if (Duration.between(started, clock()) > roundBudget) break        // 정각은 아직 — 넘기면 남은 것은 다음 바퀴로
-            val target = Target(queued.alert.server, queued.alert.rule, queued.alert.targetName)
-            if (target in held) continue
-            when (val outcome = runCatching { sender.send(queued.alert) }.getOrElse { SendOutcome.Retry(it.javaClass.simpleName) }) {
-                SendOutcome.Delivered -> { queue.markDelivered(queued.id, now); delivered++ }
-                is SendOutcome.Retry -> { queue.markRetry(queued.id, now, outcome.reason); retrying++; held += target }
-                is SendOutcome.Rejected -> { queue.markRejected(queued.id, now, outcome.reason); rejected++ }
+        // 대상의 차례: 시도한 적 없는 대상(그끼리는 머리가 오래된 순) → 마지막 시도가 오래된 대상
+        val queues = queue.pendingByTarget(batchSize).filter { it.alerts.isNotEmpty() }.sortedWith(
+            compareBy<TargetQueue>({ it.lastAttemptAt != null }, { it.lastAttemptAt }, { it.alerts.first().alert.createdAt }, { it.alerts.first().id }))
+        rounds@ for (targetQueue in queues) {
+            // 머리가 전달 · 거절이면 그 대상의 다음 건이 머리가 된다. "다시 시도"면 그 대상은 이번 바퀴에 끝
+            for (queued in targetQueue.alerts) {
+                if (delivered + retrying + rejected >= batchSize) break@rounds
+                // 한 건의 기한을 더해 바퀴의 상한을 넘게 되면 새로 보내지 않는다 — 바퀴 전체가 상한을 넘지 않게
+                if (Duration.between(started, clock()).plus(sendTimeout) > roundBudget) break@rounds
+                val outcome = runCatching { sender.send(queued.alert) }.getOrElse { SendOutcome.Retry(it.javaClass.simpleName) }
+                val at = clock()                                       // 표시의 시각 = 그 건을 보낸 시각(대상의 마지막 시도)
+                when (outcome) {
+                    SendOutcome.Delivered -> { queue.markDelivered(queued.id, at); delivered++ }
+                    is SendOutcome.Retry -> { queue.markRetry(queued.id, at, outcome.reason); retrying++; continue@rounds }
+                    is SendOutcome.Rejected -> { queue.markRejected(queued.id, at, outcome.reason); rejected++ }
+                }
             }
         }
         DispatchOutcome(true, delivered, retrying, rejected)

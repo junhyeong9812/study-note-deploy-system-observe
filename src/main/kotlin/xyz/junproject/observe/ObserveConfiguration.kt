@@ -133,8 +133,10 @@ class ObserveConfiguration {
     }
 
     /**
-     * 지표 저장소 — 로그와 같은 DB, 연결 풀은 지표 전용(수집 2 · 조회 2 · 헬스 1). 지표가 무겁거나 실패해도 로그 수집·조회의 풀을 잡지 않는다.
-     * 5분 평균 · 보관 삭제도 수집 풀을 쓴다(평균 한 바퀴 동안 원본 저장이 잠시 기다린다 — [MetricStore.rollUp]).
+     * 지표 저장소 — 로그와 같은 DB, 연결 풀은 지표 전용(수집 2 · 조회 2 · 헬스의 상태 읽기 1 · 헬스의 선택 칸 읽기 1). 지표가 무겁거나 실패해도
+     * 로그 수집·조회의 풀을 잡지 않는다. 5분 평균 · 보관 삭제도 수집 풀을 쓴다(구간마다 원본 저장이 잠시 기다린다 — [MetricStore.rollUpBuckets]).
+     * 헬스의 두 풀은 연결 하나 · 연결 대기 2초 · 문장 2초 — 선택 칸의 표가 막혀 버려진 읽기가 연결을 쥐어도 상태 읽기는 기다리지 않는다(§16.1).
+     * 판정의 읽기는 판정 · 알림 풀([thresholdJdbc])로 — 어드민 조회가 조회 풀을 다 잡아도 판정이 기다리지 않는다(§16).
      */
     @Bean
     fun metricStore(
@@ -145,8 +147,21 @@ class ObserveConfiguration {
         val ingest = pool("observe-metric-ingest", url, user, password, size = 2, statementTimeoutMs = 30_000)
         val query = pool("observe-metric-query", url, user, password, size = 2, statementTimeoutMs = 10_000)
         val health = pool("observe-metric-health", url, user, password, size = 1, statementTimeoutMs = 2_000, connectionTimeoutMs = 2_000, validationTimeoutMs = 1_000)
-        return MetricStore(JdbcTemplate(ingest), JdbcTemplate(query), JdbcTemplate(health))
+        val healthDetail = pool("observe-metric-health-detail", url, user, password, size = 1, statementTimeoutMs = 2_000, connectionTimeoutMs = 2_000,
+            validationTimeoutMs = 1_000)
+        return MetricStore(JdbcTemplate(ingest), JdbcTemplate(query), JdbcTemplate(health), judge = thresholdJdbc(url, user, password),
+            healthDetail = JdbcTemplate(healthDetail))
     }
+
+    private var sharedThresholdJdbc: JdbcTemplate? = null
+
+    /**
+     * 판정 · 알림 풀(5개 · 문장 10초) — 판정 한 바퀴(잠금 트랜잭션 1 + 표본 읽기 1) · 보내기(잠금 1 + 표시 1) · firing 이 함께 쓴다.
+     * 지표 저장소(판정의 읽기)와 판정 · 알림 저장소가 같은 풀을 나눠 쓴다.
+     */
+    @Synchronized
+    private fun thresholdJdbc(url: String, user: String, password: String): JdbcTemplate = sharedThresholdJdbc
+        ?: JdbcTemplate(pool("observe-threshold", url, user, password, size = 5, statementTimeoutMs = 10_000)).also { sharedThresholdJdbc = it }
 
     /** 뜬 직후 지표 표를 미리 만든다(최선 노력 — 실패해도 앱은 뜨고 수집 바퀴 · 첫 조회가 다시 만든다) */
     @EventListener(ApplicationReadyEvent::class)
@@ -202,13 +217,13 @@ class ObserveConfiguration {
         return constructor.callBy(given).also { log.info("observe:observe:resource thresholds {}", it) }
     }
 
-    /** 판정 · 알림 표 — 전용 연결 풀(4개 · 문장 10초): 판정 한 바퀴 · 보내기 잠금 · 보내기 표시 · 헬스 건수와 firing 이 함께 쓸 수 있게 */
+    /** 판정 · 알림 표 — 판정 · 알림 풀([thresholdJdbc]). 헬스는 이 풀을 쓰지 않는다(바퀴가 세어 둔 건수만) */
     @Bean
     fun thresholdStore(
         @Value("\${observe.db.url}") url: String,
         @Value("\${observe.db.user}") user: String,
         @Value("\${observe.db.password}") password: String,
-    ) = ThresholdStore(JdbcTemplate(pool("observe-threshold", url, user, password, size = 4, statementTimeoutMs = 10_000)))
+    ) = ThresholdStore(thresholdJdbc(url, user, password))
 
     /** 뜬 직후 판정 · 알림 표를 미리 만든다(최선 노력 — 실패해도 첫 바퀴 · 첫 조회가 다시 만든다) */
     @EventListener(ApplicationReadyEvent::class)
@@ -232,7 +247,8 @@ class ObserveConfiguration {
     }
 
     @Bean
-    fun alertDispatcher(store: ThresholdStore, sender: HttpAlertSender) = AlertDispatcher(store, sender)
+    fun alertDispatcher(store: ThresholdStore, sender: HttpAlertSender, @Value("\${observe.alert.timeout-ms:3000}") timeoutMs: Long) =
+        AlertDispatcher(store, sender, sendTimeout = Duration.ofMillis(timeoutMs))   // 한 바퀴는 "쓴 시간 + 한 건의 기한"이 30초를 넘게 되면 멈춘다
 
     @Bean
     fun thresholdRound(

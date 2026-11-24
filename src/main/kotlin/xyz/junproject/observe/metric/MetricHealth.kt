@@ -24,7 +24,7 @@ import xyz.junproject.observe.threshold.ThresholdRound
  * - `last_received_at`: 서버 이름 → 마지막 수신 시각(ISO) — 읽지 못하면 빈 객체
  * - `last_rollup_at`(5분 평균의 마지막 **성공** 시각) · `last_rollup_failure`(마지막 바퀴가 실패했으면 그 종류, 성공이면 빈 문자열)
  * - `last_retention_at` · `last_retention_raw_deleted` · `last_retention_rollup_deleted` · `last_retention_failure`
- * - `last_rollup_failed_buckets`: 마지막 5분 평균 바퀴에서 계산에 실패한 구간 수([MetricRollupResult.failedBuckets], 아직 안 돌았으면 -1) — 리뷰 루프 2, 구현 전
+ * - `last_rollup_failed_buckets`: 마지막 5분 평균 바퀴에서 계산에 실패한 구간 수([MetricRollupResult.failedBuckets], 아직 안 돌았으면 -1)
  *
  * 헬스의 응답 시간(§15): 바깥에 묻는 것(Redis 의 미확인 · 밀린 건수, DB 의 마지막 저장 시각 · 서버별 수신 시각 · 최근 항목)은 한꺼번에 시작해
  * 합쳐 [readBudget](2초) 안에서만 기다린다. 미확인 건수나 마지막 저장 시각을 그 안에 못 얻으면 `status` 는 `unreachable`
@@ -117,6 +117,7 @@ class MetricHealth(
             "last_received_at" to (received?.mapValues { it.value.toString() } ?: emptyMap<String, String>()),
             "last_rollup_at" to (runCatching(lastRollupSuccessAt).getOrNull()?.toString() ?: ""),
             "last_rollup_failure" to (rollup?.failure ?: ""),
+            "last_rollup_failed_buckets" to (rollup?.failedBuckets ?: -1),
             "last_retention_at" to (retention?.ranAt?.toString() ?: ""),
             "last_retention_raw_deleted" to (retention?.deletion?.rawDeleted ?: -1),
             "last_retention_rollup_deleted" to (retention?.deletion?.rollupDeleted ?: -1),

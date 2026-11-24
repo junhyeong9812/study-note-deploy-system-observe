@@ -58,7 +58,7 @@ class MetricHealthTest {
         assertEquals(setOf(
             "status", "last_loop_at", "last_stored_at", "stored_since_start", "unacknowledged", "lag", "failure",
             "dropped", "dropped_total", "skipped_other_kind", "last_received_at",
-            "last_rollup_at", "last_rollup_failure",
+            "last_rollup_at", "last_rollup_failure", "last_rollup_failed_buckets",
             "last_retention_at", "last_retention_raw_deleted", "last_retention_rollup_deleted", "last_retention_failure",
         ), body.keys)
         assertEquals("ok", body["status"])

@@ -104,7 +104,8 @@ enum class MetricDropReason(val wireName: String) {
     INVALID_BODY("invalid_body"),
     /**
      * 값이 숫자·null 이 아니거나(글자 "3"·"NaN"·true 포함), 범위 밖이다 — 모든 값은 0 이상, 서버 CPU·GPU 사용률은 0~100,
-     * GPU 온도는 −50~150, 바이트 수·재시작 횟수·`interval_ms` 는 정수(컨테이너 CPU 는 코어 하나 = 100 이라 위 상한이 없다)
+     * GPU 온도는 −50~150, 초당 바이트 1e13 이하, 부하 1e6 이하, 컨테이너 CPU 1e6 이하(코어 하나 = 100 이라 100 은 넘을 수 있다),
+     * 바이트 수·재시작 횟수·`interval_ms` 는 정수(바이트 수는 정수 칸의 범위가 상한)
      */
     INVALID_VALUE("invalid_value"),
     /**
@@ -147,6 +148,10 @@ object MetricEntryParser {
     private const val MAX_PERCENT = 100.0
     private const val MIN_TEMPERATURE = -50.0
     private const val MAX_TEMPERATURE = 150.0
+    /** 값의 상한(§16 · §16.1) — 유한하다는 것만으로는 받지 않는다. 바이트 수는 정수 칸의 범위가 곧 상한이라 따로 두지 않는다 */
+    private const val MAX_BYTES_PER_SECOND = 1e13
+    private const val MAX_LOAD = 1e6
+    private const val MAX_CONTAINER_CPU = 1e6
     private val REQUIRED_FIELDS = listOf("v", "server", "at", "body")
 
     // NaN·Infinity 는 기본으로 거절된다(JSON 밖의 낱말). 객체 뒤에 더 붙은 글자도 거절한다 — `{} {}` 를 앞 객체만 읽고 받지 않게
@@ -205,15 +210,15 @@ object MetricEntryParser {
             if (!node.isObject) throw Shape()
             return HostValues(
                 cpuPct = decimal(node, "cpu_pct", maximum = MAX_PERCENT),
-                load1 = decimal(node, "load1"),
+                load1 = decimal(node, "load1", maximum = MAX_LOAD),
                 memTotal = count(node, "mem_total"),
                 memUsed = count(node, "mem_used"),
                 diskTotal = count(node, "disk_total"),
                 diskUsed = count(node, "disk_used"),
-                netRxBps = decimal(node, "net_rx_bps"),
-                netTxBps = decimal(node, "net_tx_bps"),
-                ioReadBps = decimal(node, "io_read_bps"),
-                ioWriteBps = decimal(node, "io_write_bps"),
+                netRxBps = decimal(node, "net_rx_bps", maximum = MAX_BYTES_PER_SECOND),
+                netTxBps = decimal(node, "net_tx_bps", maximum = MAX_BYTES_PER_SECOND),
+                ioReadBps = decimal(node, "io_read_bps", maximum = MAX_BYTES_PER_SECOND),
+                ioWriteBps = decimal(node, "io_write_bps", maximum = MAX_BYTES_PER_SECOND),
             )
         }
 
@@ -223,7 +228,7 @@ object MetricEntryParser {
             val id = requiredText(node, "id").takeIf { CONTAINER_ID.matches(it) } ?: throw Shape()
             return ContainerValues(
                 name = name, id = id, project = requiredText(node, "project"),
-                cpuPct = decimal(node, "cpu_pct"),                       // 코어 하나 = 100 — 위 상한이 없다
+                cpuPct = decimal(node, "cpu_pct", maximum = MAX_CONTAINER_CPU),   // 코어 하나 = 100 — 100 을 넘을 수 있다
                 memUsed = count(node, "mem_used"),
                 restarts = count(node, "restarts"),
                 state = present(node, "state")?.let { if (it.isString) text(it.stringValue()) else throw Shape() },

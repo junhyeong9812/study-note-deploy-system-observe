@@ -51,11 +51,11 @@ interface AlertQueue {
     fun alertCounts(): AlertCounts
 
     /**
-     * 리뷰 루프 2(§16 · §16.1 — 구현 전): 대상([AlertTarget])마다 아직 보내지 못했고 거절되지 않은 알림의 가장 오래된 [perTarget] 건(오래된 것부터)과
+     * §16 · §16.1: 대상([AlertTarget])마다 아직 보내지 못했고 거절되지 않은 알림의 가장 오래된 [perTarget] 건(오래된 것부터)과
      * 그 대상을 마지막으로 시도한 시각(보낸 적 없으면 null). 대상 수에는 제한이 없다 — 한 대상에 알림이 아무리 많아도 다른 대상의 머리가 읽힌다.
      * 마지막 시도 시각은 [markDelivered] · [markRetry] · [markRejected] 의 `at` 이다(받은 · 거절된 알림이 지워져도 대상의 시각은 남는다).
      */
-    fun pendingByTarget(perTarget: Int): List<TargetQueue> = TODO("not implemented")
+    fun pendingByTarget(perTarget: Int): List<TargetQueue>
 }
 
 /**
@@ -64,8 +64,14 @@ interface AlertQueue {
  */
 data class AlertTarget(val server: String, val ruleGroup: String, val targetName: String?) {
     companion object {
-        /** 알림 하나의 대상(구현 전) */
-        fun of(alert: ResourceAlert): AlertTarget = TODO("not implemented")
+        const val DISK_GROUP = "disk"
+
+        /** 규칙의 묶음 — 디스크 두 단계는 한 묶음(경고 · 위험 · 그 해소의 도착 순서가 바뀌지 않게) */
+        fun groupOf(rule: ResourceRule): String =
+            if (rule == ResourceRule.DISK_WARNING || rule == ResourceRule.DISK_CRITICAL) DISK_GROUP else rule.wireName
+
+        /** 알림 하나의 대상 */
+        fun of(alert: ResourceAlert): AlertTarget = AlertTarget(alert.server, groupOf(alert.rule), alert.targetName)
     }
 }
 
@@ -80,6 +86,8 @@ data class TargetQueue(val target: AlertTarget, val lastAttemptAt: Instant?, val
  * 표(시각은 epoch 밀리초):
  * - `resource_rule_state`: 판정 상태 한 줄 = (서버, 규칙, 대상). 한 바퀴가 판정 뒤의 상태 전부로 바꿔 쓴다.
  * - `resource_alert_outbox`: 보낼 알림 — `event_id` 가 고유(같은 판정이 두 번 기록돼도 한 건). 받은 것은 지우고, 거절된 것은 `rejected_ms` 를 남겨 센다.
+ * - `resource_alert_target`: 보내기의 대상(서버 · 규칙의 묶음 · 대상 이름 — 없으면 빈 글자)마다 마지막으로 시도한 시각. 알림 줄이 지워져도 남아
+ *   대상의 차례(가장 오래 시도하지 않은 대상부터)를 정한다. 표시(`mark…`)와 같은 트랜잭션에서 큰 쪽으로 바뀐다.
  *
  * 잠금 — 둘 다 PostgreSQL 의 권고 잠금(`pg_try_advisory_xact_lock`, 기다리지 않는다)이라 표 잠금이 아니다.
  * 지표 저장 · 조회 · 5분 평균(그쪽 `LOCK TABLE metric_sample IN SHARE MODE`) · 로그와 서로 막지 않는다.
@@ -129,6 +137,14 @@ class ThresholdStore(
                  rejected_ms     bigint)"""
         )
         jdbc.execute("CREATE INDEX IF NOT EXISTS resource_alert_outbox_pending ON resource_alert_outbox (created_ms, id) WHERE rejected_ms IS NULL")
+        jdbc.execute(
+            """CREATE TABLE IF NOT EXISTS resource_alert_target (
+                 server          text   NOT NULL,
+                 rule_group      text   NOT NULL,
+                 target_name     text   NOT NULL,
+                 last_attempt_ms bigint NOT NULL,
+                 PRIMARY KEY (server, rule_group, target_name))"""
+        )
         schemaReady = true
     }
 
@@ -189,16 +205,53 @@ class ThresholdStore(
         )
     }
 
-    override fun markDelivered(id: Long, at: Instant) {
+    /**
+     * 대상마다 거절되지 않은 알림의 오래된 [perTarget] 건과 그 대상의 마지막 시도 시각. 한 대상에 알림이 아무리 많아도 다른 대상의 머리가 읽힌다
+     * (대상 수에는 제한이 없다 — 대상은 서버 · 규칙 · 컨테이너의 수만큼이다).
+     */
+    override fun pendingByTarget(perTarget: Int): List<TargetQueue> {
+        ensureSchema()
+        val queued = jdbc.query(
+            """SELECT * FROM (
+                 SELECT outbox.*, $RULE_GROUP AS rule_group,
+                        row_number() OVER (PARTITION BY server, $RULE_GROUP, coalesce(target_name, '') ORDER BY created_ms, id) AS position
+                 FROM resource_alert_outbox outbox WHERE rejected_ms IS NULL) ranked
+               WHERE position <= ? ORDER BY created_ms, id""",
+            { row, _ -> QueuedAlert(row.getLong("id"), row.toAlert(), row.getInt("attempts"), row.getString("last_failure")) },
+            perTarget,
+        )
+        if (queued.isEmpty()) return emptyList()
+        val attempts = jdbc.query("SELECT server, rule_group, target_name, last_attempt_ms FROM resource_alert_target", { row, _ ->
+            AlertTarget(row.getString("server"), row.getString("rule_group"), row.getString("target_name").ifEmpty { null }) to
+                Instant.ofEpochMilli(row.getLong("last_attempt_ms"))
+        }).toMap()
+        return queued.groupBy { AlertTarget.of(it.alert) }.map { (target, alerts) -> TargetQueue(target, attempts[target], alerts) }
+    }
+
+    /** 표시와 그 대상의 마지막 시도 시각을 한 트랜잭션에서 — 줄이 지워져도 대상의 시각은 남는다 */
+    private fun mark(id: Long, at: Instant, change: () -> Unit) {
+        transaction.executeWithoutResult {
+            jdbc.update(
+                """INSERT INTO resource_alert_target (server, rule_group, target_name, last_attempt_ms)
+                   SELECT server, $RULE_GROUP, coalesce(target_name, ''), ? FROM resource_alert_outbox WHERE id = ?
+                   ON CONFLICT (server, rule_group, target_name)
+                   DO UPDATE SET last_attempt_ms = GREATEST(resource_alert_target.last_attempt_ms, EXCLUDED.last_attempt_ms)""",
+                at.toEpochMilli(), id,
+            )
+            change()
+        }
+    }
+
+    override fun markDelivered(id: Long, at: Instant) = mark(id, at) {
         jdbc.update("DELETE FROM resource_alert_outbox WHERE id = ?", id)
     }
 
-    override fun markRetry(id: Long, at: Instant, reason: String) {
+    override fun markRetry(id: Long, at: Instant, reason: String) = mark(id, at) {
         jdbc.update("UPDATE resource_alert_outbox SET attempts = attempts + 1, last_failure = ?, last_attempt_ms = ? WHERE id = ?",
             reason.take(MAX_REASON), at.toEpochMilli(), id)
     }
 
-    override fun markRejected(id: Long, at: Instant, reason: String) {
+    override fun markRejected(id: Long, at: Instant, reason: String) = mark(id, at) {
         jdbc.update("UPDATE resource_alert_outbox SET attempts = attempts + 1, last_failure = ?, last_attempt_ms = ?, rejected_ms = ? WHERE id = ?",
             reason.take(MAX_REASON), at.toEpochMilli(), at.toEpochMilli(), id)
     }
@@ -248,6 +301,8 @@ class ThresholdStore(
         const val JUDGE_LOCK = 7_310_420_001L
         const val DISPATCH_LOCK = 7_310_420_002L
         const val MAX_REASON = 200
+        /** 규칙의 묶음(SQL) — [AlertTarget.groupOf] 와 같은 규칙. 글자는 고정값이다(입력이 아니다) */
+        val RULE_GROUP = "CASE WHEN rule IN ('${ResourceRule.DISK_WARNING.wireName}', '${ResourceRule.DISK_CRITICAL.wireName}') THEN '${AlertTarget.DISK_GROUP}' ELSE rule END"
 
         fun PreparedStatement.setNullable(index: Int, value: Any?, sqlType: Int) =
             if (value == null) setNull(index, sqlType) else setObject(index, value, sqlType)

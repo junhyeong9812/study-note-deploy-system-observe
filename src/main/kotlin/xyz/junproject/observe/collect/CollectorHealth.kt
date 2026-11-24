@@ -6,6 +6,9 @@ import xyz.junproject.observe.metric.MetricHealth
 import java.sql.SQLException
 import java.time.Duration
 import java.time.Instant
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.Executors
 
 /**
  * 수집이 살아 있는가의 판정. 200 은 `ok` 하나뿐이다.
@@ -40,6 +43,8 @@ class CollectorHealth(
     @Volatile private var lastLoggedProblem: String? = null
 
     fun report(now: Instant): Report {
+        // 지표 칸은 로그 쪽 읽기와 동시에 시작한다(§16) — 헬스 전체는 둘의 합이 아니라 긴 쪽(지표 칸은 그 안에서 최대 2초)
+        val metricReport = metrics?.let { metricHealth -> CompletableFuture.supplyAsync({ metricHealth.report(now) }, METRIC_READER) }
         val lastLoopAt = collector.lastLoopAt
         val failure = collector.lastFailure
         val pending = runCatching(unacknowledged)
@@ -73,10 +78,10 @@ class CollectorHealth(
             "last_auth_retention_failure" to (authRetention?.failure ?: ""),
         )
         // 지표 칸은 판정이 끝난 뒤에 덧붙인다 — 지표 쪽의 어떤 실패도 위 status 와 HTTP 상태에 닿지 않게(만들다 실패해도 칸에만 남긴다)
-        val metricHealth = metrics
-        val withMetrics = if (metricHealth == null) body else body + ("metrics" to runCatching { metricHealth.report(now) }.getOrElse {
-            log.error("observe:observe:metric health failed: {}: {}", it.javaClass.simpleName, it.message?.take(200))
-            mapOf("status" to "failing", "failure" to "health ${it.javaClass.simpleName}")
+        val withMetrics = if (metricReport == null) body else body + ("metrics" to runCatching { metricReport.get() }.getOrElse {
+            val cause = (it as? ExecutionException)?.cause ?: it
+            log.error("observe:observe:metric health failed: {}: {}", cause.javaClass.simpleName, cause.message?.take(200))
+            mapOf("status" to "failing", "failure" to "health ${cause.javaClass.simpleName}")
         })
         return Report(status == "ok", withMetrics)
     }
@@ -93,5 +98,7 @@ class CollectorHealth(
 
     companion object {
         private const val UNDEFINED_TABLE = "42P01"   // PostgreSQL: relation does not exist
+        /** 지표 칸을 읽는 가상 스레드 — 그 읽기는 [MetricHealth] 가 스스로 2초에서 끊는다 */
+        private val METRIC_READER = Executors.newVirtualThreadPerTaskExecutor()
     }
 }

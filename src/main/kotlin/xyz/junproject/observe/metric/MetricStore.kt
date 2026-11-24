@@ -60,8 +60,8 @@ interface MetricReader {
     /** [server] 에서 측정 시각이 `[from, to]`(양 끝 포함) 안인 항목에 들어 있던 컨테이너(계열 이름) — 이름순 */
     fun containers(server: String, from: Instant, to: Instant): List<SeenContainer>
 
-    /** 서버별 마지막 수신 시각(원본과 따로 남긴 값 — §15). `latest` 의 `age_ms` · `stale` 이 쓴다. 모르면 빈 지도 */
-    fun lastReceivedOfEveryServer(): Map<String, Instant> = emptyMap()
+    /** 서버별 마지막 수신 시각(원본과 따로 남긴 값 — §15 · §16). `latest` 의 서버 목록 · `age_ms` · `stale` 이 쓴다. 모르면 빈 지도 */
+    fun serverReceipts(): Map<String, Instant> = emptyMap()
 }
 
 /** 원본 7일 · 5분 평균 30일 삭제 한 번의 결과 — [rawDeleted] 는 지운 항목(스트림 항목) 수, [rollupDeleted] 는 지운 (서버, 5분 구간) 수 */
@@ -73,7 +73,7 @@ data class MetricRetentionResult(val ranAt: Instant, val deletion: MetricDeletio
 /** 5분 평균 한 바퀴의 결과(헬스용) — 실패면 [buckets] 는 null 이고 [failure] 에 예외 종류 이름 */
 data class MetricRollupResult(val ranAt: Instant, val buckets: Int?, val failure: String?, val failedBuckets: Int = 0)
 
-/** 5분 평균 한 바퀴의 구간 수(§16 — 리뷰 루프 2) — [computed] 는 확정한 (서버, 구간), [failed] 는 계산에 실패해 표시 없이 남긴 (서버, 구간) */
+/** 5분 평균 한 바퀴의 구간 수(§16) — [computed] 는 확정한 (서버, 구간), [failed] 는 계산에 실패해 표시 없이 남긴 (서버, 구간) */
 data class RollupOutcome(val computed: Int, val failed: Int)
 
 /** 예약 실행이 쓰는 면 — 5분 평균과 보관 삭제. 시각은 늘 인자로 받는다(테스트가 시계를 정한다) */
@@ -86,7 +86,7 @@ interface MetricMaintenance {
     fun rollUp(now: Instant): Int
 
     /**
-     * 리뷰 루프 2(§16 · §16.1 — 구현 전): [rollUp] 과 같은 일을 **구간마다 따로** 한다 — 한 (서버, 구간)의 계산 실패가 다른 구간의 결과를 되돌리지 않고,
+     * §16 · §16.1: [rollUp] 과 같은 일을 **구간마다 따로** 한다 — 한 (서버, 구간)의 계산 실패가 다른 구간의 결과를 되돌리지 않고,
      * 그 구간의 평균 값과 "계산함" 표시는 같은 트랜잭션에서 확정된다(실패한 구간에는 표시가 없다). 한 바퀴는 가장 오래 시도하지 않은 구간부터
      * 200 구간까지. 예외는 구간 밖의 실패(DB 에 닿지 못함 등)만 낸다. 기본 동작은 [rollUp] 을 그대로 부르는 것(가짜 저장소용).
      */
@@ -111,16 +111,24 @@ interface MetricMaintenance {
  *   조회 꼴(서버 · 계열 이름 또는 번호 · 측정 시각 범위)에 맞춘 인덱스.
  * - `metric_rollup_bucket`: (서버, 5분 구간)의 평균 계산 기록 — 계산 시각과 그때 본 마지막 저장 순번.
  * - `metric_rollup`: (서버, 구간, 갈래, 계열 이름, 값 이름)마다 평균 · 최댓값 · 표본 수. host 의 계열 이름은 빈 글자.
+ * - `metric_rollup_attempt`: (서버, 5분 구간)을 마지막으로 계산해 보려 한 시각 — 성패와 상관없이. "계산함" 표시(`metric_rollup_bucket`)와 따로 두어
+ *   실패한 구간에는 표시가 없고 차례만 뒤로 간다.
+ * - `metric_server_receipt`: 서버별 마지막 수신 시각 — 새로 저장된 항목만, 큰 쪽으로(원본이 지워져도 남는다).
  */
 class MetricStore(
     private val ingest: JdbcTemplate,
     private val query: JdbcTemplate,
     private val health: JdbcTemplate,
     /**
-     * 리뷰 루프 2(§16 — 구현 전): 임계값 판정이 읽는 연결([samplesMeasuredBetween] · [lastReceivedOfEveryServer] 를 판정이 부를 때) — 어드민 조회가
+     * §16: 임계값 판정이 읽는 연결([samplesMeasuredBetween] · [lastReceivedOfEveryServer]) — 어드민 조회가
      * [query] 를 다 잡아도 판정이 기다리지 않게. 없으면 [query].
      */
     private val judge: JdbcTemplate = query,
+    /**
+     * 헬스의 선택 칸(서버별 수신 시각 · 최근 항목)을 읽는 연결 — 상태를 정하는 읽기([latestStoredAt] — [health])와 풀을 나눠, 선택 칸의 표가
+     * 막혀 버려진 읽기가 연결을 쥐고 있어도 상태 읽기는 기다리지 않는다(§16.1). 없으면 [health].
+     */
+    private val healthDetail: JdbcTemplate = health,
 ) : MetricSink, MetricReader, MetricMaintenance, MetricSampleSource {
     private val transaction = TransactionTemplate(DataSourceTransactionManager(requireNotNull(ingest.dataSource) { "JdbcTemplate 에 DataSource 가 없다" }))
     @Volatile private var schemaReady = false
@@ -130,7 +138,10 @@ class MetricStore(
      * 스키마 — 있으면 그대로 둔다(마이그레이션 도구 없이 `IF NOT EXISTS`). 두 자리가 동시에 처음 만들면 한쪽이 고유 제약 위반으로
      * 실패할 수 있다(`log_entry` 와 같은 한계) — 그 호출이 실패로 남고 다음 호출이 다시 만든다.
      */
-    override fun createSchema() {
+    override fun createSchema() = synchronized(creatingSchema) { createTables() }
+
+    /** 표 만들기 — 이 프로세스 안에서는 [creatingSchema] 로 한 줄로 선다(수집 스레드와 뜬 직후 미리 만들기가 겹쳐 한쪽이 실패하지 않게 · §16) */
+    private fun createTables() {
         ingest.execute(
             """CREATE TABLE IF NOT EXISTS metric_sample (
                  stream_ms    bigint           NOT NULL,
@@ -226,15 +237,22 @@ class MetricStore(
         // 처음 채우기 — 이 표가 생기기 전부터 원본이 있던 DB 에서 비어 있지 않게. 큰 쪽으로만 바꾸므로 몇 번을, 두 자리가 함께 해도 결과가 같다
         ingest.update(
             """INSERT INTO metric_server_receipt (server, last_received_ms)
-               SELECT server, max(received_ms) FROM metric_sample GROUP BY server
+               SELECT server, max(received_ms) FROM metric_sample GROUP BY server ORDER BY server
                ON CONFLICT (server) DO UPDATE SET last_received_ms = GREATEST(metric_server_receipt.last_received_ms, EXCLUDED.last_received_ms)"""
+        )
+        ingest.execute(
+            """CREATE TABLE IF NOT EXISTS metric_rollup_attempt (
+                 server       text   NOT NULL,
+                 bucket_ms    bigint NOT NULL,
+                 attempted_ms bigint NOT NULL,
+                 PRIMARY KEY (server, bucket_ms))"""
         )
         schemaReady = true
     }
 
     /** 조회·예약이 먼저 닿으면 그때 만든다(수집 바퀴보다 먼저 불려도 표 없음으로 실패하지 않게). 헬스는 만들지 않는다 — 표 없음을 그대로 본다 */
     private fun ensureSchema() {
-        if (!schemaReady) synchronized(creatingSchema) { if (!schemaReady) createSchema() }
+        if (!schemaReady) synchronized(creatingSchema) { if (!schemaReady) createTables() }
     }
 
     /** 뜬 직후 한 번 미리 만든다 — 실패는 예외로(부르는 쪽이 로그만 남기고 삼킨다) */
@@ -265,8 +283,9 @@ class MetricStore(
             }
             // 서버별 마지막 수신 시각 — 같은 트랜잭션에서, 큰 쪽으로만(두 자리가 엇갈려 커밋해도 옛 값이 새 값을 덮지 않는다).
             // 서버 이름순으로 잡아 두 저장이 서로의 줄을 거꾸로 기다리지 않게
-            val receipts = samples.groupBy { it.server }.mapValues { (_, list) -> list.maxOf { it.receivedAt.toEpochMilli() } }.toSortedMap()
-            ingest.batchUpdate(UPSERT_RECEIPT, receipts.entries.toList(), receipts.size) { statement, (server, receivedMs) ->
+            // 다시 전달된 항목(이미 있던 스트림 ID)은 수신으로 치지 않는다 — 실제로 새로 들어간 항목의 서버만(§16)
+            val receipts = inserted.groupBy { it.server }.mapValues { (_, list) -> list.maxOf { it.receivedAt.toEpochMilli() } }.toSortedMap()
+            if (receipts.isNotEmpty()) ingest.batchUpdate(UPSERT_RECEIPT, receipts.entries.toList(), receipts.size) { statement, (server, receivedMs) ->
                 statement.setString(1, server); statement.setLong(2, receivedMs)
             }
             inserted.size
@@ -366,17 +385,17 @@ class MetricStore(
     }
 
     /**
-     * 임계값 판정의 입력 — 측정 시각이 `(from, to]` 인 항목을 컨테이너 · GPU 까지(서버 · 측정 시각순). 조회 풀로 읽는다.
+     * 임계값 판정의 입력 — 측정 시각이 `(from, to]` 인 항목을 컨테이너 · GPU 까지(서버 · 측정 시각순). 판정용 연결로 읽는다(§16).
      * 읽기만이라 5분 평균이 원본 표에 거는 SHARE 잠금에 막히지 않는다(읽기의 ACCESS SHARE 는 그것과 충돌하지 않는다).
      */
     override fun samplesMeasuredBetween(from: Instant, to: Instant): List<ResourceSample> {
         ensureSchema()
-        val heads = query.query(
+        val heads = judge.query(
             "SELECT * FROM metric_sample WHERE measured_ms > ? AND measured_ms <= ? ORDER BY server, measured_ms, stream_ms, stream_seq",
             { row, _ -> row.toSampleHead() }, from.toEpochMilli(), to.toEpochMilli(),
         )
         if (heads.isEmpty()) return heads
-        fun <T> children(table: String, read: (ResultSet) -> T): Map<StreamId, List<T>> = query.query(
+        fun <T> children(table: String, read: (ResultSet) -> T): Map<StreamId, List<T>> = judge.query(
             "SELECT * FROM $table WHERE measured_ms > ? AND measured_ms <= ? ORDER BY stream_ms, stream_seq, position",
             { row, _ -> StreamId(row.getLong("stream_ms"), row.getInt("stream_seq")) to read(row) }, from.toEpochMilli(), to.toEpochMilli(),
         ).groupBy({ it.first }, { it.second })
@@ -386,12 +405,17 @@ class MetricStore(
     }
 
     /**
-     * 서버별 마지막 수신 시각(판정 · `latest` 의 `age_ms` — 조회 풀). 원본과 따로 둔 작은 표에서 읽는다 — 원본이 7일 뒤 지워져도 남고
-     * 늦게 도착한 옛 항목도 "방금 받았다"로 친다(§15).
+     * 서버별 마지막 수신 시각(판정의 입력 — 판정용 연결). 원본과 따로 둔 작은 표에서 읽는다 — 원본이 7일 뒤 지워져도 남는다(§15).
+     * 새로 저장된 항목만 올린다(다시 전달된 항목은 치지 않는다 · §16).
      */
-    override fun lastReceivedOfEveryServer(): Map<String, Instant> {
+    override fun lastReceivedOfEveryServer(): Map<String, Instant> = receipts(judge)
+
+    /** 서버별 마지막 수신 시각(`latest` 의 서버 목록 · `age_ms` — 조회 풀) */
+    override fun serverReceipts(): Map<String, Instant> = receipts(query)
+
+    private fun receipts(jdbc: JdbcTemplate): Map<String, Instant> {
         ensureSchema()
-        return query.query("SELECT server, last_received_ms FROM metric_server_receipt",
+        return jdbc.query("SELECT server, last_received_ms FROM metric_server_receipt",
             { row, _ -> row.getString("server") to Instant.ofEpochMilli(row.getLong("last_received_ms")) }).toMap()
     }
 
@@ -411,49 +435,86 @@ class MetricStore(
         ).sortedBy { it.name }
     }
 
+    /** 끝난 5분 구간을 모두 다시 계산할 만큼 돈다(개수 제한 없이) — 확정한 (서버, 구간) 수. 예약 실행은 [rollUpBuckets] 를 쓴다 */
+    override fun rollUp(now: Instant): Int = rollUpBuckets(now, limit = null).computed
+
+    /** §16 · §16.1: 구간마다 따로, 가장 오래 시도하지 않은 구간부터 [BUCKETS_PER_ROUND] 개 */
+    override fun rollUpBuckets(now: Instant): RollupOutcome = rollUpBuckets(now, BUCKETS_PER_ROUND)
+
     /**
-     * 끝난 5분 구간 중 다시 계산할 것을 고른다: 평균이 없거나, 계산 시각이 그 구간 원본의 마지막 수신 시각보다 뒤가 아니거나,
-     * 계산 뒤에 저장된 원본(저장 순번이 그때 본 것보다 큼)이 있는 구간.
-     * 수신 시각은 수집기가 저장 **전에** 찍으므로 그것만으로는 "계산하는 동안 커밋된 원본"을 놓칠 수 있다 — 그래서 한 바퀴 동안
-     * 원본 표에 SHARE 잠금을 걸어(읽기는 막지 않고 저장만 잠시 기다리게) 진행 중인 저장을 끝낸 뒤 보고, 그때의 마지막 저장 순번을 기록한다.
+     * 다시 계산할 (서버, 5분 구간)을 고른다: 끝난 구간 중 평균이 없거나, 계산 시각이 그 구간 원본의 마지막 수신 시각보다 뒤가 아니거나,
+     * 계산 뒤에 저장된 원본(저장 순번이 그때 본 것보다 큼)이 있는 구간. 차례는 마지막으로 시도한 시각(`metric_rollup_attempt` — "계산함" 표시와 따로,
+     * 성패와 상관없이 남긴다)이 오래된 구간부터(시도한 적 없는 구간이 맨 앞, 그끼리는 서버 · 구간순) — 계속 실패하는 구간이 앞자리를 차지하지 않는다.
+     * 구간마다 따로 한 트랜잭션([rollUpOne]) — 한 구간의 실패가 다른 구간을 되돌리지 않는다. 고르기가 실패하면(DB 에 닿지 못함 등) 예외.
      */
-    override fun rollUp(now: Instant): Int {
+    private fun rollUpBuckets(now: Instant, limit: Int?): RollupOutcome {
         ensureSchema()
         val closedBefore = SeriesPlan.floorTo(now, BUCKET).toEpochMilli()
         val bucket = BUCKET.toMillis()
-        return transaction.execute {
+        val targets = ingest.query(
+            """SELECT raw.server, raw.bucket_ms FROM (
+                 SELECT server, measured_ms / ? * ? AS bucket_ms, max(received_ms) AS last_received, max(insert_order) AS last_order
+                 FROM metric_sample WHERE measured_ms < ? GROUP BY 1, 2) raw
+               LEFT JOIN metric_rollup_bucket done ON done.server = raw.server AND done.bucket_ms = raw.bucket_ms
+               LEFT JOIN metric_rollup_attempt tried ON tried.server = raw.server AND tried.bucket_ms = raw.bucket_ms
+               WHERE done.server IS NULL OR done.computed_ms <= raw.last_received OR done.insert_order_seen < raw.last_order
+               ORDER BY tried.attempted_ms NULLS FIRST, raw.server, raw.bucket_ms
+               LIMIT ?""",
+            { row, _ -> row.getString("server") to row.getLong("bucket_ms") },
+            bucket, bucket, closedBefore, limit ?: Int.MAX_VALUE,
+        )
+        var computed = 0
+        val failures = mutableListOf<String>()
+        for ((server, bucketStart) in targets) {
+            try {
+                rollUpOne(server, bucketStart, now)
+                computed++
+            } catch (error: Exception) {
+                failures += "$server ${Instant.ofEpochMilli(bucketStart)} ${error.javaClass.simpleName}"
+            }
+            // 시도한 시각 — 성패와 상관없이(차례를 정한다). 이것이 실패해도 그 구간의 결과는 이미 정해졌다
+            runCatching {
+                ingest.update(
+                    """INSERT INTO metric_rollup_attempt (server, bucket_ms, attempted_ms) VALUES (?,?,?)
+                       ON CONFLICT (server, bucket_ms) DO UPDATE SET attempted_ms = EXCLUDED.attempted_ms""",
+                    server, bucketStart, now.toEpochMilli(),
+                )
+            }
+        }
+        if (failures.isNotEmpty()) log.warn("observe:observe:metric rollup failed for {} buckets (first: {})", failures.size, failures.first())
+        return RollupOutcome(computed, failures.size)
+    }
+
+    /**
+     * (서버, 5분 구간) 하나를 한 트랜잭션에서 계산해 덮어쓰고 "계산함" 표시(계산 시각 · 그때 본 마지막 저장 순번)를 함께 확정한다.
+     * 수신 시각은 수집기가 저장 **전에** 찍으므로 그것만으로는 "계산하는 동안 커밋된 원본"을 놓칠 수 있다 — 그래서 이 트랜잭션 동안
+     * 원본 표에 SHARE 잠금을 걸어(읽기는 막지 않고 저장만 잠시 기다리게) 진행 중인 저장을 끝낸 뒤 보고, 그때의 마지막 저장 순번을 기록한다.
+     * 잠금은 구간마다 잡고 풀므로 그 사이에 저장이 끼어들 수 있다 — 그렇게 들어온 원본은 기록된 순번보다 큰 순번을 받으므로 그 구간은
+     * "다시 계산할 것"이 되고 원본 삭제의 조건(그때 본 순번 ≥ 그 구간의 마지막 순번)도 서지 않는다. 같은 구간을 두 자리가 함께 계산하면
+     * 표시 줄을 먼저 쓴 쪽이 커밋할 때까지 다른 쪽이 그 줄에서 기다렸다가 이어서 덮어쓴다.
+     */
+    private fun rollUpOne(server: String, bucketStart: Long, now: Instant) {
+        val bucket = BUCKET.toMillis()
+        transaction.executeWithoutResult {
             ingest.execute("LOCK TABLE metric_sample IN SHARE MODE")
             val seen = ingest.queryForObject("SELECT coalesce(max(insert_order), 0) FROM metric_sample", Long::class.java)!!
-            val targets = ingest.query(
-                """SELECT raw.server, raw.bucket_ms FROM (
-                     SELECT server, measured_ms / ? * ? AS bucket_ms, max(received_ms) AS last_received, max(insert_order) AS last_order
-                     FROM metric_sample WHERE measured_ms < ? GROUP BY 1, 2) raw
-                   LEFT JOIN metric_rollup_bucket done ON done.server = raw.server AND done.bucket_ms = raw.bucket_ms
-                   WHERE done.server IS NULL OR done.computed_ms <= raw.last_received OR done.insert_order_seen < raw.last_order
-                   ORDER BY raw.server, raw.bucket_ms""",
-                { row, _ -> row.getString("server") to row.getLong("bucket_ms") },
-                bucket, bucket, closedBefore,
+            ingest.update(
+                """INSERT INTO metric_rollup_bucket (server, bucket_ms, computed_ms, insert_order_seen) VALUES (?,?,?,?)
+                   ON CONFLICT (server, bucket_ms) DO UPDATE SET computed_ms = EXCLUDED.computed_ms, insert_order_seen = EXCLUDED.insert_order_seen""",
+                server, bucketStart, now.toEpochMilli(), seen,
             )
-            for ((server, bucketStart) in targets) {
+            ingest.update("DELETE FROM metric_rollup WHERE server = ? AND bucket_ms = ?", server, bucketStart)
+            for (scope in MetricScope.entries) {
                 ingest.update(
-                    """INSERT INTO metric_rollup_bucket (server, bucket_ms, computed_ms, insert_order_seen) VALUES (?,?,?,?)
-                       ON CONFLICT (server, bucket_ms) DO UPDATE SET computed_ms = EXCLUDED.computed_ms, insert_order_seen = EXCLUDED.insert_order_seen""",
-                    server, bucketStart, now.toEpochMilli(), seen,
+                    """INSERT INTO metric_rollup (server, bucket_ms, scope, name, value_name, average, maximum, samples)
+                       SELECT server, ?, ?, name, value_name, avg(value), max(value), count(value)
+                       FROM (${valueRows(scope)}) value_row
+                       WHERE server = ? AND measured_ms >= ? AND measured_ms < ?
+                       GROUP BY server, name, value_name HAVING count(value) > 0""",
+                    bucketStart, scope.wireName, server, bucketStart, bucketStart + bucket,
                 )
-                ingest.update("DELETE FROM metric_rollup WHERE server = ? AND bucket_ms = ?", server, bucketStart)
-                for (scope in MetricScope.entries) {
-                    ingest.update(
-                        """INSERT INTO metric_rollup (server, bucket_ms, scope, name, value_name, average, maximum, samples)
-                           SELECT server, ?, ?, name, value_name, avg(value), max(value), count(value)
-                           FROM (${valueRows(scope)}) value_row
-                           WHERE server = ? AND measured_ms >= ? AND measured_ms < ?
-                           GROUP BY server, name, value_name HAVING count(value) > 0""",
-                        bucketStart, scope.wireName, server, bucketStart, bucketStart + bucket,
-                    )
-                }
             }
-            targets.size
-        }!!
+        }
     }
 
     /**
@@ -481,6 +542,7 @@ class MetricStore(
             bucket, bucket, wholeBucketsBefore, bucket, rawCutoff.toEpochMilli(),
         )
         val rollupDeleted = ingest.update("DELETE FROM metric_rollup_bucket WHERE bucket_ms < ?", now.minus(ROLLUP_RETENTION).toEpochMilli())
+        ingest.update("DELETE FROM metric_rollup_attempt WHERE bucket_ms < ?", now.minus(ROLLUP_RETENTION).toEpochMilli())   // 시도 기록도 같은 기한
         return MetricDeletion(rawDeleted, rollupDeleted)
     }
 
@@ -490,14 +552,14 @@ class MetricStore(
 
     /** 서버별 마지막 수신 시각(헬스용 — §2.3) — 작은 표에서(헬스용 연결 · 표를 만들지 않는다) */
     fun lastReceivedByServer(): Map<String, Instant> =
-        health.query("SELECT server, last_received_ms FROM metric_server_receipt ORDER BY server",
+        healthDetail.query("SELECT server, last_received_ms FROM metric_server_receipt ORDER BY server",
             { row, _ -> row.getString("server") to Instant.ofEpochMilli(row.getLong("last_received_ms")) }).toMap()
 
     /**
      * 서버마다 측정 시각이 가장 늦은 항목(컨테이너 · GPU 없이 — 헬스의 `clock_behind` 용, 헬스용 연결 · 표를 만들지 않는다).
      * 수신이 [receivedSince] 이후인 항목에서 고른다(`latest` 와 같은 범위).
      */
-    fun latestHeads(receivedSince: Instant): List<ResourceSample> = health.query(
+    fun latestHeads(receivedSince: Instant): List<ResourceSample> = healthDetail.query(
         """SELECT DISTINCT ON (server) * FROM metric_sample WHERE received_ms >= ?
            ORDER BY server, measured_ms DESC, stream_ms DESC, stream_seq DESC""",
         { row, _ -> row.toSampleHead() }, receivedSince.toEpochMilli(),
@@ -523,6 +585,9 @@ class MetricStore(
         val RAW_RETENTION: Duration = Duration.ofDays(7)
         val ROLLUP_RETENTION: Duration = Duration.ofDays(30)
         val BUCKET: Duration = Duration.ofMinutes(5)
+        /** 5분 평균 한 바퀴의 구간 수 상한(§16) — 밀린 뒤에도 저장이 오래 기다리지 않게 */
+        const val BUCKETS_PER_ROUND = 200
+        private val log = org.slf4j.LoggerFactory.getLogger("observe")
 
         private const val UPSERT_RECEIPT =
             """INSERT INTO metric_server_receipt (server, last_received_ms) VALUES (?, ?)

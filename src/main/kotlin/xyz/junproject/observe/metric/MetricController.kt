@@ -22,7 +22,8 @@ import xyz.junproject.observe.threshold.FiringSource
  * 401 `unauthorized` · 422 `invalid_request`(`detail`) · DB 오류 503 `query_failed` · 시간 초과 504 `query_timeout`.
  *
  * - `GET /metrics/latest` → `{servers:[{server, at, received_at, age_ms, stale, host, containers, gpus, missing}], firing:[]}`
- *   - 서버: 수신 시각이 최근 24시간 안인 서버 + [expectedServers](쉼표로 나눈 이름 — `METRICS_EXPECTED_SERVERS`) 중 그 밖의 서버. 이름순.
+ *   - 서버: 수신 시각이 최근 24시간 안인 서버 + [expectedServers](쉼표로 나눈 이름 — `METRICS_EXPECTED_SERVERS`) + 마지막 수신 기록이 있는 서버. 이름순.
+ *     보일 값이 없는 서버는 "수신 없음"(마지막 수신 기록이 있으면 `received_at` · `age_ms` 를 채운다).
  *   - `at`: 그 서버의 가장 최근 항목의 측정 시각, `received_at`: 그 항목의 수신 시각, `age_ms` = now − received_at, `stale` = age_ms > 3분.
  *   - 24시간 안에 받은 것이 없는 기대 서버("수신 없음"): `at`·`received_at`·`age_ms`·`host` 는 null, `stale` true, `containers`·`gpus`·`missing` 는 빈 배열.
  *   - `host`: 스트림 `body.host` 와 같은 칸 이름(없으면 null). `containers[]`: `{name, series_name, id, project, cpu_pct, mem_used, restarts, state}`
@@ -87,9 +88,10 @@ class MetricController(
         if (!authorized(request)) return unauthorized()
         return answering("latest") {
             val received = reader.latest(now.minus(LATEST_WINDOW)).associateBy { it.server }
-            val lastReceived = reader.lastReceivedOfEveryServer()
-            val servers = (received.keys + expected).sorted().map { name ->
-                received[name]?.let { latestServer(it, lastReceived[name], now) } ?: silentServer(name)
+            val lastReceived = reader.serverReceipts()
+            // 최근 24시간에 받은 서버 + 기대 서버 + 마지막 수신 기록이 있는 서버(§16 — 원본이 지워진 서버도 빠지지 않게)
+            val servers = (received.keys + expected + lastReceived.keys).sorted().map { name ->
+                received[name]?.let { latestServer(it, lastReceived[name], now) } ?: silentServer(name, lastReceived[name], now)
             }
             val firing = firingSource?.firing().orEmpty().map {
                 mapOf("server" to it.server, "rule" to it.rule, "target" to it.target, "severity" to it.severity,
@@ -124,11 +126,14 @@ class MetricController(
         )
     }
 
-    /** 기대 서버인데 24시간 안에 받은 것이 없다("수신 없음") */
-    private fun silentServer(name: String): Map<String, Any?> = mapOf(
-        "server" to name, "at" to null, "received_at" to null, "age_ms" to null, "stale" to true,
-        "host" to null, "containers" to emptyList<Any>(), "gpus" to emptyList<Any>(), "missing" to emptyList<Any>(),
-    )
+    /** 보일 값이 없는 서버("수신 없음") — 마지막 수신 기록이 있으면 그 시각과 나이를 낸다 */
+    private fun silentServer(name: String, lastReceived: Instant?, now: Instant): Map<String, Any?> {
+        val age = lastReceived?.let { Duration.between(it, now) }
+        return mapOf(
+            "server" to name, "at" to null, "received_at" to lastReceived?.toString(), "age_ms" to age?.toMillis(), "stale" to (age == null || age > STALE_AFTER),
+            "host" to null, "containers" to emptyList<Any>(), "gpus" to emptyList<Any>(), "missing" to emptyList<Any>(),
+        )
+    }
 
     @GetMapping("/metrics/series")
     fun series(

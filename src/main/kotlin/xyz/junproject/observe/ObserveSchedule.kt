@@ -168,17 +168,18 @@ class ObserveSchedule(
      */
     internal fun rollUpMetrics(now: Instant): Int? {
         val maintenance = metrics ?: return null
-        return runCatching { maintenance.rollUp(now) }
+        // 구간마다 따로(§16) — 실패한 구간은 세어 남기고 다음 바퀴에 다시 해 본다. 바퀴 밖의 실패(DB 불통 등)만 예외다
+        return runCatching { maintenance.rollUpBuckets(now) }
             .onSuccess {
-                if (it > 0) log.info("observe:observe:rolled up {} metric buckets", it)
-                metricRollup = MetricRollupResult(now, it, null)
+                if (it.computed > 0) log.info("observe:observe:rolled up {} metric buckets", it.computed)
+                metricRollup = MetricRollupResult(now, it.computed, null, failedBuckets = it.failed)
                 metricRollupSuccessAt = now
             }
             .onFailure {
                 log.error("observe:observe:metric rollup failed: {}: {}", it.javaClass.simpleName, it.message?.take(200))
                 metricRollup = MetricRollupResult(now, null, it.javaClass.simpleName)
             }
-            .getOrNull()
+            .getOrNull()?.computed
     }
 
     /** [now] 기준 지표 삭제([MetricMaintenance.deleteExpired]) — 실패는 예외를 삼키고 [lastMetricRetention] 에 종류 이름. [metrics] 가 없으면 null */
