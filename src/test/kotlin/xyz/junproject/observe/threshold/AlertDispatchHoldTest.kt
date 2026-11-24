@@ -79,7 +79,7 @@ class AlertDispatchHoldTest {
         val queue = FakeQueue(listOf(alert("memory-1"), alert("memory-2"), alert("cpu-1", rule = ResourceRule.CPU)))
         val sender = ScriptedSender { if (it.eventId == "memory-1") SendOutcome.Rejected("http 422") else SendOutcome.Delivered }
         assertEquals(DispatchOutcome(true, 2, 0, 1), AlertDispatcher(queue, sender).dispatch(now))
-        assertEquals(listOf("memory-1", "memory-2", "cpu-1"), sender.sent)
+        assertEquals(listOf("memory-1", "cpu-1", "memory-2"), sender.sent)   // §16.2: 대상을 돌아가며 한 건씩
     }
 
     /** 보낼 때마다 [perSend] 만큼 흐르는 가짜 시계 */

@@ -74,7 +74,12 @@ data class MetricRetentionResult(val ranAt: Instant, val deletion: MetricDeletio
 data class MetricRollupResult(val ranAt: Instant, val buckets: Int?, val failure: String?, val failedBuckets: Int = 0)
 
 /** 5분 평균 한 바퀴의 구간 수(§16) — [computed] 는 확정한 (서버, 구간), [failed] 는 계산에 실패해 표시 없이 남긴 (서버, 구간) */
-data class RollupOutcome(val computed: Int, val failed: Int)
+data class RollupOutcome(
+    val computed: Int,
+    val failed: Int,
+    /** 리뷰 루프 3(§16.2): 그 바퀴의 첫 실패의 예외 종류 이름(실패가 없으면 null) — 헬스의 `last_rollup_failure` 에 실패 구간 수와 함께 남는다 */
+    val firstFailure: String? = null,
+)
 
 /** 예약 실행이 쓰는 면 — 5분 평균과 보관 삭제. 시각은 늘 인자로 받는다(테스트가 시계를 정한다) */
 interface MetricMaintenance {

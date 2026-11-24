@@ -110,7 +110,8 @@ class MetricHealthDeadlineTest {
         }
         val schedule = ObserveSchedule(LogCollector(FakeLogStream(), FakeLogSink()), unreachableLogStore, metrics = maintenance)
         assertEquals(5, schedule.rollUpMetrics(now))
-        assertEquals(MetricRollupResult(now, 5, null, failedBuckets = 2), schedule.lastMetricRollup)
+        // §16.2: 실패 구간이 있는 바퀴는 실패 사유를 남긴다 — 구간 수만 본다(실패 사유 · 성공 시각은 RollupSuccessTest)
+        assertEquals(5 to 2, schedule.lastMetricRollup?.let { it.buckets to it.failedBuckets })
     }
 
     private val unreachableLogStore = org.springframework.jdbc.core.JdbcTemplate(object : org.springframework.jdbc.datasource.AbstractDataSource() {

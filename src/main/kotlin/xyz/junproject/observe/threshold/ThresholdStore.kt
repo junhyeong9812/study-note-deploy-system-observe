@@ -97,6 +97,11 @@ data class TargetQueue(val target: AlertTarget, val lastAttemptAt: Instant?, val
  */
 class ThresholdStore(
     private val jdbc: JdbcTemplate,
+    /**
+     * 리뷰 루프 3(§16.2): 어드민 조회([firing])가 쓰는 연결 — 읽기 문장과 그 길의 표 확인까지 판정 · 알림용 [jdbc] 를 쓰지 않게.
+     * 기본값은 [jdbc](지금 동작과 같다 — 배선에서 조회용 풀을 넘긴다). [failpoint] 를 끝 람다로 넘기는 호출이 그대로 되게 그 앞에 둔다
+     */
+    private val query: JdbcTemplate = jdbc,
     private val failpoint: (String) -> Unit = {},
 ) : RuleStateStore, AlertQueue, FiringSource {
     private val dataSource = requireNotNull(jdbc.dataSource) { "JdbcTemplate 에 DataSource 가 없다" }

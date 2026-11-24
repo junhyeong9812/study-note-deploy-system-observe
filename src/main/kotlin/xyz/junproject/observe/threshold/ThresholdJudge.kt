@@ -145,6 +145,9 @@ data class JudgeResult(val states: List<RuleState>, val events: List<ResourceAle
  * 창 안의 표본(null 제외)이 기대 수(창 ÷ 간격)의 절반에 못 미치거나 창을 덮지 못하면(가장 오랜 표본이 `now − 창 + 간격` 보다 늦음)
  * 그 규칙은 판정을 미루고 상태를 그대로 둔다(결측은 넘음도 해소도 아니다). 재시작 넘음은 창을 덮지 않아도 되지만 절반 규칙은 따른다.
  * 넘어 있는 재시작 규칙의 컨테이너 ID 가 창 안에 하나도 없고 그 서버의 표본은 절반 이상이면(새 컨테이너로 바뀜) 해소다.
+ * 리뷰 루프 3(§16.2 — 구현 전): "그 ID 가 없음"과 재시작 횟수의 증가량은 **컨테이너 갈래가 온전한 표본만**(`missing` 에 `containers` · `containers_truncated`
+ * 가 없음) 보고 센다 — 잘린 표본의 값은 넘음 · 해소 어느 쪽도 좌우하지 않는다. 해소의 까닭은 해소 알림의 글(title · detail)로 가른다:
+ * 컨테이너가 바뀌어 해소하면 그 글에 "바뀜"이 있고, 횟수가 늘지 않아 해소한 글과 다르다(해소된 상태 줄은 남기지 않는다 — 배포마다 쌓이지 않게).
  */
 class ThresholdJudge(private val thresholds: ResourceThresholds = ResourceThresholds()) {
     /** 판정에 필요한 가장 긴 창 — 입력 표본은 `(now − lookback, now]` */

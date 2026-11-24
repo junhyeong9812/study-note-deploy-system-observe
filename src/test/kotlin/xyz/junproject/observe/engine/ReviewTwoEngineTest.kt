@@ -166,7 +166,7 @@ class ReviewTwoEngineTest {
         val failing = good.plus(Duration.ofMinutes(5))
         store.insertAll(listOf(sample(good.plusSeconds(10)), sample(good.plusSeconds(20), server = "ci-agent-164")) + overflowing(failing))
         val outcome = store.rollUpBuckets(now)
-        assertEquals(RollupOutcome(2, 1), outcome, "실패 구간이 바퀴 전체를 되돌렸거나 세지 않았다")
+        assertEquals(2 to 1, outcome.computed to outcome.failed, "실패 구간이 바퀴 전체를 되돌렸거나 세지 않았다")   // §16.2: 첫 실패의 종류가 함께 온다
         assertEquals(1, store.rollups("ci-agent-158", MetricScope.HOST, null, good, good.plus(Duration.ofMinutes(5))).size)
         assertEquals(1, store.rollups("ci-agent-164", MetricScope.HOST, null, good, good.plus(Duration.ofMinutes(5))).size)
         assertEquals(emptyList<Any>(), store.rollups("ci-agent-158", MetricScope.HOST, null, failing, failing.plus(Duration.ofMinutes(5))))
