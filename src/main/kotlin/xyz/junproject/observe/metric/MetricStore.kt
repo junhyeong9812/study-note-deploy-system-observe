@@ -77,7 +77,7 @@ data class MetricRollupResult(val ranAt: Instant, val buckets: Int?, val failure
 data class RollupOutcome(
     val computed: Int,
     val failed: Int,
-    /** 리뷰 루프 3(§16.2): 그 바퀴의 첫 실패의 예외 종류 이름(실패가 없으면 null) — 헬스의 `last_rollup_failure` 에 실패 구간 수와 함께 남는다 */
+    /** §16.2: 그 바퀴의 첫 실패의 예외 종류 이름(실패가 없으면 null) — 헬스의 `last_rollup_failure` 에 실패 구간 수와 함께 남는다 */
     val firstFailure: String? = null,
 )
 
@@ -470,12 +470,14 @@ class MetricStore(
         )
         var computed = 0
         val failures = mutableListOf<String>()
+        var firstFailure: String? = null
         for ((server, bucketStart) in targets) {
             try {
                 rollUpOne(server, bucketStart, now)
                 computed++
             } catch (error: Exception) {
                 failures += "$server ${Instant.ofEpochMilli(bucketStart)} ${error.javaClass.simpleName}"
+                if (firstFailure == null) firstFailure = error.javaClass.simpleName
             }
             // 시도한 시각 — 성패와 상관없이(차례를 정한다). 이것이 실패해도 그 구간의 결과는 이미 정해졌다
             runCatching {
@@ -487,7 +489,7 @@ class MetricStore(
             }
         }
         if (failures.isNotEmpty()) log.warn("observe:observe:metric rollup failed for {} buckets (first: {})", failures.size, failures.first())
-        return RollupOutcome(computed, failures.size)
+        return RollupOutcome(computed, failures.size, firstFailure)
     }
 
     /**
@@ -502,7 +504,10 @@ class MetricStore(
         val bucket = BUCKET.toMillis()
         transaction.executeWithoutResult {
             ingest.execute("LOCK TABLE metric_sample IN SHARE MODE")
-            val seen = ingest.queryForObject("SELECT coalesce(max(insert_order), 0) FROM metric_sample", Long::class.java)!!
+            // 지금까지의 저장 순번 — 표를 훑지 않고 순번 발번기(identity 칸의 시퀀스)의 마지막 값을 읽는다(§16.2). 잠금을 쥔 동안에는
+            // 진행 중인 저장이 없다(INSERT 는 표의 ROW EXCLUSIVE 잠금을 얻은 뒤에야 번호를 받는다) — 그래서 이 값은 저장된 모든 원본의 순번 이상이다.
+            // 되돌려진 저장이 번호를 써 버려 더 커도, 뒤의 저장은 그보다 큰 번호를 받는다. 한 번도 번호를 매기지 않았으면 0
+            val seen = ingest.queryForObject(LAST_INSERT_ORDER, Long::class.java)!!
             ingest.update(
                 """INSERT INTO metric_rollup_bucket (server, bucket_ms, computed_ms, insert_order_seen) VALUES (?,?,?,?)
                    ON CONFLICT (server, bucket_ms) DO UPDATE SET computed_ms = EXCLUDED.computed_ms, insert_order_seen = EXCLUDED.insert_order_seen""",
@@ -594,6 +599,9 @@ class MetricStore(
         const val BUCKETS_PER_ROUND = 200
         private val log = org.slf4j.LoggerFactory.getLogger("observe")
 
+        /** 순번 발번기의 마지막 값 — 시퀀스 이름은 표 이름으로 찾는다(검색 경로를 따라 풀린다). 한 번도 안 불렸으면 null → 0 */
+        private const val LAST_INSERT_ORDER =
+            "SELECT coalesce(pg_sequence_last_value(pg_get_serial_sequence('metric_sample', 'insert_order')::regclass), 0)"
         private const val UPSERT_RECEIPT =
             """INSERT INTO metric_server_receipt (server, last_received_ms) VALUES (?, ?)
                ON CONFLICT (server) DO UPDATE SET last_received_ms = GREATEST(metric_server_receipt.last_received_ms, EXCLUDED.last_received_ms)"""

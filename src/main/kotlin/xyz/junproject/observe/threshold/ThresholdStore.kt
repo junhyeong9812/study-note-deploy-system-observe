@@ -98,7 +98,7 @@ data class TargetQueue(val target: AlertTarget, val lastAttemptAt: Instant?, val
 class ThresholdStore(
     private val jdbc: JdbcTemplate,
     /**
-     * 리뷰 루프 3(§16.2): 어드민 조회([firing])가 쓰는 연결 — 읽기 문장과 그 길의 표 확인까지 판정 · 알림용 [jdbc] 를 쓰지 않게.
+     * §16.2: 어드민 조회([firing])가 쓰는 연결 — 읽기 문장과 그 길의 표 확인까지 판정 · 알림용 [jdbc] 를 쓰지 않게.
      * 기본값은 [jdbc](지금 동작과 같다 — 배선에서 조회용 풀을 넘긴다). [failpoint] 를 끝 람다로 넘기는 호출이 그대로 되게 그 앞에 둔다
      */
     private val query: JdbcTemplate = jdbc,
@@ -110,8 +110,11 @@ class ThresholdStore(
     private val creatingSchema = Any()
 
     /** 표를 만든다(있으면 그대로). 실패는 예외 */
-    fun createSchema() {
-        jdbc.execute(
+    fun createSchema() = createSchema(jdbc)
+
+    /** [using] 연결로 표를 만든다 — 어드민 조회([firing])의 길은 조회용 연결로 확인한다(§16.2) */
+    private fun createSchema(using: JdbcTemplate) {
+        using.execute(
             """CREATE TABLE IF NOT EXISTS resource_rule_state (
                  server           text             NOT NULL,
                  rule             text             NOT NULL,
@@ -123,7 +126,7 @@ class ThresholdStore(
                  last_value       double precision,
                  PRIMARY KEY (server, rule, target))"""
         )
-        jdbc.execute(
+        using.execute(
             """CREATE TABLE IF NOT EXISTS resource_alert_outbox (
                  id              bigint  GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
                  event_id        text    NOT NULL UNIQUE,
@@ -141,8 +144,8 @@ class ThresholdStore(
                  last_attempt_ms bigint,
                  rejected_ms     bigint)"""
         )
-        jdbc.execute("CREATE INDEX IF NOT EXISTS resource_alert_outbox_pending ON resource_alert_outbox (created_ms, id) WHERE rejected_ms IS NULL")
-        jdbc.execute(
+        using.execute("CREATE INDEX IF NOT EXISTS resource_alert_outbox_pending ON resource_alert_outbox (created_ms, id) WHERE rejected_ms IS NULL")
+        using.execute(
             """CREATE TABLE IF NOT EXISTS resource_alert_target (
                  server          text   NOT NULL,
                  rule_group      text   NOT NULL,
@@ -154,8 +157,8 @@ class ThresholdStore(
     }
 
     /** 처음 닿을 때 만든다 — 뜬 직후 DB 가 없었어도 다음 바퀴 · 조회가 만든다 */
-    private fun ensureSchema() {
-        if (!schemaReady) synchronized(creatingSchema) { if (!schemaReady) createSchema() }
+    private fun ensureSchema(using: JdbcTemplate = jdbc) {
+        if (!schemaReady) synchronized(creatingSchema) { if (!schemaReady) createSchema(using) }
     }
 
     /** 뜬 직후 한 번 미리 만든다 — 실패는 예외로(부르는 쪽이 로그만 남기고 삼킨다) */
@@ -290,9 +293,10 @@ class ThresholdStore(
         )!!
     }
 
+    /** 지금 넘어 있는 규칙 — 조회용 연결로(표 확인까지), 커밋된 판정 상태를 읽는다(§16.2 — 판정 · 알림 연결이 다 잡혀도 답한다) */
     override fun firing(): List<FiringRule> {
-        ensureSchema()
-        return jdbc.query("SELECT * FROM resource_rule_state WHERE firing", { row, _ -> row.toRuleState() })
+        ensureSchema(query)
+        return query.query("SELECT * FROM resource_rule_state WHERE firing", { row, _ -> row.toRuleState() })
             .map { state ->
                 FiringRule(state.server, state.rule.wireName, state.targetName.takeIf { state.rule == ResourceRule.RESTARTS },
                     (if (state.rule == ResourceRule.DISK_CRITICAL) AlertSeverity.CRITICAL else AlertSeverity.WARNING).wireName,

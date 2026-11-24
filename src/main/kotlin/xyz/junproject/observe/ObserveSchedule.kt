@@ -172,8 +172,14 @@ class ObserveSchedule(
         return runCatching { maintenance.rollUpBuckets(now) }
             .onSuccess {
                 if (it.computed > 0) log.info("observe:observe:rolled up {} metric buckets", it.computed)
-                metricRollup = MetricRollupResult(now, it.computed, null, failedBuckets = it.failed)
-                metricRollupSuccessAt = now
+                if (it.failed == 0) {
+                    // 실패한 구간이 하나도 없는 바퀴만 성공이다(§16.2) — 성공 시각을 올리고 사유를 비운다
+                    metricRollup = MetricRollupResult(now, it.computed, null)
+                    metricRollupSuccessAt = now
+                } else {
+                    // 일부만 실패해도 성공이 아니다 — 성공 시각은 그대로, 사유에 실패한 구간 수와 첫 실패의 종류
+                    metricRollup = MetricRollupResult(now, it.computed, "${it.failed} buckets failed: ${it.firstFailure ?: "unknown"}", failedBuckets = it.failed)
+                }
             }
             .onFailure {
                 log.error("observe:observe:metric rollup failed: {}: {}", it.javaClass.simpleName, it.message?.take(200))

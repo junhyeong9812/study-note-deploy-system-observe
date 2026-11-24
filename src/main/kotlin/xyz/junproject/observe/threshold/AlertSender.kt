@@ -113,19 +113,25 @@ class AlertDispatcher(
         // 대상의 차례: 시도한 적 없는 대상(그끼리는 머리가 오래된 순) → 마지막 시도가 오래된 대상
         val queues = queue.pendingByTarget(batchSize).filter { it.alerts.isNotEmpty() }.sortedWith(
             compareBy<TargetQueue>({ it.lastAttemptAt != null }, { it.lastAttemptAt }, { it.alerts.first().alert.createdAt }, { it.alerts.first().id }))
-        rounds@ for (targetQueue in queues) {
-            // 머리가 전달 · 거절이면 그 대상의 다음 건이 머리가 된다. "다시 시도"면 그 대상은 이번 바퀴에 끝
-            for (queued in targetQueue.alerts) {
-                if (delivered + retrying + rejected >= batchSize) break@rounds
+        // 대상을 돌아가며 한 건씩(§16.2): 차례대로 대상마다 머리 한 건, 다 돌면 처음 대상으로 돌아가 다음 건. 같은 대상 안의 순서는 그대로,
+        // "다시 시도"가 난 대상은 그 바퀴에서 빠진다 — 한 대상에 알림이 많이 밀려도 다른 대상이 그 뒤에서 기다리지 않는다
+        val remaining = queues.map { ArrayDeque(it.alerts) }.toMutableList()
+        sending@ while (remaining.isNotEmpty()) {
+            val iterator = remaining.iterator()
+            while (iterator.hasNext()) {
+                val line = iterator.next()
+                if (delivered + retrying + rejected >= batchSize) break@sending
                 // 한 건의 기한을 더해 바퀴의 상한을 넘게 되면 새로 보내지 않는다 — 바퀴 전체가 상한을 넘지 않게
-                if (Duration.between(started, clock()).plus(sendTimeout) > roundBudget) break@rounds
+                if (Duration.between(started, clock()).plus(sendTimeout) > roundBudget) break@sending
+                val queued = line.removeFirst()
                 val outcome = runCatching { sender.send(queued.alert) }.getOrElse { SendOutcome.Retry(it.javaClass.simpleName) }
                 val at = clock()                                       // 표시의 시각 = 그 건을 보낸 시각(대상의 마지막 시도)
                 when (outcome) {
                     SendOutcome.Delivered -> { queue.markDelivered(queued.id, at); delivered++ }
-                    is SendOutcome.Retry -> { queue.markRetry(queued.id, at, outcome.reason); retrying++; continue@rounds }
+                    is SendOutcome.Retry -> { queue.markRetry(queued.id, at, outcome.reason); retrying++; line.clear() }
                     is SendOutcome.Rejected -> { queue.markRejected(queued.id, at, outcome.reason); rejected++ }
                 }
+                if (line.isEmpty()) iterator.remove()
             }
         }
         DispatchOutcome(true, delivered, retrying, rejected)

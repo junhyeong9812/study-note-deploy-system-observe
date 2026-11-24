@@ -145,15 +145,20 @@ class ObserveConfiguration {
         @Value("\${observe.db.password}") password: String,
     ): MetricStore {
         val ingest = pool("observe-metric-ingest", url, user, password, size = 2, statementTimeoutMs = 30_000)
-        val query = pool("observe-metric-query", url, user, password, size = 2, statementTimeoutMs = 10_000)
         val health = pool("observe-metric-health", url, user, password, size = 1, statementTimeoutMs = 2_000, connectionTimeoutMs = 2_000, validationTimeoutMs = 1_000)
         val healthDetail = pool("observe-metric-health-detail", url, user, password, size = 1, statementTimeoutMs = 2_000, connectionTimeoutMs = 2_000,
             validationTimeoutMs = 1_000)
-        return MetricStore(JdbcTemplate(ingest), JdbcTemplate(query), JdbcTemplate(health), judge = thresholdJdbc(url, user, password),
+        return MetricStore(JdbcTemplate(ingest), metricQueryJdbc(url, user, password), JdbcTemplate(health), judge = thresholdJdbc(url, user, password),
             healthDetail = JdbcTemplate(healthDetail))
     }
 
     private var sharedThresholdJdbc: JdbcTemplate? = null
+    private var sharedMetricQueryJdbc: JdbcTemplate? = null
+
+    /** 지표 조회 풀(2개 · 문장 10초) — 어드민 조회(지표 · `firing`)가 쓴다. 지표 저장소와 판정 · 알림 저장소의 `firing` 이 나눠 쓴다(§16.2) */
+    @Synchronized
+    private fun metricQueryJdbc(url: String, user: String, password: String): JdbcTemplate = sharedMetricQueryJdbc
+        ?: JdbcTemplate(pool("observe-metric-query", url, user, password, size = 2, statementTimeoutMs = 10_000)).also { sharedMetricQueryJdbc = it }
 
     /**
      * 판정 · 알림 풀(5개 · 문장 10초) — 판정 한 바퀴(잠금 트랜잭션 1 + 표본 읽기 1) · 보내기(잠금 1 + 표시 1) · firing 이 함께 쓴다.
@@ -217,13 +222,13 @@ class ObserveConfiguration {
         return constructor.callBy(given).also { log.info("observe:observe:resource thresholds {}", it) }
     }
 
-    /** 판정 · 알림 표 — 판정 · 알림 풀([thresholdJdbc]). 헬스는 이 풀을 쓰지 않는다(바퀴가 세어 둔 건수만) */
+    /** 판정 · 알림 표 — 판정 · 알림 풀([thresholdJdbc]). 어드민의 `firing` 은 지표 조회 풀로(§16.2). 헬스는 어느 쪽도 쓰지 않는다(바퀴가 세어 둔 건수만) */
     @Bean
     fun thresholdStore(
         @Value("\${observe.db.url}") url: String,
         @Value("\${observe.db.user}") user: String,
         @Value("\${observe.db.password}") password: String,
-    ) = ThresholdStore(thresholdJdbc(url, user, password))
+    ) = ThresholdStore(thresholdJdbc(url, user, password), query = metricQueryJdbc(url, user, password))
 
     /** 뜬 직후 판정 · 알림 표를 미리 만든다(최선 노력 — 실패해도 첫 바퀴 · 첫 조회가 다시 만든다) */
     @EventListener(ApplicationReadyEvent::class)

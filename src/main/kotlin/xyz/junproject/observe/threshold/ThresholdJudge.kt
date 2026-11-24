@@ -145,7 +145,7 @@ data class JudgeResult(val states: List<RuleState>, val events: List<ResourceAle
  * 창 안의 표본(null 제외)이 기대 수(창 ÷ 간격)의 절반에 못 미치거나 창을 덮지 못하면(가장 오랜 표본이 `now − 창 + 간격` 보다 늦음)
  * 그 규칙은 판정을 미루고 상태를 그대로 둔다(결측은 넘음도 해소도 아니다). 재시작 넘음은 창을 덮지 않아도 되지만 절반 규칙은 따른다.
  * 넘어 있는 재시작 규칙의 컨테이너 ID 가 창 안에 하나도 없고 그 서버의 표본은 절반 이상이면(새 컨테이너로 바뀜) 해소다.
- * 리뷰 루프 3(§16.2 — 구현 전): "그 ID 가 없음"과 재시작 횟수의 증가량은 **컨테이너 갈래가 온전한 표본만**(`missing` 에 `containers` · `containers_truncated`
+ * §16.2: "그 ID 가 없음"과 재시작 횟수의 증가량은 **컨테이너 갈래가 온전한 표본만**(`missing` 에 `containers` · `containers_truncated`
  * 가 없음) 보고 센다 — 잘린 표본의 값은 넘음 · 해소 어느 쪽도 좌우하지 않는다. 해소의 까닭은 해소 알림의 글(title · detail)로 가른다:
  * 컨테이너가 바뀌어 해소하면 그 글에 "바뀜"이 있고, 횟수가 늘지 않아 해소한 글과 다르다(해소된 상태 줄은 남기지 않는다 — 배포마다 쌓이지 않게).
  */
@@ -299,20 +299,21 @@ class ThresholdJudge(private val thresholds: ResourceThresholds = ResourceThresh
             val window = thresholds.restartWindow
             val start = now.minus(window)
             val inWindow = samples.filter { it.measuredAt.isAfter(start) }
-            // 컨테이너 갈래가 온전한 표본(읽지 못했거나 잘린 것이 아님) — "그 ID 가 사라짐"은 이것으로만 판단한다(§15 · §15.1)
+            // 컨테이너 갈래가 온전한 표본(읽지 못했거나 잘린 것이 아님)만 센다(§16.2) — "그 ID 가 사라짐"도, 재시작 횟수의 증가량도.
+            // 잘린 표본의 값은 넘음 · 해소 어느 쪽도 좌우하지 않는다
             val intact = inWindow.filter { sample -> sample.missing.none { it in INCOMPLETE_CONTAINERS } }
-            val seenIds = inWindow.flatMapTo(HashSet()) { sample -> sample.containers.map { it.id } }
-            // 컨테이너 ID 마다 (측정 시각, 재시작 횟수, 이름) — 새 ID 는 새 기준(배포는 재시작이 아니다)
+            val seenIds = intact.flatMapTo(HashSet()) { sample -> sample.containers.map { it.id } }
+            // 컨테이너 ID 마다 (재시작 횟수, 이름) — 새 ID 는 새 기준(배포는 재시작이 아니다)
             val byContainer = LinkedHashMap<String, MutableList<Pair<Long, String>>>()
-            for (sample in inWindow) for (container in sample.containers) {
+            for (sample in intact) for (container in sample.containers) {
                 val restarts = container.restarts ?: continue
                 byContainer.getOrPut(container.id) { mutableListOf() } += restarts to container.name
             }
             val firing = states.values.filter { it.server == server && it.rule == ResourceRule.RESTARTS && it.firing }
             for (state in firing) {
                 if (state.target !in seenIds) {
-                    // 울리던 컨테이너가 사라지고 서버는 계속 보낸다 — 새 컨테이너로 바뀌었다(§14). 온전한 표본이 절반 이상이고
-                    // 가장 최근 표본도 온전할 때만 — 컨테이너를 읽지 못한 것은 넘음도 해소도 아니다(보류)
+                    // 울리던 컨테이너가 온전한 표본에서 사라지고 서버는 계속 보낸다 — 새 컨테이너로 바뀌었다(§14). 온전한 표본이 절반 이상이고
+                    // 가장 최근 표본도 온전할 때만 — 컨테이너를 읽지 못한 것은 넘음도 해소도 아니다(보류). 해소 글에 까닭("바뀜")을 적는다
                     if (enough(intact.size, window) && inWindow.lastOrNull()?.missing?.none { it in INCOMPLETE_CONTAINERS } == true) {
                         resolve(state, null, "$server 컨테이너 ${state.targetName} 재시작 해소 — 컨테이너가 바뀜",
                             "최근 ${minutes(window)} 에 그 컨테이너(${state.target})가 보이지 않는다")
@@ -322,7 +323,7 @@ class ThresholdJudge(private val thresholds: ResourceThresholds = ResourceThresh
                 val counts = byContainer[state.target] ?: continue            // 보이지만 재시작 횟수를 읽지 못했다 — 보류
                 if (!enough(counts.size, window)) continue
                 val increase = (counts.last().first - counts.first().first).toDouble()
-                if (increase <= 0) resolve(state, 0.0, "$server 컨테이너 ${state.targetName} 재시작 해소", "최근 ${minutes(window)} 동안 재시작이 늘지 않았다")
+                if (increase <= 0) resolve(state, 0.0, "$server 컨테이너 ${state.targetName} 재시작 해소 — 재시작이 멈춤", "최근 ${minutes(window)} 동안 재시작이 늘지 않았다")
                 else keep(state, increase, "$server 컨테이너 ${state.targetName} 재시작 반복 — ${minutes(window)}에 +${increase.toLong()}",
                     "재시작 횟수 ${counts.first().first} → ${counts.last().first}")
             }
