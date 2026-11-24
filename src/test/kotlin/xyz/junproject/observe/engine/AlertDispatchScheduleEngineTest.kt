@@ -15,6 +15,7 @@ import org.springframework.test.annotation.DirtiesContext
 import org.springframework.test.context.DynamicPropertyRegistry
 import org.springframework.test.context.DynamicPropertySource
 import tools.jackson.databind.json.JsonMapper
+import xyz.junproject.observe.threshold.ThresholdRound
 import java.net.InetSocketAddress
 import java.net.URI
 import java.net.http.HttpClient
@@ -38,6 +39,7 @@ import java.util.concurrent.atomic.AtomicInteger
 class AlertDispatchScheduleEngineTest {
     @Autowired private lateinit var environment: Environment
     @Autowired private lateinit var redis: StringRedisTemplate
+    @Autowired private lateinit var thresholdRound: ThresholdRound
 
     private val http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build()
     private val base get() = "http://127.0.0.1:${environment.getProperty("local.server.port")}"
@@ -66,17 +68,23 @@ class AlertDispatchScheduleEngineTest {
         while (inFlight.get() == 0 && System.nanoTime() < deadline) Thread.sleep(50)
         assertTrue(inFlight.get() > 0, "알림 서버가 보내기를 받지 않았다 — 넘음이 판정되지 않았거나 보내지 않는다")
 
-        // 알림 서버가 한 건을 붙잡고 있는 2.5초 동안 판정 시각이 몇 번 바뀌는가
-        val seen = mutableSetOf<String>()
-        val watchEnd = System.nanoTime() + Duration.ofMillis(2_500).toNanos()
-        var sawInFlight = 0
-        while (System.nanoTime() < watchEnd) {
-            lastJudgedAt()?.let { seen += it }
-            if (inFlight.get() > 0) sawInFlight++
-            Thread.sleep(100)
+        // 보내는 중인 동안(최대 약 10초 — 넘음 넷 × 3초) 판정이 제 주기에 도는지 본다. 판정 시각은 판정 바퀴가 직접 남긴 값(ThresholdRound.lastJudgedAt)을
+        // 이 프로세스 안에서 50ms 마다 읽는다 — 헬스(HTTP)를 거치지 않아 헬스의 지연과 섞이지 않는다. 멈춤은 "읽은 순간 마지막 판정이 얼마나 오래됐나"로 본다.
+        // 판정 간격은 200ms 이므로 2.5초(12배 넘게)는 넉넉하다 — 한 건 보내기(3초) 동안이라도 판정이 막히면 넘는다.
+        val observations = mutableListOf<Duration>()
+        val watchEnd = System.nanoTime() + Duration.ofSeconds(10).toNanos()
+        var lastSending = System.nanoTime()
+        // 보내는 중 — 지금 붙잡힌 건이 있거나, 건과 건 사이의 짧은 틈(1초 미만)
+        while (System.nanoTime() - lastSending < Duration.ofSeconds(1).toNanos() && System.nanoTime() < watchEnd) {
+            if (inFlight.get() > 0) lastSending = System.nanoTime()
+            thresholdRound.lastJudgedAt?.let { observations += Duration.between(it, Instant.now()) }
+            Thread.sleep(50)
         }
-        assertTrue(sawInFlight > 0, "지켜보는 동안 보내는 중인 알림이 없었다 — 시험이 성립하지 않는다")
-        assertTrue(seen.size >= 3, "보내는 3초 동안 판정이 멈췄다(판정 시각 ${seen.size}개: $seen)")
+        println("observe-test dispatch-schedule observations=${observations.size} stalest(ms)=${observations.maxOrNull()?.toMillis()} sent=${sentCount.get()}")
+        assertTrue(observations.size >= 3, "보내는 동안 판정 시각을 ${observations.size}번밖에 읽지 못했다 — 보내는 중이 너무 짧았거나 판정이 한 번도 돌지 않았다(관찰 부족 — 판정 멈춤과 따로 본다)")
+        val stalest = observations.max()
+        assertTrue(stalest < Duration.ofMillis(2_500),
+            "보내는 동안 판정이 멈췄다 — 물은 순간 마지막 판정이 ${stalest.toMillis()}ms 전(판정 간격 200ms, 관찰 ${observations.size}번)")
     }
 
     @AfterAll
@@ -97,11 +105,13 @@ class AlertDispatchScheduleEngineTest {
         private val administration by lazy { JdbcTemplate(administrationPool) }
         private val json = JsonMapper.builder().build()
         private val inFlight = AtomicInteger()
+        private val sentCount = AtomicInteger()
 
         /** 알림 서버 대역 — 한 건에 3초 걸려 202 */
         private val alertServer: HttpServer = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {
             createContext("/events") { exchange ->
                 inFlight.incrementAndGet()
+                sentCount.incrementAndGet()
                 try {
                     exchange.requestBody.readAllBytes()
                     Thread.sleep(3_000)
