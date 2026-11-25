@@ -15,7 +15,14 @@ object TrafficDistribution {
      * [percent] 분위수가 든 칸(보간하지 않는다). 순위 = ceil(합 × percent / 100)(최소 1), 앞에서부터 센 수가 순위에 닿는 첫 칸.
      * 합이 0 이면 null.
      */
-    fun quantile(buckets: List<Long>, percent: Int): TrafficQuantile? = TODO("뼈대: 구현 워커가 채운다")
+    fun quantile(buckets: List<Long>, percent: Int): TrafficQuantile? {
+        val total = buckets.sum()
+        if (total == 0L) return null
+        val rank = Math.ceilDiv(total * percent, 100L).coerceAtLeast(1)
+        var seen = 0L
+        val index = buckets.indexOfFirst { seen += it; seen >= rank }
+        return if (index < UPPER_BOUNDS_MS.size) TrafficQuantile(UPPER_BOUNDS_MS[index], null) else TrafficQuantile(null, UPPER_BOUNDS_MS.last())
+    }
 }
 
 /**
@@ -42,8 +49,9 @@ object TrafficReadProgress {
     val RECEIVE_DELAY: Duration = Duration.ofMinutes(2)
 
     /** 칸이 [cellEnd] 에서 끝날 때 "채우는 중"인가 — `읽기 진도 − 30초` 보다 뒤에서 끝나면(같으면 아니다). 읽기 진도가 없으면 늘 채우는 중 */
-    fun isFilling(cellEnd: Instant, readProgress: Instant?): Boolean = TODO("뼈대: 구현 워커가 채운다")
+    fun isFilling(cellEnd: Instant, readProgress: Instant?): Boolean = readProgress == null || cellEnd.isAfter(readProgress.minus(FILLING_MARGIN))
 
     /** 읽기 진도가 마지막으로 나아간 뒤 2분 **넘게** 지났으면 "수신 지연"(정확히 2분은 아니다). 나아간 적이 없으면 지연 */
-    fun isReceiveDelayed(progressAdvancedAt: Instant?, now: Instant): Boolean = TODO("뼈대: 구현 워커가 채운다")
+    fun isReceiveDelayed(progressAdvancedAt: Instant?, now: Instant): Boolean =
+        progressAdvancedAt == null || now.isAfter(progressAdvancedAt.plus(RECEIVE_DELAY))
 }

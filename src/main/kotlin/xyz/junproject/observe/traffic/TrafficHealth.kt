@@ -1,5 +1,7 @@
 package xyz.junproject.observe.traffic
 
+import org.slf4j.LoggerFactory
+import xyz.junproject.observe.collect.HealthReads
 import java.time.Duration
 import java.time.Instant
 
@@ -17,7 +19,6 @@ import java.time.Instant
  * - `servers`: `[{server, read_progress_at, receive_delayed, sequence_gaps, last_received_at, first_seq_seen}]`(읽지 못하면 빈 목록 · 없는 값은 "" · -1)
  * - `last_rollup_at` · `last_rollup_failure` · `last_rollup_failed_buckets` · `last_retention_at` · `last_retention_entries_deleted` ·
  *   `last_retention_segments_deleted` · `last_retention_requests_deleted` · `last_retention_rollup_deleted` · `last_retention_failure`
- * 뼈대: 본문은 구현 워커가 채운다.
  */
 class TrafficHealth(
     private val collector: TrafficCollector,
@@ -32,6 +33,73 @@ class TrafficHealth(
     private val startedAt: Instant = Instant.now(),
     private val readBudget: Duration = Duration.ofSeconds(2),
 ) {
+    private val log = LoggerFactory.getLogger("observe")
+    @Volatile private var lastLoggedProblem: String? = null
+
     /** `traffic` 객체 — 예외를 내지 않는다 */
-    fun report(now: Instant): Map<String, Any> = TODO("뼈대: 구현 워커가 채운다")
+    fun report(now: Instant): Map<String, Any> {
+        val lastLoopAt = collector.lastLoopAt
+        val failure = collector.lastFailure
+        val deadline = System.nanoTime() + readBudget.toNanos()
+        val pendingRead = HealthReads.start(unacknowledged)
+        val storedRead = HealthReads.start(latestStoredAt)
+        val lagRead = HealthReads.start(lag)
+        val progressRead = HealthReads.start(serverProgress)
+        val pending = HealthReads.await(pendingRead, deadline)
+        val stored = HealthReads.await(storedRead, deadline).recoverCatching { if (HealthReads.isTableMissing(it)) null else throw it }
+        val problems = listOfNotNull(pending.exceptionOrNull()?.let { "redis" to it }, stored.exceptionOrNull()?.let { "database" to it })
+        val detail = problems.joinToString("; ") { (where, error) -> "$where ${error.javaClass.simpleName}" }.ifEmpty { null }
+        if (detail != null && detail != lastLoggedProblem) log.warn("observe:observe:traffic health check unreachable: {}", detail)
+        lastLoggedProblem = detail
+        val status = when {
+            problems.isNotEmpty() -> "unreachable"
+            failure != null -> "failing"
+            lastLoopAt != null && Duration.between(lastLoopAt, now) < stallAfter -> "ok"
+            lastLoopAt == null && Duration.between(startedAt, now) < stallAfter -> "starting"
+            else -> "stalled"
+        }
+        val dropped = collector.droppedCounts()
+        val cellDrops = collector.cellDropCounts()
+        val rollup = runCatching(lastRollup).getOrNull()
+        val retention = runCatching(lastRetention).getOrNull()
+        val servers = HealthReads.await(progressRead, deadline).getOrNull().orEmpty().map {
+            mapOf(
+                "server" to it.server,
+                "read_progress_at" to (it.readProgressAt?.toString() ?: ""),
+                "receive_delayed" to TrafficReadProgress.isReceiveDelayed(it.progressAdvancedAt, now),
+                "sequence_gaps" to it.sequenceGaps,
+                "last_received_at" to (it.lastReceivedAt?.toString() ?: ""),
+                "first_seq_seen" to (it.firstSeqSeen ?: -1L),
+            )
+        }
+        return mapOf(
+            "status" to status,
+            "last_loop_at" to (lastLoopAt?.toString() ?: ""),
+            "last_stored_at" to (stored.getOrNull()?.toString() ?: ""),
+            "stored_since_start" to collector.storedTotal,
+            "unacknowledged" to (pending.getOrNull() ?: -1L),
+            "lag" to (HealthReads.await(lagRead, deadline).getOrNull() ?: -1L),
+            "failure" to (detail ?: failure ?: ""),
+            "dropped" to TrafficDropReason.entries.associate { it.wireName to (dropped[it] ?: 0L) },
+            "dropped_total" to dropped.values.sum(),
+            "skipped_other_kind" to collector.skippedOtherKind,
+            "duplicates" to collector.duplicates,
+            "cells_dropped" to TrafficCellDrop.entries.associate { it.wireName to (cellDrops[it] ?: 0L) },
+            "at_ahead" to collector.atAhead,
+            "at_too_old" to collector.atTooOld,
+            "requests_rejected" to collector.requestsRejected,
+            "last_store_failure" to (collector.lastStoreFailure ?: ""),
+            "last_store_failure_at" to (collector.lastStoreFailureAt?.toString() ?: ""),
+            "servers" to servers,
+            "last_rollup_at" to (runCatching(lastRollupSuccessAt).getOrNull()?.toString() ?: ""),
+            "last_rollup_failure" to (rollup?.failure ?: ""),
+            "last_rollup_failed_buckets" to (rollup?.failedBuckets ?: -1),
+            "last_retention_at" to (retention?.ranAt?.toString() ?: ""),
+            "last_retention_entries_deleted" to (retention?.deletion?.entriesDeleted ?: -1),
+            "last_retention_segments_deleted" to (retention?.deletion?.segmentsDeleted ?: -1),
+            "last_retention_requests_deleted" to (retention?.deletion?.requestsDeleted ?: -1),
+            "last_retention_rollup_deleted" to (retention?.deletion?.rollupDeleted ?: -1),
+            "last_retention_failure" to (retention?.failure ?: ""),
+        )
+    }
 }

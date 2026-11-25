@@ -37,6 +37,10 @@ import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler
 import java.time.Instant
 import java.util.concurrent.CopyOnWriteArrayList
 import xyz.junproject.observe.threshold.SilentGate
+import xyz.junproject.observe.traffic.TrafficCollector
+import xyz.junproject.observe.traffic.TrafficHealth
+import xyz.junproject.observe.traffic.TrafficStore
+import xyz.junproject.observe.traffic.TrafficStreamSource
 
 /** 조립 — 연결 정보는 환경변수에서. DB 비밀번호 같은 값은 로그에 내지 않는다. */
 @Configuration
@@ -91,13 +95,14 @@ class ObserveConfiguration {
     }
 
     /**
-     * 예약 실행기 — 스레드 넷(5분 평균 · 판정 · 보내기 · 하루 한 번 삭제가 서로 기다리지 않게, §15.1). 스프링 부트의 기본(가상 스레드 설정일 때의
+     * 예약 실행기 — 스레드 여섯(지표 5분 평균 · 판정 · 보내기 · 하루 한 번 삭제 · 통신 5분 묶음 · 통신 삭제가 서로 기다리지 않게, §15.1 — 통신 표가 막혀
+     * 통신 쪽 예약이 문장 시간 제한까지 기다려도 기존 예약은 제 주기에 돈다). 스프링 부트의 기본(가상 스레드 설정일 때의
      * 실행기)은 고정 지연 작업을 한 줄로 돌려, 알림 한 건에 3초 걸리는 동안 판정이 멈췄다(실측 — `AlertDispatchScheduleEngineTest`).
      * 이 빈이 있으면 부트의 기본 실행기는 만들어지지 않는다. 닫힐 때 도는 작업을 기다리지 않는다(기존과 같다).
      */
     @Bean
     fun taskScheduler() = ThreadPoolTaskScheduler().apply {
-        poolSize = 4
+        poolSize = 6
         setThreadNamePrefix("observe-schedule-")
     }
 
@@ -279,10 +284,55 @@ class ObserveConfiguration {
      * `observe-traffic-health-detail` 1). 네 풀 모두 드라이버 설정 `logServerErrorDetail=false` — 드라이버 예외 글에 서버 오류의 상세(행의 값)와
      * 묶음 문장의 값이 실리지 않게(항목의 경로가 예외 글을 타고 로그에 새지 않게).
      * [gapWait] 는 `observe.traffic.gap-wait`(환경 변수 `TRAFFIC_GAP_WAIT`, 기본 `10m` — `DurationStyle` 꼴, 0 이하면 뜰 때 실패).
-     * 뼈대: 구현에서 `@Bean` 과 인자마다 `@Value`(`observe.db.url` · `observe.db.user` · `observe.db.password` · `observe.traffic.gap-wait:10m`)를 달고 본문을 채운다
-     * (뼈대에 달면 앱이 뜰 때 이 본문이 불린다). 이 이름과 인자는 엔진 테스트가 직접 부른다.
+     * 이 이름과 인자는 엔진 테스트가 직접 부른다.
      */
-    fun trafficStore(url: String, user: String, password: String, gapWait: String): xyz.junproject.observe.traffic.TrafficStore = TODO("뼈대: 구현 워커가 채운다")
+    @Bean
+    fun trafficStore(
+        @Value("\${observe.db.url}") url: String,
+        @Value("\${observe.db.user}") user: String,
+        @Value("\${observe.db.password}") password: String,
+        @Value("\${observe.traffic.gap-wait:10m}") gapWait: String,
+    ): TrafficStore {
+        val wait = DurationStyle.detectAndParse(gapWait.trim())
+        require(!wait.isNegative && !wait.isZero) { "observe.traffic.gap-wait 는 0 보다 길어야 한다" }
+        val quietUrl = url + (if ('?' in url) "&" else "?") + "logServerErrorDetail=false"
+        val ingest = pool("observe-traffic-ingest", quietUrl, user, password, size = 2, statementTimeoutMs = 30_000)
+        val query = pool("observe-traffic-query", quietUrl, user, password, size = 2, statementTimeoutMs = 10_000)
+        val health = pool("observe-traffic-health", quietUrl, user, password, size = 1, statementTimeoutMs = 2_000, connectionTimeoutMs = 2_000, validationTimeoutMs = 1_000)
+        val healthDetail = pool("observe-traffic-health-detail", quietUrl, user, password, size = 1, statementTimeoutMs = 2_000, connectionTimeoutMs = 2_000,
+            validationTimeoutMs = 1_000)
+        return TrafficStore(JdbcTemplate(ingest), JdbcTemplate(query), JdbcTemplate(health), JdbcTemplate(healthDetail), wait)
+    }
+
+    /** 뜬 직후 통신 표를 미리 만든다(최선 노력 — 실패해도 앱은 뜨고 수집 바퀴 · 첫 조회가 다시 만든다) */
+    @EventListener(ApplicationReadyEvent::class)
+    fun prepareTrafficSchema(event: ApplicationReadyEvent) {
+        try {
+            event.applicationContext.getBean(TrafficStore::class.java).prepareSchema()
+            log.info("observe:observe:traffic schema ready")
+        } catch (error: Exception) {
+            log.error("observe:observe:traffic schema failed — will retry on first use: {}", error.javaClass.simpleName)
+        }
+    }
+
+    /** 통신 스트림(규약 4.1 — 따로의 스트림 `traffic`) — 지표와 같은 소비자 그룹 코드를 스트림 이름만 달리해 쓴다 */
+    @Bean
+    fun trafficStreamSource(
+        redis: StringRedisTemplate,
+        @Value("\${observe.traffic.stream:traffic}") stream: String,
+        @Value("\${observe.traffic.group:observe}") group: String,
+    ): TrafficStreamSource {
+        log.info("observe:observe:collecting traffic stream '{}' as group '{}'", stream, group)
+        return TrafficStreamSource(RedisMetricStreamSource(redis, stream, group))
+    }
+
+    @Bean
+    fun trafficCollector(source: TrafficStreamSource, store: TrafficStore) = TrafficCollector(source, store)
+
+    @Bean
+    fun trafficHealth(collector: TrafficCollector, source: TrafficStreamSource, store: TrafficStore, schedule: ObserveSchedule) =
+        TrafficHealth(collector, { source.unacknowledgedCount() }, { source.lag() }, { store.latestStoredAt() }, { store.healthProgress() },
+            { schedule.lastTrafficRollup }, { schedule.lastTrafficRollupSuccessAt }, { schedule.lastTrafficRetention })
 
     @Bean
     fun logStreamSource(
@@ -298,7 +348,8 @@ class ObserveConfiguration {
     fun logCollector(source: RedisLogStreamSource, store: LogStore) = LogCollector(source, store)
 
     @Bean
-    fun collectorHealth(collector: LogCollector, source: RedisLogStreamSource, store: LogStore, schedule: ObserveSchedule, metricHealth: MetricHealth) =
+    fun collectorHealth(collector: LogCollector, source: RedisLogStreamSource, store: LogStore, schedule: ObserveSchedule, metricHealth: MetricHealth,
+                        trafficHealth: TrafficHealth) =
         CollectorHealth(collector, { source.unacknowledgedCount() }, { source.lag() }, { store.latestStoredAt() }, { schedule.lastRetention },
-            lastAuthRetention = { schedule.lastAuthRetention }, metrics = metricHealth)
+            lastAuthRetention = { schedule.lastAuthRetention }, metrics = metricHealth, traffic = trafficHealth)
 }

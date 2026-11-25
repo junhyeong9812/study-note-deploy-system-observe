@@ -32,6 +32,11 @@ observe:
     alert:
       silent-warm-up: ${METRICS_ALERT_SILENT_WARM_UP:3m}               # 끊김 판정은 뜬 지 이만큼 지나고 한 번 따라잡은 뒤부터(§15.1)
       silent-give-up-after: ${METRICS_ALERT_SILENT_GIVE_UP_AFTER:15m}  # 따라잡지 못해도 뜬 지 이만큼 지나면 판정한다
+  traffic:                                         # 통신 수치 — agent 가 같은 Redis 의 따로의 스트림으로 보낸다(통신 규약 4.1)
+    stream: ${TRAFFIC_STREAM:traffic}
+    group: ${TRAFFIC_GROUP:observe}
+    rollup-interval-ms: ${TRAFFIC_ROLLUP_INTERVAL_MS:60000}   # 5분 묶음 바퀴의 간격
+    gap-wait: ${TRAFFIC_GAP_WAIT:10m}                # 틈난 순번을 잃음으로 확정하기까지 기다리는 시간(뒤의 순번을 처음 받은 때부터)
   alert:                                           # 알림 서버 POST /events — 비우면 보내지 않고 못 보낸 알림으로 남는다
     events-url: ${ALERT_EVENTS_URL:}
     secret: ${ALERT_SECRET:}

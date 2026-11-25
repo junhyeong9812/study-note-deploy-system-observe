@@ -11,6 +11,29 @@ import java.sql.Types
 import java.time.Duration
 import java.time.Instant
 
+/**
+ * [table] 의 저장 순번(`insert_order` identity 칸) 발번기의 마지막 값과 그 전제(§16.3) — 지표 · 통신의 5분 묶음이 함께 쓴다.
+ * 번호를 하나씩 내줘야(캐시 1) 마지막 값이 "지금까지 내준 번호"다. 캐시가 크면 한 연결이 미리 받아 둔
+ * 번호를 나중에 쓰므로 그 값을 "이미 본 순번"으로 칠 수 없다. 캐시가 1 이 아니거나 값이 비어 오면(이름을 못 찾음 · 아직 내준 번호 없음) 예외 —
+ * 그 구간은 실패로 남고(평균도 "계산함" 표시도 없다) 원본은 지워지지 않는다. 권한이 없으면 읽기 자체가 예외다.
+ * 시퀀스는 표 이름으로 찾는다(검색 경로를 따라 풀린다). `pg_sequence` 는 누구나 읽는 목록이고, 값 읽기(`pg_sequence_last_value`)는 그 시퀀스의 권한이 있어야 한다.
+ */
+internal fun lastInsertOrder(jdbc: JdbcTemplate, table: String): Long {
+    val rows = jdbc.queryForList(
+        """SELECT sequence.seqcache AS cache_size, pg_sequence_last_value(sequence.seqrelid) AS last_value
+           FROM pg_sequence sequence
+           WHERE sequence.seqrelid = pg_get_serial_sequence(?, 'insert_order')::regclass""",
+        table,
+    )
+    val row = rows.singleOrNull() ?: throw InsertOrderSequenceUnusable("$table.insert_order 의 발번기를 찾지 못했다")
+    val cache = (row["cache_size"] as Number).toLong()
+    if (cache != 1L) throw InsertOrderSequenceUnusable("$table.insert_order 의 발번기 캐시가 $cache 이다(1 이어야 한다)")
+    return (row["last_value"] as Number?)?.toLong() ?: throw InsertOrderSequenceUnusable("$table.insert_order 의 발번기 값이 비어 있다")
+}
+
+/** 발번기 읽기의 전제가 서지 않음 — 그 구간의 계산을 실패로(헬스의 실패 사유에 이 이름이 나온다) */
+internal class InsertOrderSequenceUnusable(message: String) : IllegalStateException(message)
+
 /** 수집 쪽이 쓰는 면 */
 interface MetricSink {
     /** 표를 만든다(있으면 그대로) — 추가만, 기존 `log_entry` · `auth_*` 는 건드리지 않는다. 실패는 예외. */
@@ -500,22 +523,6 @@ class MetricStore(
      * "다시 계산할 것"이 되고 원본 삭제의 조건(그때 본 순번 ≥ 그 구간의 마지막 순번)도 서지 않는다. 같은 구간을 두 자리가 함께 계산하면
      * 표시 줄을 먼저 쓴 쪽이 커밋할 때까지 다른 쪽이 그 줄에서 기다렸다가 이어서 덮어쓴다.
      */
-    /**
-     * 발번기의 마지막 값과 그 전제(§16.3) — 번호를 하나씩 내줘야(캐시 1) 마지막 값이 "지금까지 내준 번호"다. 캐시가 크면 한 연결이 미리 받아 둔
-     * 번호를 나중에 쓰므로 그 값을 "이미 본 순번"으로 칠 수 없다. 캐시가 1 이 아니거나 값이 비어 오면(이름을 못 찾음 · 아직 내준 번호 없음) 예외 —
-     * 그 구간은 실패로 남고(평균도 "계산함" 표시도 없다) 원본은 지워지지 않는다. 권한이 없으면 읽기 자체가 예외다.
-     */
-    private fun lastInsertOrder(): Long {
-        val rows = ingest.queryForList(INSERT_ORDER_SEQUENCE)
-        val row = rows.singleOrNull() ?: throw InsertOrderSequenceUnusable("metric_sample.insert_order 의 발번기를 찾지 못했다")
-        val cache = (row["cache_size"] as Number).toLong()
-        if (cache != 1L) throw InsertOrderSequenceUnusable("metric_sample.insert_order 의 발번기 캐시가 $cache 이다(1 이어야 한다)")
-        return (row["last_value"] as Number?)?.toLong() ?: throw InsertOrderSequenceUnusable("metric_sample.insert_order 의 발번기 값이 비어 있다")
-    }
-
-    /** 발번기 읽기의 전제가 서지 않음 — 그 구간의 계산을 실패로(헬스의 실패 사유에 이 이름이 나온다) */
-    private class InsertOrderSequenceUnusable(message: String) : IllegalStateException(message)
-
     private fun rollUpOne(server: String, bucketStart: Long, now: Instant) {
         val bucket = BUCKET.toMillis()
         transaction.executeWithoutResult {
@@ -523,7 +530,7 @@ class MetricStore(
             // 지금까지의 저장 순번 — 표를 훑지 않고 순번 발번기(identity 칸의 시퀀스)의 마지막 값을 읽는다(§16.2). 잠금을 쥔 동안에는
             // 진행 중인 저장이 없다(INSERT 는 표의 ROW EXCLUSIVE 잠금을 얻은 뒤에야 번호를 받는다) — 그래서 이 값은 저장된 모든 원본의 순번 이상이다.
             // 되돌려진 저장이 번호를 써 버려 더 커도, 뒤의 저장은 그보다 큰 번호를 받는다
-            val seen = lastInsertOrder()
+            val seen = lastInsertOrder(ingest, "metric_sample")
             ingest.update(
                 """INSERT INTO metric_rollup_bucket (server, bucket_ms, computed_ms, insert_order_seen) VALUES (?,?,?,?)
                    ON CONFLICT (server, bucket_ms) DO UPDATE SET computed_ms = EXCLUDED.computed_ms, insert_order_seen = EXCLUDED.insert_order_seen""",
@@ -615,14 +622,6 @@ class MetricStore(
         const val BUCKETS_PER_ROUND = 200
         private val log = org.slf4j.LoggerFactory.getLogger("observe")
 
-        /**
-         * 순번 발번기의 캐시와 마지막 값 — 시퀀스는 표 이름으로 찾는다(검색 경로를 따라 풀린다). 못 찾으면 줄이 없고, 아직 내준 번호가 없으면 값이 null.
-         * `pg_sequence` 는 누구나 읽는 목록이고, 값 읽기(`pg_sequence_last_value`)는 그 시퀀스의 권한이 있어야 한다(없으면 예외)
-         */
-        private const val INSERT_ORDER_SEQUENCE =
-            """SELECT sequence.seqcache AS cache_size, pg_sequence_last_value(sequence.seqrelid) AS last_value
-               FROM pg_sequence sequence
-               WHERE sequence.seqrelid = pg_get_serial_sequence('metric_sample', 'insert_order')::regclass"""
         private const val UPSERT_RECEIPT =
             """INSERT INTO metric_server_receipt (server, last_received_ms) VALUES (?, ?)
                ON CONFLICT (server) DO UPDATE SET last_received_ms = GREATEST(metric_server_receipt.last_received_ms, EXCLUDED.last_received_ms)"""
