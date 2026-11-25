@@ -34,17 +34,23 @@ class VisitHealthTest {
     private var tableMissing = false
     private var latestInDatabase: Instant? = null
     private var retention: RetentionResult? = null
+    private var oldestInDatabase: Instant? = null
 
     private fun visitHealth(latestStoredAt: () -> Instant? = {
         if (!databaseReachable) throw IllegalStateException("DB 에 닿지 못함 jdbc:postgresql://postgres:5432 $ADDRESS_V4")
         if (tableMissing) throw BadSqlGrammarException("latest", "SELECT …", SQLException("relation \"visit_event\" does not exist", "42P01"))
         latestInDatabase
-    }, readBudget: Duration = Duration.ofSeconds(2)) = VisitHealth(
+    }, readBudget: Duration = Duration.ofSeconds(2), oldestStoredAt: () -> Instant? = {
+        if (!databaseReachable) throw IllegalStateException("DB 에 닿지 못함 jdbc:postgresql://postgres:5432 $ADDRESS_V4")
+        if (tableMissing) throw BadSqlGrammarException("oldest", "SELECT …", SQLException("relation \"visit_event\" does not exist", "42P01"))
+        oldestInDatabase
+    }) = VisitHealth(
         collector,
         unacknowledged = { stream.unacknowledgedCount() },
         lag = { 0L },
         latestStoredAt = latestStoredAt,
         lastRetention = { retention },
+        oldestStoredAt = oldestStoredAt,
         startedAt = startedAt,
         readBudget = readBudget,
     )
@@ -58,6 +64,7 @@ class VisitHealthTest {
         assertEquals(setOf(
             "status", "last_loop_at", "last_stored_at", "stored_since_start", "unacknowledged", "lag", "failure",
             "dropped", "dropped_total", "query_stripped", "last_retention_at", "last_retention_deleted", "last_retention_failure",
+            "already_stored", "oldest_stored_at",
         ), body.keys)
         assertEquals("ok", body["status"])
         assertEquals(now.toString(), body["last_stored_at"])
@@ -69,6 +76,8 @@ class VisitHealthTest {
         assertEquals(0L, body["query_stripped"])
         assertEquals("", body["last_retention_at"])
         assertEquals(-1, body["last_retention_deleted"])
+        assertEquals(0L, body["already_stored"])
+        assertEquals("", body["oldest_stored_at"], "표가 비었는데 가장 오래된 시각이 있다")
     }
 
     @Test
@@ -126,6 +135,70 @@ class VisitHealthTest {
         assertEquals("ok", body["status"], "삭제 실패가 수집의 상태를 바꿨다")
     }
 
+    // ── 90일 삭제가 밀리면 드러난다 ─────────────────────
+
+    private val retentionDays = Duration.ofDays(90)
+
+    @Test
+    fun `가장 오래된 줄이 90일과 26시간보다 오래되면 retention_overdue 이고 그 시각을 보인다`() {
+        collector.runOnce()
+        oldestInDatabase = now.minus(retentionDays).minus(Duration.ofHours(26)).minusSeconds(1)
+        val body = visitHealth().report(now)
+        assertEquals("retention_overdue", body["status"], "$body")
+        assertEquals(oldestInDatabase.toString(), body["oldest_stored_at"])
+        assertEquals("", body["failure"], "밀린 삭제는 수집의 실패가 아니다: $body")
+    }
+
+    @Test
+    fun `가장 오래된 줄이 정확히 90일과 26시간이거나 90일과 25시간이면 ok 이다`() {
+        collector.runOnce()
+        oldestInDatabase = now.minus(retentionDays).minus(Duration.ofHours(26))
+        assertEquals("ok", visitHealth().report(now)["status"], "경계(정확히 90일 + 26시간)를 밀렸다고 봤다")
+        oldestInDatabase = now.minus(retentionDays).minus(Duration.ofHours(25))
+        val body = visitHealth().report(now)
+        assertEquals("ok", body["status"], "$body")
+        assertEquals(oldestInDatabase.toString(), body["oldest_stored_at"])
+    }
+
+    @Test
+    fun `표가 비거나 아직 없으면 밀린 것이 아니다`() {
+        collector.runOnce()
+        oldestInDatabase = null
+        assertEquals("ok", visitHealth().report(now)["status"])
+        tableMissing = true
+        val body = visitHealth().report(now)
+        assertEquals("ok", body["status"], "표가 아직 없는 것을 닿지 못함이나 밀림으로 봤다: $body")
+        assertEquals("", body["oldest_stored_at"])
+    }
+
+    @Test
+    fun `가장 오래된 줄을 읽지 못하면 unreachable 이고 사유는 종류 이름만이다`() {
+        collector.runOnce()
+        val body = visitHealth(oldestStoredAt = { throw IllegalStateException("DB 에 닿지 못함 $ADDRESS_V4") }).report(now)
+        assertEquals("unreachable", body["status"], "$body")
+        assertEquals("database IllegalStateException", body["failure"])
+        assertFalse(body.toString().contains(ADDRESS_V4), "$body")
+    }
+
+    @Test
+    fun `밀린 삭제는 수집의 실패를 가리지 않는다`() {
+        stream.add(VisitRecords.record("1000-0"))
+        sink.failure = IllegalStateException("boom")
+        collector.runOnce()
+        oldestInDatabase = now.minus(retentionDays).minus(Duration.ofDays(3))
+        assertEquals("failing", visitHealth().report(now)["status"])
+    }
+
+    @Test
+    fun `이미 있음의 수를 보인다`() {
+        sink.insertAll(listOf(VisitRecords.visit(1_000)))
+        stream.add(VisitRecords.record("1000-0"), VisitRecords.record("2000-0"))
+        collector.runOnce()
+        val body = visitHealth().report(now)
+        assertEquals(1L, body["stored_since_start"])
+        assertEquals(1L, body["already_stored"])
+    }
+
     @Test
     fun `마지막 저장 시각을 읽는 것이 멈춰도 읽기 상한 안에 unreachable 로 답한다`() {
         collector.runOnce()
@@ -179,7 +252,7 @@ class VisitHealthTest {
         logCollector.runOnce()
         val exploding = VisitHealth(collector, unacknowledged = { throw IllegalStateException("redis $ADDRESS_V4") }, lag = { throw IllegalStateException("lag $ADDRESS_V4") },
             latestStoredAt = { throw IllegalStateException("db $ADDRESS_V4") }, lastRetention = { throw IllegalStateException("retention $ADDRESS_V4") },
-            startedAt = startedAt)
+            oldestStoredAt = { throw IllegalStateException("oldest $ADDRESS_V4") }, startedAt = startedAt)
         val report = collectorHealth(exploding).report(now)
         assertTrue(report.healthy, "${report.body}")
         assertTrue(report.body.containsKey("visits"), "${report.body}")

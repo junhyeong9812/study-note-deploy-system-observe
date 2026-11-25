@@ -27,6 +27,8 @@ import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
+import java.time.Instant
+import java.time.temporal.ChronoUnit
 import java.util.UUID
 
 /**
@@ -177,6 +179,40 @@ class VisitHttpEngineTest {
         }
     }
 
+    /** 표에 줄 하나를 바로 넣는다(수집을 거치지 않고) — 가장 오래된 줄을 만들려고. 주소는 표에만 있는 값 */
+    private fun insertDirectly(at: Instant, sequence: Int) = administration.update(
+        """INSERT INTO $SCHEMA.visit_event (stream_ms, stream_seq, path, screen, referrer_host, device, visitor, ip)
+           VALUES (?, ?, '/old', 'topic', NULL, 'desktop', ?, ?)""", at.toEpochMilli(), sequence, VISITOR_TWO, ADDRESS_V6)
+
+    @Test
+    fun `가장 오래된 줄이 90일과 26시간보다 오래되면 HTTP 헬스의 방문 상태가 retention_overdue 이고 25시간이면 ok 이며 표가 비면 ok 이다`() {
+        eventually(what = "헬스의 visits.status 가 ok(표가 만들어짐)") { visitHealth().takeIf { it["status"] == "ok" } }
+        val retention = Duration.ofDays(90)
+        val overdueAt = Instant.now().minus(retention).minus(Duration.ofHours(26)).minus(Duration.ofMinutes(10)).truncatedTo(ChronoUnit.MILLIS)
+        val withinAt = Instant.now().minus(retention).minus(Duration.ofHours(25)).truncatedTo(ChronoUnit.MILLIS)
+        try {
+            insertDirectly(overdueAt, 9_001)
+            val overdue = eventually(what = "헬스의 visits.status 가 retention_overdue") { visitHealth().takeIf { it["status"] == "retention_overdue" } }
+            assertEquals(overdueAt.toString(), overdue["oldest_stored_at"], "$overdue")
+            val whole = call("GET", "/health", secret = null)
+            assertEquals(200, whole.statusCode(), "밀린 방문 삭제가 헬스의 HTTP 판정을 바꿨다: ${whole.body()}")
+            assertEquals("ok", envelope(whole)["status"], "밀린 방문 삭제가 로그 수집의 상태를 바꿨다: ${whole.body()}")
+
+            administration.update("DELETE FROM $SCHEMA.visit_event WHERE stream_seq = 9001 AND path = '/old'")
+            insertDirectly(withinAt, 9_002)
+            val within = eventually(what = "헬스의 visits.oldest_stored_at 이 90일 + 25시간 된 줄") {
+                visitHealth().takeIf { it["oldest_stored_at"] == withinAt.toString() }
+            }
+            assertEquals("ok", within["status"], "90일 + 25시간 된 줄을 밀렸다고 봤다: $within")
+
+            administration.update("DELETE FROM $SCHEMA.visit_event")
+            val empty = eventually(what = "헬스의 visits.oldest_stored_at 이 빈 글자") { visitHealth().takeIf { it["oldest_stored_at"] == "" } }
+            assertEquals("ok", empty["status"], "빈 표를 밀렸다고 봤다: $empty")
+        } finally {
+            administration.update("DELETE FROM $SCHEMA.visit_event WHERE path = '/old' AND stream_seq IN (9001, 9002)")
+        }
+    }
+
     @AfterAll
     fun cleanUp() {
         logs.close()
@@ -215,6 +251,7 @@ class VisitHttpEngineTest {
             registry.add("observe.visits.stream") { VISIT_STREAM }
             registry.add("observe.visits.group") { "visit-http-$suffix" }
             registry.add("observe.secret") { SECRET }
+            registry.add("observe.visits.retention-cron") { "0 0 0 1 1 *" }   // 테스트 중에 하루 한 번의 삭제가 돌아 넣은 줄을 지우지 않게
         }
     }
 }

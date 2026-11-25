@@ -1,6 +1,7 @@
 package xyz.junproject.observe.visit
 
 import org.springframework.jdbc.core.JdbcTemplate
+import xyz.junproject.observe.log.StreamId
 import java.time.Duration
 import java.time.Instant
 import java.time.LocalDate
@@ -35,8 +36,8 @@ interface VisitReader {
 
 /** 보관 삭제의 면 */
 interface VisitRetention {
-    /** [cutoff] 보다 오래된 줄을 지운다. 지운 줄 수. 실패는 예외 */
-    fun deleteOlderThan(cutoff: Instant): Int
+    /** [cutoff] 보다 오래된 줄을 한 문장으로 많아야 [limit] 줄 지운다. 지운 줄 수. 실패는 예외 */
+    fun deleteOlderThan(cutoff: Instant, limit: Int): Int
 }
 
 /**
@@ -64,15 +65,15 @@ class VisitStore(private val ingest: JdbcTemplate, private val query: JdbcTempla
         )
     }
 
-    override fun insertAll(visits: List<Visit>): Int {
-        if (visits.isEmpty()) return 0
+    override fun insertAll(visits: List<Visit>): Set<StreamId> {
+        if (visits.isEmpty()) return emptySet()
         val results = ingest.batchUpdate(
             """INSERT INTO visit_event (stream_ms, stream_seq, path, screen, referrer_host, device, visitor, ip)
                VALUES (?,?,?,?,?,?,?,?) ON CONFLICT (stream_ms, stream_seq) DO NOTHING""",
             visits.map { arrayOf<Any?>(it.id.millis, it.id.sequence, it.path, it.screen, it.referrerHost, it.device.wireName, it.visitor, it.ip) },
             intArrayOf(Types.BIGINT, Types.INTEGER, Types.VARCHAR, Types.VARCHAR, Types.VARCHAR, Types.VARCHAR, Types.VARCHAR, Types.VARCHAR),
         )
-        return results.count { it > 0 || it == java.sql.Statement.SUCCESS_NO_INFO }
+        return visits.filterIndexed { index, _ -> results[index] > 0 || results[index] == java.sql.Statement.SUCCESS_NO_INFO }.map { it.id }.toSet()
     }
 
     /**
@@ -119,7 +120,11 @@ class VisitStore(private val ingest: JdbcTemplate, private val query: JdbcTempla
         )
     }
 
-    override fun deleteOlderThan(cutoff: Instant): Int = ingest.update("DELETE FROM visit_event WHERE stream_ms < ?", cutoff.toEpochMilli())
+    // 뼈대: [limit] 을 아직 지키지 않는다 — 구현 워커가 한 문장 [limit] 줄까지로 바꾼다
+    override fun deleteOlderThan(cutoff: Instant, limit: Int): Int = ingest.update("DELETE FROM visit_event WHERE stream_ms < ?", cutoff.toEpochMilli())
+
+    /** 가장 오래된 방문의 시각(헬스용) — 뼈대: 구현 워커가 헬스 풀로 읽는다(비었으면 null) */
+    fun oldestStoredAt(): Instant? = null
 
     /** 가장 최근에 저장된 방문의 시각(헬스용) — 비었으면 null, 표가 없으면 SQLSTATE 42P01 예외, DB 에 닿지 못하면 예외 */
     fun latestStoredAt(): Instant? = health.query(

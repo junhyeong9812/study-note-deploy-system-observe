@@ -39,6 +39,7 @@ import java.util.concurrent.CopyOnWriteArrayList
 import xyz.junproject.observe.threshold.SilentGate
 import xyz.junproject.observe.visit.VisitCollector
 import xyz.junproject.observe.visit.VisitHealth
+import xyz.junproject.observe.visit.VisitRetention
 import xyz.junproject.observe.visit.VisitSchedule
 import xyz.junproject.observe.visit.VisitStore
 
@@ -319,7 +320,13 @@ class ObserveConfiguration {
 
     /** 방문 수집 스레드와 90일 삭제(`observe.visits.retention-cron`, 서울) */
     @Bean
-    fun visitSchedule(collector: VisitCollector, store: VisitStore) = VisitSchedule(collector, store)
+    fun visitSchedule(
+        collector: VisitCollector,
+        retention: VisitRetention,
+        @Value("\${observe.visits.retention-cron:0 40 3 * * *}") retentionCron: String,            // 뼈대: 구현 워커가 `-`(끔)을 거절한다
+        @Value("\${observe.visits.retention-batch-size:5000}") retentionBatchSize: Int,          // 뼈대: 구현 워커가 넘기고 검사한다
+        @Value("\${observe.visits.retention-time-budget:5m}") retentionTimeBudget: String,       // 뼈대: 구현 워커가 넘기고 검사한다
+    ) = VisitSchedule(collector, retention)
 
     @Bean
     fun visitHealth(
@@ -331,7 +338,8 @@ class ObserveConfiguration {
         schedule: VisitSchedule,
     ): VisitHealth {
         val source = visitStreamSource(redis, stream, group)
-        return VisitHealth(collector, { source.unacknowledgedCount() }, { source.lag() }, { store.latestStoredAt() }, { schedule.lastRetention })
+        return VisitHealth(collector, { source.unacknowledgedCount() }, { source.lag() }, { store.latestStoredAt() }, { schedule.lastRetention },
+            oldestStoredAt = { store.oldestStoredAt() })
     }
 
     @Bean

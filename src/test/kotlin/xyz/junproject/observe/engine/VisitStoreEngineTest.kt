@@ -9,6 +9,7 @@ import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
 import org.springframework.jdbc.core.JdbcTemplate
+import xyz.junproject.observe.log.StreamId
 import xyz.junproject.observe.visit.PathViews
 import xyz.junproject.observe.visit.ReferrerViews
 import xyz.junproject.observe.visit.Visit
@@ -19,6 +20,12 @@ import xyz.junproject.observe.visit.VisitRecords.ADDRESS_V4
 import xyz.junproject.observe.visit.VisitRecords.ADDRESS_V6
 import xyz.junproject.observe.visit.VisitRecords.VISITOR_ONE
 import xyz.junproject.observe.visit.VisitRecords.VISITOR_TWO
+import xyz.junproject.observe.log.RetentionResult
+import xyz.junproject.observe.metric.FakeMetricStream
+import xyz.junproject.observe.visit.FakeVisitSink
+import xyz.junproject.observe.visit.VisitCollector
+import xyz.junproject.observe.visit.VisitRetention
+import xyz.junproject.observe.visit.VisitSchedule
 import xyz.junproject.observe.visit.VisitStore
 import java.time.Duration
 import java.time.Instant
@@ -72,7 +79,7 @@ class VisitStoreEngineTest {
             VisitRecords.visit(1_764_000_000_000, 1, path = "/wiki/쿠버네티스", screen = "search", referrerHost = null, device = VisitDevice.MOBILE,
                 visitor = VISITOR_TWO, ip = ADDRESS_V6),
         )
-        assertEquals(2, store.insertAll(visits))
+        assertEquals(visits.map { it.id }.toSet(), store.insertAll(visits))
         assertEquals(listOf(
             mapOf("stream_ms" to 1_764_000_000_000L, "stream_seq" to 0, "path" to "/wiki/kubernetes/pod", "screen" to "topic", "referrer_host" to "www.google.com",
                 "device" to "desktop", "visitor" to VISITOR_ONE, "ip" to ADDRESS_V4),
@@ -83,9 +90,9 @@ class VisitStoreEngineTest {
 
     @Test
     fun `같은 스트림 ID 를 두 번 저장해도 한 줄이고 처음 것이 남는다`() {
-        assertEquals(1, store.insertAll(listOf(VisitRecords.visit(1_000))))
-        assertEquals(0, store.insertAll(listOf(VisitRecords.visit(1_000, path = "/other"))))
-        assertEquals(1, store.insertAll(listOf(VisitRecords.visit(1_000), VisitRecords.visit(2_000))))
+        assertEquals(setOf(StreamId(1_000, 0)), store.insertAll(listOf(VisitRecords.visit(1_000))))
+        assertEquals(emptySet<StreamId>(), store.insertAll(listOf(VisitRecords.visit(1_000, path = "/other"))))
+        assertEquals(setOf(StreamId(2_000, 0)), store.insertAll(listOf(VisitRecords.visit(1_000), VisitRecords.visit(2_000))), "이미 있던 것까지 새로 넣었다고 했다")
         assertEquals(listOf(1_000L, 2_000L), rows().map { it["stream_ms"] })
         assertEquals("/wiki/kubernetes/pod", rows().first()["path"])
     }
@@ -117,10 +124,61 @@ class VisitStoreEngineTest {
             VisitRecords.visit(now.minus(Duration.ofDays(89)).minus(Duration.ofHours(23)).minus(Duration.ofMinutes(59)).toEpochMilli()),
             VisitRecords.visit(now.toEpochMilli()),
         ))
-        assertEquals(2, store.deleteOlderThan(cutoff))
+        assertEquals(2, store.deleteOlderThan(cutoff, 5_000))
         assertEquals(listOf(cutoff.toEpochMilli(), now.minus(Duration.ofMinutes(89L * 24 * 60 + 23 * 60 + 59)).toEpochMilli(), now.toEpochMilli()),
             rows().map { it["stream_ms"] })
-        assertEquals(0, store.deleteOlderThan(cutoff), "두 번째 삭제가 또 지웠다")
+        assertEquals(0, store.deleteOlderThan(cutoff, 5_000), "두 번째 삭제가 또 지웠다")
+    }
+
+    /** 기한(`cutoff`)보다 1ms 부터 [count] ms 까지 오래된 줄을 한 문장으로 넣는다 — 모두 기한을 넘겼다 */
+    private fun insertOverdue(cutoff: Instant, count: Int) {
+        jdbc.update(
+            """INSERT INTO visit_event (stream_ms, stream_seq, path, screen, referrer_host, device, visitor, ip)
+               SELECT ? - n, 0, '/old', 'topic', NULL, 'desktop', ?, ? FROM generate_series(1, ?) AS n""",
+            cutoff.toEpochMilli(), VISITOR_ONE, ADDRESS_V4, count,
+        )
+    }
+
+    private fun overdueCount(cutoff: Instant) = jdbc.queryForObject("SELECT count(*) FROM visit_event WHERE stream_ms < ?", Long::class.java, cutoff.toEpochMilli())!!
+
+    @Test
+    fun `한 문장은 묶음 크기까지만 지우고 기한 안의 줄은 건드리지 않는다`() {
+        val cutoff = now.minus(VisitStore.RETENTION)
+        insertOverdue(cutoff, 12_000)
+        store.insertAll(listOf(VisitRecords.visit(cutoff.toEpochMilli()), VisitRecords.visit(cutoff.toEpochMilli() + 1), VisitRecords.visit(now.toEpochMilli())))
+        assertEquals(5_000, store.deleteOlderThan(cutoff, 5_000))
+        assertEquals(7_000L, overdueCount(cutoff), "한 문장이 묶음 크기보다 많이(또는 적게) 지웠다")
+        assertEquals(3L, jdbc.queryForObject("SELECT count(*) FROM visit_event WHERE stream_ms >= ?", Long::class.java, cutoff.toEpochMilli()), "기한 안의 줄을 지웠다")
+        assertEquals(5_000, store.deleteOlderThan(cutoff, 5_000))
+        assertEquals(2_000, store.deleteOlderThan(cutoff, 5_000), "남은 것보다 많이 지웠다고 했다")
+        assertEquals(0, store.deleteOlderThan(cutoff, 5_000))
+        assertEquals(3L, jdbc.queryForObject("SELECT count(*) FROM visit_event", Long::class.java), "기한 안의 줄을 지웠다")
+    }
+
+    @Test
+    fun `밀린 줄이 묶음 크기보다 많아도 한 번의 실행이 나눠 모두 지우고 기한 안의 줄은 경계의 줄까지 남긴다`() {
+        val cutoff = now.minus(Duration.ofDays(90))
+        insertOverdue(cutoff, 12_000)
+        val kept = listOf(cutoff.toEpochMilli(), cutoff.toEpochMilli() + 1, now.toEpochMilli())   // 정확히 90일 된 줄 · 그보다 1ms 새 줄 · 지금
+        store.insertAll(kept.map { VisitRecords.visit(it) })
+        val deletedPerStatement = mutableListOf<Int>()
+        val recording = object : VisitRetention {
+            override fun deleteOlderThan(cutoff: Instant, limit: Int) = store.deleteOlderThan(cutoff, limit).also { deletedPerStatement += it }
+        }
+        val schedule = VisitSchedule(VisitCollector(FakeMetricStream(), FakeVisitSink(), block = Duration.ZERO), recording,
+            retentionBatchSize = 5_000, retentionTimeBudget = Duration.ofMinutes(5))
+        assertEquals(12_000, schedule.deleteOldVisits(now))
+        assertEquals(listOf(5_000, 5_000, 2_000), deletedPerStatement, "문장마다 지운 수")
+        assertEquals(0L, overdueCount(cutoff), "기한을 넘긴 줄이 남았다")
+        assertEquals(kept, rows().map { it["stream_ms"] }, "기한 안의 줄이 지워졌다")
+        assertEquals(RetentionResult(now, 12_000, null), schedule.lastRetention)
+    }
+
+    @Test
+    fun `가장 오래된 줄의 시각은 스트림 ID 의 밀리초이고 비었으면 null`() {
+        assertNull(store.oldestStoredAt())
+        store.insertAll(listOf(VisitRecords.visit(at("2026-11-25T02:00:00Z"), 1), VisitRecords.visit(at("2026-08-01T00:00:00.123Z")), VisitRecords.visit(at("2026-11-25T02:00:00Z"))))
+        assertEquals(Instant.parse("2026-08-01T00:00:00.123Z"), store.oldestStoredAt())
     }
 
     // ── 요약 ──────────────────────────────────────────────

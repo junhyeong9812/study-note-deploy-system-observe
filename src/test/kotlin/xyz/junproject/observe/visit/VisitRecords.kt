@@ -52,7 +52,7 @@ object VisitRecords {
     ) = Visit(StreamId(millis, sequence), path, screen, referrerHost, device, visitor, ip)
 }
 
-/** 메모리 저장소 — 같은 스트림 ID 는 한 번만. [failure] 가 있으면 저장이 그 예외로 실패한다 */
+/** 메모리 저장소 — 같은 스트림 ID 는 한 번만(새로 넣은 ID 만 돌려준다). [failure] 가 있으면 저장이 그 예외로 실패한다 */
 class FakeVisitSink(private val events: MutableList<String> = mutableListOf()) : VisitSink {
     val stored = LinkedHashMap<StreamId, Visit>()
     var failure: RuntimeException? = null
@@ -64,10 +64,10 @@ class FakeVisitSink(private val events: MutableList<String> = mutableListOf()) :
         schemaCreations++
     }
 
-    override fun insertAll(visits: List<Visit>): Int {
+    override fun insertAll(visits: List<Visit>): Set<StreamId> {
         failure?.let { events += "insert-failed"; throw it }
         visits.forEach { events += "insert:${it.id}" }
-        return visits.count { stored.putIfAbsent(it.id, it) == null }
+        return visits.filter { stored.putIfAbsent(it.id, it) == null }.map { it.id }.toSet()
     }
 }
 

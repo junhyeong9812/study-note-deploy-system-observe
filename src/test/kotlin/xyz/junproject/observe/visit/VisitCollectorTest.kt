@@ -97,6 +97,34 @@ class VisitCollectorTest {
     }
 
     @Test
+    fun `같은 항목을 두 번 처리하면 저장 수와 잘라 낸 수는 한 번만 세고 두 번째는 이미 있음으로 센다`() {
+        val record = VisitRecords.record("1000-0", VisitRecords.fields(path = "/search?q=$SEARCH_WORDS", screen = "search"))
+        stream.add(record)
+        collector.runOnce()
+        assertEquals(1L, collector.storedTotal)
+        assertEquals(0L, collector.alreadyStored)
+        stream.add(record)                                     // 같은 스트림 ID 가 다시 온다 — 표에는 이미 있다
+        assertEquals(1, collector.runOnce())
+        assertTrue(stream.pending.isEmpty(), "이미 있는 항목을 확인하지 않았다 — 영영 다시 받는다")
+        assertEquals(1, sink.stored.size)
+        assertEquals(1L, collector.storedTotal, "이미 있던 항목을 저장 수에 셌다")
+        assertEquals(1L, collector.alreadyStored, "이미 있던 항목을 따로 세지 않았다")
+        assertEquals(1L, collector.queryStripped, "이미 있던 항목의 잘라 냄을 또 셌다")
+        assertNull(collector.lastFailure, "이미 있는 항목은 실패가 아니다")
+    }
+
+    @Test
+    fun `저장소가 하나도 넣지 않았다고 하면 저장 수는 그대로이고 묶음 전부를 이미 있음으로 센다`() {
+        sink.insertAll(listOf(VisitRecords.visit(1_000, path = "/search", screen = "search"), VisitRecords.visit(2_000)))
+        stream.add(VisitRecords.record("1000-0", VisitRecords.fields(path = "/search?q=$SEARCH_WORDS", screen = "search")), good(2_000))
+        assertEquals(2, collector.runOnce())
+        assertEquals(0L, collector.storedTotal)
+        assertEquals(2L, collector.alreadyStored)
+        assertEquals(0L, collector.queryStripped)
+        assertTrue(stream.pending.isEmpty())
+    }
+
+    @Test
     fun `기동 직후 지난번에 확인하지 못한 항목부터 받고 같은 항목은 한 줄만 남는다`() {
         stream.add(good(1_000), good(2_000))
         stream.ensureGroup()

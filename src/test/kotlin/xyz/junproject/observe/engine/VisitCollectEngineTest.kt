@@ -10,6 +10,8 @@ import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
 import org.springframework.data.redis.connection.lettuce.LettuceConnectionFactory
+import org.springframework.data.redis.connection.stream.RecordId
+import org.springframework.data.redis.connection.stream.StreamRecords
 import org.springframework.jdbc.core.JdbcTemplate
 import xyz.junproject.observe.metric.RedisMetricStreamSource
 import xyz.junproject.observe.visit.CapturedLogs
@@ -170,6 +172,34 @@ class VisitCollectEngineTest {
         assertEquals(0L, restarted.droppedCounts().values.sum())
     }
 
+    /** 스트림 ID 를 정해 보낸다 — 표에 이미 있는 열쇠와 같은 항목을 만들려고 */
+    private fun sendWithId(id: String, fields: Map<String, String>) =
+        producer.opsForStream<String, String>().add(StreamRecords.mapBacked<String, String, String>(fields).withStreamKey(stream).withId(RecordId.of(id)))!!.value
+
+    @Test
+    fun `한 묶음에 이미 있는 항목과 새 항목이 섞여 오면 저장 수와 잘라 낸 수는 새로 넣은 것만 세고 나머지는 이미 있음으로 센다`() {
+        // 앞 프로세스가 1000-0 · 4000-0 을 저장까지 하고 확인 전에 죽었다(같은 열쇠가 표에 있다)
+        store.insertAll(listOf(VisitRecords.visit(1_000, path = "/search", screen = "search"), VisitRecords.visit(4_000)))
+        sendWithId("1000-0", VisitRecords.fields(path = "/search?q=$SEARCH_WORDS", screen = "search"))   // 이미 있음 · 잘라 냄
+        sendWithId("2000-0", VisitRecords.fields())                                                     // 새것
+        sendWithId("3000-0", VisitRecords.fields(path = "/search?q=$SEARCH_WORDS", screen = "search"))   // 새것 · 잘라 냄
+        sendWithId("4000-0", VisitRecords.fields())                                                     // 이미 있음
+        val reader = source()
+        val collector = collector(reader)
+        assertEquals(4, collector.runOnce())
+        assertNull(collector.lastFailure)
+        assertEquals(0L, reader.unacknowledgedCount(), "이미 있는 항목을 확인하지 않아 다시 받는다")
+        assertEquals(listOf("1000-0", "2000-0", "3000-0", "4000-0"), rows().map(::streamId))
+        assertEquals(2L, collector.storedTotal, "이미 있던 항목까지 저장 수에 셌다")
+        assertEquals(2L, collector.alreadyStored, "이미 있던 항목을 따로 세지 않았다")
+        assertEquals(1L, collector.queryStripped, "이미 있던 항목의 잘라 냄까지 셌다")
+        val health = VisitHealth(collector, { reader.unacknowledgedCount() }, { reader.lag() }, { store.latestStoredAt() }, { null },
+            oldestStoredAt = { store.oldestStoredAt() }).report(Instant.now())
+        assertEquals(2L, health["stored_since_start"], "$health")
+        assertEquals(2L, health["already_stored"], "$health")
+        assertEquals(1L, health["query_stripped"], "$health")
+    }
+
     @Test
     fun `DB 가 죽은 동안은 확인하지 않고 기다리며 헬스에 드러나고 살아나면 잃지 않고 저장한다`() {
         val sink = SwitchableSink()
@@ -182,7 +212,8 @@ class VisitCollectEngineTest {
         assertNotNull(collector.lastFailure, "DB 가 죽었는데 실패가 아니다")
         assertEquals(5L, reader.unacknowledgedCount(), "DB 가 죽은 동안 확인해 버렸다 — 잃는다")
         assertEquals(0, rows().size)
-        val health = VisitHealth(collector, { reader.unacknowledgedCount() }, { reader.lag() }, { deadStore.latestStoredAt() }, { null })
+        val health = VisitHealth(collector, { reader.unacknowledgedCount() }, { reader.lag() }, { deadStore.latestStoredAt() }, { null },
+            oldestStoredAt = { deadStore.oldestStoredAt() })
         val body = health.report(Instant.now())
         assertEquals("unreachable", body["status"], "$body")
         assertTrue((body["failure"] as String).startsWith("database "), "$body")
@@ -208,7 +239,8 @@ class VisitCollectEngineTest {
             repeat(2) { collector.runOnce() }
             assertNotNull(collector.lastFailure, "저장이 실패했는데 실패가 아니다")
             assertEquals(2L, reader.unacknowledgedCount())
-            val health = VisitHealth(collector, { reader.unacknowledgedCount() }, { reader.lag() }, { store.latestStoredAt() }, { null }).report(Instant.now())
+            val health = VisitHealth(collector, { reader.unacknowledgedCount() }, { reader.lag() }, { store.latestStoredAt() }, { null },
+                oldestStoredAt = { store.oldestStoredAt() }).report(Instant.now())
             assertEquals("failing", health["status"], "$health")
             val text = logs.text()
             assertTrue(text.contains("visit", ignoreCase = true), "저장 실패가 로그에 드러나지 않는다: $text")

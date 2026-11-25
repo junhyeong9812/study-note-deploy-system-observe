@@ -29,6 +29,7 @@ class VisitHealth(
     private val lag: () -> Long?,
     private val latestStoredAt: () -> Instant?,
     private val lastRetention: () -> RetentionResult?,
+    private val oldestStoredAt: () -> Instant?,                      // 뼈대: 구현 워커가 retention_overdue · oldest_stored_at 에 쓴다
     private val stallAfter: Duration = Duration.ofSeconds(60),
     private val startedAt: Instant = Instant.now(),
     private val readBudget: Duration = Duration.ofSeconds(2),

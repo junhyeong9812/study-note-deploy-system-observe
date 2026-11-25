@@ -12,8 +12,10 @@ import xyz.junproject.observe.visit.VisitRecords.VISITOR_ONE
 /**
  * 스트림 항목의 꼴(계약) — 칸: `v`(= "1") · `path` · `screen` · `referrer_host`(없어도 된다) · `device` · `visitor` · `ip`.
  * 방문 시각은 스트림 ID 의 밀리초다(front 가 싣지 않는다). 꼴이 틀리면 그 항목만 버리고 이유를 센다.
- * 검사 순서: ID → 칸 없음 → 필수 칸 → 버전 → 제어 문자(모든 칸의 받은 글 그대로) → 길이 → 칸마다의 꼴(경로 → 화면 → 들어온 곳 → 기기 → 구분값 → 주소).
- * 경로의 `?` · `#` 뒤(검색어 · 조각)는 버리고 앞까지만 저장한다 — 항목은 받는다.
+ * 검사 순서: ID → 칸 없음 → 필수 칸 → 버전 → 제어 문자 → 길이 → 칸마다의 꼴(경로 → 화면 → 들어온 곳 → 기기 → 구분값 → 주소).
+ * 경로는 **먼저 자르고 나서 검사한다**: 처음 나오는 `?` · `#` · `;` 의 뒤(검색어 · 조각 · `;jsessionid=…` 같은 세션 값)는 버리고 앞까지만 저장한다 —
+ * 항목은 받고 자른 수에 센다. 자른 뒤의 경로에 제어 문자(Cc)나 서식 문자(Cf — 글 방향 뒤집기 · 폭 없는 빈칸)가 있으면 `control_character`,
+ * 잘려 나간 부분에만 있던 것으로는 버리지 않는다. `//` 로 시작하는 경로는 `invalid_path`. 다른 칸의 제어 문자는 받은 글 그대로 본다.
  */
 class VisitEntryParserTest {
     private fun parse(fields: Map<String, String>, id: String = "1764000000000-0") = VisitEntryParser.parse(MetricStreamRecord(id, fields))
@@ -99,6 +101,61 @@ class VisitEntryParserTest {
         assertEquals(longest, accepted(VisitRecords.fields(path = longest)).visit.path)
         assertEquals(longest, accepted(VisitRecords.fields(path = "$longest?q=$SEARCH_WORDS")).visit.path)
         assertDropped(VisitDropReason.TOO_LONG, VisitRecords.fields(path = longest + "a"))
+    }
+
+    // ── 경로의 꼴 — 먼저 자르고 나서 검사한다 ─────────────
+
+    /** 해석 결과를 표의 칸 하나로 — 받으면 저장할 경로와 잘랐는지, 버리면 이유 */
+    private fun pathOutcome(path: String): String = when (val result = parse(VisitRecords.fields(path = path))) {
+        is VisitEntryParse.Accepted -> "받음 ${visible(result.visit.path)} 자름=${result.queryStripped}"
+        is VisitEntryParse.Dropped -> "버림 ${result.reason.wireName}"
+    }
+
+    /** 실패 글에서 보이지 않는 글자를 알아볼 수 있게 */
+    private fun visible(text: String) = text.map { if (Character.isISOControl(it) || Character.getType(it) == Character.FORMAT.toInt()) "\\u%04x".format(it.code) else "$it" }.joinToString("")
+
+    @Test
+    fun `경로의 꼴 표 — 세미콜론 물음표 샵 뒤를 자르고 자른 뒤에 제어 문자와 서식 문자를 보고 빗금 둘로 시작하면 버린다`() {
+        val table = listOf(
+            "/a;jsessionid=x" to "받음 /a 자름=true",
+            "/a;b?c#d" to "받음 /a 자름=true",
+            "/a?q=\u0001" to "받음 /a 자름=true",                      // 잘려 나간 부분에만 제어 문자
+            "/a#\u0000" to "받음 /a 자름=true",
+            "/a;\u202Eb" to "받음 /a 자름=true",                       // 잘려 나간 부분에만 서식 문자
+            "/a\u0001b" to "버림 control_character",
+            "/a\u202Eb" to "버림 control_character",                    // 글 방향 뒤집기(RIGHT-TO-LEFT OVERRIDE)
+            "/a\u200Bb" to "버림 control_character",                    // 폭 없는 빈칸(ZERO WIDTH SPACE)
+            "/a\u2066b" to "버림 control_character",                    // 글 방향 격리(LEFT-TO-RIGHT ISOLATE)
+            "/a\uFEFFb" to "버림 control_character",                    // 폭 없는 붙임 빈칸(BOM)
+            "/a\u0001b?q=x" to "버림 control_character",                // 자른 뒤에도 남는 제어 문자
+            "//evil.example/x" to "버림 invalid_path",
+            "//" to "버림 invalid_path",
+            "//?x" to "버림 invalid_path",
+            ";x" to "버림 invalid_path",
+            "/" to "받음 / 자름=false",
+            "/a/b" to "받음 /a/b 자름=false",
+            "/wiki/쿠버네티스/파드" to "받음 /wiki/쿠버네티스/파드 자름=false",
+            "/;x" to "받음 / 자름=true",
+        )
+        val wrong = table.mapNotNull { (path, expected) ->
+            val actual = pathOutcome(path)
+            if (actual == expected) null else "${visible(path)}: 기대 [$expected] 실제 [$actual]"
+        }
+        assertTrue(wrong.isEmpty(), "어긋난 줄 ${wrong.size}개:\n" + wrong.joinToString("\n"))
+    }
+
+    @Test
+    fun `세미콜론 뒤를 자른 경로의 세션 값은 저장할 방문 어디에도 없다`() {
+        val result = accepted(VisitRecords.fields(path = "/wiki/a;jsessionid=$SEARCH_WORDS"))
+        assertEquals("/wiki/a", result.visit.path)
+        assertTrue(result.queryStripped)
+        assertFalse(result.visit.toString().contains(SEARCH_WORDS))
+    }
+
+    @Test
+    fun `경로 길이 상한은 세미콜론 뒤를 자른 뒤의 경로로 잰다`() {
+        val longest = "/" + "a".repeat(VisitEntryParser.MAX_PATH_LENGTH - 1)
+        assertEquals(longest, accepted(VisitRecords.fields(path = "$longest;jsessionid=$SEARCH_WORDS")).visit.path)
     }
 
     // ── 버리는 꼴 ──────────────────────────────────────

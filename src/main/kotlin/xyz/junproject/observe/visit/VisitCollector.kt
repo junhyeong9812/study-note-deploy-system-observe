@@ -1,6 +1,7 @@
 package xyz.junproject.observe.visit
 
 import org.slf4j.LoggerFactory
+import xyz.junproject.observe.log.StreamId
 import xyz.junproject.observe.metric.MetricStreamRecord
 import xyz.junproject.observe.metric.MetricStreamSource
 import java.sql.SQLException
@@ -13,8 +14,8 @@ import java.util.concurrent.atomic.AtomicLong
 interface VisitSink {
     /** 표를 만든다(있으면 그대로). 실패는 예외 */
     fun createSchema()
-    /** 묶음을 저장한다. 이미 있는 항목(같은 스트림 ID)은 건너뛴다. 새로 들어간 줄 수를 돌려준다. 실패는 예외 */
-    fun insertAll(visits: List<Visit>): Int
+    /** 묶음을 저장한다. 이미 있는 항목(같은 스트림 ID)은 건너뛴다. 새로 들어간 줄의 스트림 ID 를 돌려준다(이미 있던 것은 빠진다). 실패는 예외 */
+    fun insertAll(visits: List<Visit>): Set<StreamId>
 }
 
 /**
@@ -49,6 +50,8 @@ class VisitCollector(
     @Volatile var storedTotal: Long = 0; private set
     /** 이 프로세스가 뜬 뒤 경로의 `?` · `#` 뒤를 잘라 내고 저장한 항목 수 */
     @Volatile var queryStripped: Long = 0; private set
+    /** 이 프로세스가 뜬 뒤 받았지만 표에 이미 있어(같은 스트림 ID) 넣지 않은 항목 수 — 뼈대: 구현 워커가 센다 */
+    @Volatile var alreadyStored: Long = 0; private set
 
     /** 이 프로세스가 뜬 뒤 버린 항목 수 — 이유마다(모든 이유가 들고, 없으면 0) */
     fun droppedCounts(): Map<VisitDropReason, Long> = dropped.mapValues { it.value.get() }
