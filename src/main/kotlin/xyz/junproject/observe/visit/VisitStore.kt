@@ -73,8 +73,11 @@ class VisitStore(private val ingest: JdbcTemplate, private val query: JdbcTempla
             visits.map { arrayOf<Any?>(it.id.millis, it.id.sequence, it.path, it.screen, it.referrerHost, it.device.wireName, it.visitor, it.ip) },
             intArrayOf(Types.BIGINT, Types.INTEGER, Types.VARCHAR, Types.VARCHAR, Types.VARCHAR, Types.VARCHAR, Types.VARCHAR, Types.VARCHAR),
         )
-        // 뼈대: 아직 "결과 모름"을 넣은 것으로 친다 — 구현 워커가 resultUnknown 으로 가른다
-        return VisitInsertion(visits.filterIndexed { index, _ -> results[index] > 0 || results[index] == java.sql.Statement.SUCCESS_NO_INFO }.map { it.id }.toSet())
+        // 줄마다: 1 이상 = 새로 넣음 · SUCCESS_NO_INFO = 결과 모름(넣은 것으로 치지 않는다) · 0 = 이미 있음
+        return VisitInsertion(
+            inserted = visits.filterIndexed { index, _ -> results[index] > 0 }.map { it.id }.toSet(),
+            resultUnknown = visits.filterIndexed { index, _ -> results[index] == java.sql.Statement.SUCCESS_NO_INFO }.map { it.id }.toSet(),
+        )
     }
 
     /**

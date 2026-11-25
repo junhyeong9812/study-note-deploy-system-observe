@@ -359,16 +359,17 @@ front ── XADD visits ──▶ Redis ──▶ 관측 서버(방문 전용 �
 | `status` | 지표와 같은 낱말 · 판정 순서(`unreachable` → `failing` → `ok` → `starting` → `stalled`), 방문 수집 바퀴 · `visits` 스트림 · `visit_event` 표 기준. 수집은 `ok` 인데 가장 오래된 줄이 `지금 − (90일 + 26시간)` 보다 오래되면 `ok` 대신 `retention_overdue` — 90일 삭제가 밀려 보관 기한을 넘긴 주소가 남아 있다(실패 · 예산 초과가 이어짐). 로그 수집의 `status` · HTTP 상태는 바꾸지 않는다 |
 | `last_loop_at` · `last_stored_at` · `stored_since_start` · `unacknowledged` · `lag` · `failure` | 로그의 같은 칸과 같은 뜻. `last_stored_at` 은 가장 최근 방문의 시각. `stored_since_start` 는 표에 새로 넣은 수. `failure` 는 예외 종류 이름만 |
 | `already_stored` | 이 프로세스가 뜬 뒤 받았지만 표에 이미 있어(같은 스트림 ID — 앞 자리가 저장하고 확인 전에 죽음) 넣지 않은 수. 저장 수 · 자른 수에 들지 않는다 |
+| `store_result_unknown` | 저장 문장은 성공했지만 드라이버가 줄의 결과를 알려 주지 않은("결과 모름") 수 — 저장 수 · 이미 있음 · 자른 수 어디에도 세지 않는다(짐작하지 않는다). 풀 주소에 `reWriteBatchedInserts=false` 를 박으므로 보통 0 이다 |
 | `oldest_stored_at` | 가장 오래된 방문의 시각(표가 비거나 없으면 빈 문자열) |
 | `dropped` · `dropped_total` · `query_stripped` | 이 프로세스가 뜬 뒤 버린 항목 수(이유별 — 모든 이유가 0 부터) · 그 합 · 경로의 `?` · `#` · `;` 뒤를 잘라 내고 새로 저장한 수 |
-| `last_retention_at` · `last_retention_deleted` · `last_retention_failure` | 마지막 90일 삭제의 시각 · 지운 줄 수 · 실패 종류(안 돌았으면 빈 문자열 · -1) |
+| `last_retention_at` · `last_retention_deleted` · `last_retention_failure` | 마지막 90일 삭제의 시각 · 지운 줄 수 · 실패 종류(안 돌았으면 빈 문자열 · -1). 도중에 실패해도 그때까지 지운 수가 남는다(묶음마다 커밋 — 첫 묶음에서 실패하면 0) |
 
 ### 보관 · 설정
 
 - 90일: 매일 03:40(서울, `VISITS_RETENTION_CRON`) `지금 − 90일` 보다 오래된 줄을 지운다(시각 기준 — 서울의 날짜로 자르지 않는다). 지운 수는 서버 로그와 헬스에, 실패는 종류 이름만. 로그 · 지표 · 로그인 시도 삭제와 따로 돈다.
 - 나눠 지운다: 한 문장에 `VISITS_RETENTION_BATCH_SIZE` 줄까지, 문장마다 따로 커밋해 그 사이에 수집이 연결을 쓴다. 한 문장이 그보다 적게 지우면 끝. 한 번의 실행이 `VISITS_RETENTION_TIME_BUDGET` 을 넘기면 그 문장 뒤에 멈추고(로그 한 줄 — 지운 수와 남았다는 것) 다음 실행이 잇는다. 밀린 것이 남아 하루를 넘기면 헬스가 `retention_overdue` 다.
 - **삭제는 끌 수 없다**: `VISITS_RETENTION_CRON=-` 이면 서버가 뜨지 않는다(주소를 저장하면서 삭제를 끌 수 없다). 묶음 크기가 1 보다 작거나 예산이 0 이하여도 뜨지 않는다.
-- 연결 풀은 방문 전용(수집 1 — 하루 한 번의 삭제와 함께 쓴다 · 조회 1 · 헬스 1).
+- 연결 풀은 방문 전용(수집 1 — 하루 한 번의 삭제와 함께 쓴다 · 조회 1 · 헬스 1). 세 풀은 DB 주소에 `logServerErrorDetail=false`(드라이버 예외 글 · 풀의 로그에 주소 · 구분값이 실리지 않게)와 `reWriteBatchedInserts=false`(묶음 저장이 줄마다 결과를 돌려 저장 수를 셀 수 있게)를 박는다 — `OBSERVE_DB_URL` 에 다른 값이 있어도 이 값으로 바뀐다.
 
 | 설정(환경변수) | 기본 | 뜻 |
 |---|---|---|

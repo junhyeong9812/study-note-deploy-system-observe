@@ -67,32 +67,34 @@ class VisitSchedule(
         deleteOldVisits(Instant.now())
     }
 
-    /** [now] 기준 [VisitStore.RETENTION] 보다 오래된 방문을 지운다 — 기준 시각의 경계를 테스트가 시계를 정해 확인할 수 있게 나눴다 */
-    internal fun deleteOldVisits(now: Instant): Int? =
-        runCatching { deleteInBatches(now.minus(VisitStore.RETENTION)) }
-            .onSuccess {
-                log.info("observe:observe:deleted {} visits older than {} days", it, VisitStore.RETENTION.toDays())
-                retentionResult = RetentionResult(now, it, null)
-            }
-            .onFailure {
-                log.error("observe:observe:visit retention failed: {}", it.javaClass.simpleName)
-                retentionResult = RetentionResult(now, null, it.javaClass.simpleName)
-            }
-            .getOrNull()
-
-    private fun deleteInBatches(cutoff: Instant): Int {
+    /**
+     * [now] 기준 [VisitStore.RETENTION] 보다 오래된 방문을 지운다 — 기준 시각의 경계를 테스트가 시계를 정해 확인할 수 있게 나눴다.
+     * 지운 수를 돌려주고, 실패하면 null. 묶음은 하나씩 커밋되므로 도중에 실패해도 그때까지 지운 수를 [lastRetention] 과 ERROR 줄에 남긴다.
+     */
+    internal fun deleteOldVisits(now: Instant): Int? {
+        val cutoff = now.minus(VisitStore.RETENTION)
         val startedAt = clock()
         var deleted = 0
-        while (true) {
-            val deletedNow = retention.deleteOlderThan(cutoff, retentionBatchSize)
-            deleted += deletedNow
-            if (deletedNow < retentionBatchSize) return deleted
-            if (Duration.between(startedAt, clock()) >= retentionTimeBudget) {
-                log.warn("observe:observe:visit retention stopped at the time budget ({}) after deleting {} visits — older visits remain, the next run continues",
-                    retentionTimeBudget, deleted)
-                return deleted
+        try {
+            while (true) {
+                val deletedNow = retention.deleteOlderThan(cutoff, retentionBatchSize)
+                deleted += deletedNow
+                if (deletedNow < retentionBatchSize) break
+                if (Duration.between(startedAt, clock()) >= retentionTimeBudget) {
+                    log.warn("observe:observe:visit retention stopped at the time budget ({}) after deleting {} visits — older visits remain, the next run continues",
+                        retentionTimeBudget, deleted)
+                    break
+                }
             }
+        } catch (error: Exception) {
+            // 예외의 글은 싣지 않는다 — 방문 표의 오류 글에는 줄의 값이 실릴 수 있다. 종류 이름만
+            log.error("observe:observe:visit retention failed after deleting {} visits: {}", deleted, error.javaClass.simpleName)
+            retentionResult = RetentionResult(now, deleted, error.javaClass.simpleName)
+            return null
         }
+        log.info("observe:observe:deleted {} visits older than {} days", deleted, VisitStore.RETENTION.toDays())
+        retentionResult = RetentionResult(now, deleted, null)
+        return deleted
     }
 
     private companion object {

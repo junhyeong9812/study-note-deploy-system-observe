@@ -20,7 +20,7 @@ import java.util.concurrent.TimeoutException
  *   `failing`(마지막 바퀴 실패) → `ok`(마지막 성공 바퀴가 [stallAfter] 안) → `starting`(뜬 지 [stallAfter] 안, 아직 성공 없음) → `stalled`.
  *   `ok` 일 때 가장 오래된 줄이 `now − (90일 + [RETENTION_GRACE])` 보다 엄격히 오래되면 `retention_overdue`(90일 삭제가 밀림 — `ok` 만 대신한다).
  * - `last_loop_at` · `last_stored_at`(가장 최근 방문의 스트림 시각) · `oldest_stored_at`(가장 오래된 방문의 스트림 시각) · `stored_since_start` ·
- *   `already_stored`(받았지만 표에 이미 있던 항목 수) · `unacknowledged` · `lag` · `failure`
+ *   `already_stored`(받았지만 표에 이미 있던 항목 수) · `store_result_unknown`(저장소가 "결과 모름"을 돌려준 항목 수) · `unacknowledged` · `lag` · `failure`
  * - `dropped`: 이유 글자 → 건수(모든 이유, 없으면 0) · `dropped_total` · `query_stripped`
  * - `last_retention_at` · `last_retention_deleted` · `last_retention_failure`(90일 삭제)
  * 바깥에 묻는 것(미확인 · 밀린 건수, 마지막 · 가장 오래된 저장 시각)은 한꺼번에 시작해 합쳐 [readBudget] 안에서만 기다린다 — 넘기면 `TimeoutException` 실패와 같다.
@@ -73,6 +73,7 @@ class VisitHealth(
             "oldest_stored_at" to (oldest.getOrNull()?.toString() ?: ""),
             "stored_since_start" to collector.storedTotal,
             "already_stored" to collector.alreadyStored,
+            "store_result_unknown" to collector.storeResultUnknown,
             "unacknowledged" to (pending.getOrNull() ?: -1L),
             "lag" to (awaitRead(lagRead, deadline).getOrNull() ?: -1L),
             "failure" to problems.ifEmpty { failure ?: "" },

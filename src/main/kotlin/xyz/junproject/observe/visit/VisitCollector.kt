@@ -12,7 +12,7 @@ import java.util.concurrent.atomic.AtomicLong
 
 /**
  * 묶음 저장의 결과 — [inserted] 는 새로 넣은 줄의 스트림 ID, [resultUnknown] 은 드라이버가 "결과 모름"(`Statement.SUCCESS_NO_INFO`)을 돌려준 항목.
- * 둘 다 아닌 항목은 표에 이미 있던 것이다. 뼈대: 구현 워커가 [resultUnknown] 을 채우고 센다.
+ * 둘 다 아닌 항목은 표에 이미 있던 것이다.
  */
 data class VisitInsertion(val inserted: Set<StreamId>, val resultUnknown: Set<StreamId> = emptySet())
 
@@ -59,7 +59,7 @@ class VisitCollector(
     @Volatile var queryStripped: Long = 0; private set
     /** 이 프로세스가 뜬 뒤 받았지만 표에 이미 있어(같은 스트림 ID) 넣지 않은 항목 수 */
     @Volatile var alreadyStored: Long = 0; private set
-    /** 이 프로세스가 뜬 뒤 저장소가 "결과 모름"을 돌려준 항목 수 — 뼈대: 구현 워커가 센다 */
+    /** 이 프로세스가 뜬 뒤 저장소가 "결과 모름"을 돌려준 항목 수 — 저장 수 · 이미 있음 · 자른 수 어디에도 세지 않는다(넣었는지 짐작하지 않는다) */
     @Volatile var storeResultUnknown: Long = 0; private set
 
     /** 이 프로세스가 뜬 뒤 버린 항목 수 — 이유마다(모든 이유가 들고, 없으면 0) */
@@ -126,10 +126,12 @@ class VisitCollector(
             }
         }
         if (accepted.isNotEmpty()) {
-            val inserted = sink.insertAll(accepted).inserted      // 실패하면 예외 → 아래 확인을 하지 않는다(다음 바퀴에 다시 받는다)
-            source.acknowledge(acceptedIds)
+            val insertion = sink.insertAll(accepted)     // 실패하면 예외 → 아래 확인을 하지 않는다(다음 바퀴에 다시 받는다)
+            source.acknowledge(acceptedIds)              // 결과 모름도 확인한다 — 저장 문장은 성공했다
+            val inserted = insertion.inserted
             storedTotal += inserted.size
-            alreadyStored += accepted.count { it.id !in inserted }
+            storeResultUnknown += accepted.count { it.id in insertion.resultUnknown }
+            alreadyStored += accepted.count { it.id !in inserted && it.id !in insertion.resultUnknown }
             queryStripped += strippedIds.count { it in inserted }
         }
         return records.size

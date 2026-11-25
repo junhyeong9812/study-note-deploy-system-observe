@@ -285,8 +285,8 @@ class ObserveConfiguration {
      * 방문 쪽이 무겁거나 실패해도 로그 · 지표의 풀을 잡지 않는다. 헬스 풀은 지표의 헬스 풀과 같은 꼴(연결 하나 · 대기 2초 · 문장 2초).
      * 단순화: 90일 삭제는 수집과 연결 하나를 나눠 쓴다 — 삭제하는 동안 수집 바퀴가 연결을 5초 넘게 기다리면 실패로 남고 다시 시도한다(항목은 잃지 않는다).
      * 하루치 삭제가 몇 초 안에 끝나는 동안(하루 방문 수만 줄 안팎)은 문제없다 — 삭제가 그보다 길어지면 삭제 전용 연결을 따로 둔다.
-     * 세 풀 모두 서버 오류의 세부를 드라이버 예외 글에 싣지 않는다([withoutServerErrorDetail]) — 연결이 끊긴 쪽 오류면 풀이 그 예외를
-     * 통째로 로그에 남기는데, 묶음 저장의 값이나 서버 오류의 세부(DETAIL)에 주소 · 구분값이 실린다.
+     * 세 풀의 주소는 [visitJdbcUrl] 이 만든다 — 서버 오류의 세부를 드라이버 예외 글에 싣지 않고(연결이 끊긴 쪽 오류면 풀이 그 예외를
+     * 통째로 로그에 남기는데, 묶음 저장의 값이나 서버 오류의 세부(DETAIL)에 주소 · 구분값이 실린다), 묶음 저장이 줄마다 결과를 돌려주게 한다.
      */
     @Bean
     fun visitStore(
@@ -294,25 +294,28 @@ class ObserveConfiguration {
         @Value("\${observe.db.user}") user: String,
         @Value("\${observe.db.password}") password: String,
     ): VisitStore {
-        val visitUrl = withoutServerErrorDetail(url)
+        val visitUrl = visitJdbcUrl(url)
         val ingest = pool("observe-visit-ingest", visitUrl, user, password, size = 1, statementTimeoutMs = 30_000)
         val query = pool("observe-visit-query", visitUrl, user, password, size = 1, statementTimeoutMs = 10_000)
         val health = pool("observe-visit-health", visitUrl, user, password, size = 1, statementTimeoutMs = 2_000, connectionTimeoutMs = 2_000, validationTimeoutMs = 1_000)
         return VisitStore(JdbcTemplate(ingest), JdbcTemplate(query), JdbcTemplate(health))
     }
 
-    /** JDBC 주소에 `logServerErrorDetail=false` — 이미 `?` 가 있으면 `&` 로 잇고, 그 매개변수가 이미 있으면 덧붙이지 않고 값을 false 로 바꾼다 */
-    private fun withoutServerErrorDetail(url: String): String {
-        val existing = Regex("([?&])logServerErrorDetail=[^&]*")
-        return if (existing.containsMatchIn(url)) url.replace(existing, "$1logServerErrorDetail=false")
-        else url + (if ('?' in url) "&" else "?") + "logServerErrorDetail=false"
-    }
-
     private var sharedVisitStreamSource: RedisMetricStreamSource? = null
 
     companion object {
-        /** 방문 풀 셋의 JDBC 주소 — 뼈대: 지금은 [withoutServerErrorDetail] 만. 구현 워커가 `reWriteBatchedInserts=false` 도 박고 [visitStore] 가 이것을 쓰게 한다 */
-        internal fun visitJdbcUrl(url: String): String = ObserveConfiguration().withoutServerErrorDetail(url)
+        /** 방문 풀이 주소에 박는 드라이버 설정 — 주어진 주소에 이미 있어도(값이 무엇이든) 이 값 하나만 남긴다 */
+        private val VISIT_DRIVER_SETTINGS = listOf(
+            "logServerErrorDetail" to "false",   // 드라이버 예외 글에 서버 오류의 세부 · 넣으려던 값(주소 · 구분값)을 싣지 않는다
+            "reWriteBatchedInserts" to "false",  // 묶음 저장이 줄마다 결과를 돌려준다 — 켜지면 모든 줄이 "결과 모름"이 되어 저장한 수를 셀 수 없다
+        )
+
+        /** 방문 풀 셋의 JDBC 주소 — 주소의 앞부분과 다른 매개변수는 그대로 두고 [VISIT_DRIVER_SETTINGS] 를 꼭 한 번씩 붙인다(물음표는 하나) */
+        internal fun visitJdbcUrl(url: String): String {
+            val names = VISIT_DRIVER_SETTINGS.map { it.first }
+            val others = url.substringAfter('?', "").split('&').filter { it.isNotEmpty() && it.substringBefore('=') !in names }
+            return url.substringBefore('?') + "?" + (others + VISIT_DRIVER_SETTINGS.map { (name, value) -> "$name=$value" }).joinToString("&")
+        }
     }
 
     /**
