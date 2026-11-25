@@ -49,6 +49,11 @@ services:
     volumes:
       - ./deploy/active:/etc/nginx:ro            # nginx 가 읽는 것은 git 밖의 활성 디렉토리뿐
     restart: unless-stopped
+    logging:   # 접속 기록(통신 규약 v1)이 표준 출력으로 가므로 크기를 묶는다 — 에이전트는 json-file 을 도커 API 로 읽는다
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # 로그 저장소. profiles 가 없어 이름 없이 `docker compose up -d` 해도 뜬다. 두 자리가 같은 DB 를 본다.
   postgres:
