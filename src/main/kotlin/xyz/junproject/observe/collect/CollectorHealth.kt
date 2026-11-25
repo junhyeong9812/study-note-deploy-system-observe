@@ -84,7 +84,9 @@ class CollectorHealth(
         val sections = listOfNotNull(metricReport?.let { "metrics" to it }, trafficReport?.let { "traffic" to it }).associate { (name, report) ->
             name to runCatching { report.get() }.getOrElse {
                 val cause = (it as? ExecutionException)?.cause ?: it
-                log.error("observe:observe:{} health failed: {}", name, cause.javaClass.simpleName)
+                // 지표 칸은 기존 글 그대로(종류와 문구 200자), 통신 칸은 종류만 — 통신 쪽 문구에는 항목의 경로가 실릴 수 있다
+                if (name == "metrics") log.error("observe:observe:metric health failed: {}: {}", cause.javaClass.simpleName, cause.message?.take(200))
+                else log.error("observe:observe:traffic health failed: {}", cause.javaClass.simpleName)
                 mapOf("status" to "failing", "failure" to "health ${cause.javaClass.simpleName}")
             }
         }

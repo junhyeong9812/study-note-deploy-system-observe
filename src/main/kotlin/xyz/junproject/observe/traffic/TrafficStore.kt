@@ -73,6 +73,18 @@ interface TrafficReader {
     fun requestSpans(requestId: String, limit: Int): List<TrafficSpan>
 
     /**
+     * 지도용 — 칸 시작이 `[from, to)` 인 원본 칸을 (서버 · 서비스 · 호출자 · 갈래 · 채우는 중)마다 합친 것. 채우는 중의 경계는 칸마다 그 칸의 서버의 읽기 진도
+     * ([serverProgress] 의 `readProgressAt`, 없으면 모두 채우는 중)다. 기본은 [cells] 를 읽어 합치고, 저장소는 같은 합을 SQL 에서 낸다(돌아오는 행이 칸이 아니라 선에 비례하게).
+     */
+    fun edgeTotals(from: Instant, to: Instant): List<TrafficEdgeTotals> {
+        val readProgress = serverProgress().associate { it.server to it.readProgressAt }
+        return cells(TrafficCellQuery(from, to, from))
+            .groupBy { cell -> TrafficEdgeTotals(cell.server, cell.service, cell.caller, cell.trafficClass,
+                TrafficReadProgress.isFilling(cell.bucketStart.plus(cell.width), readProgress[cell.server]), TrafficTotals.EMPTY) }
+            .map { (key, cells) -> key.copy(totals = cells.fold(TrafficTotals.EMPTY) { sum, cell -> sum + cell.totals }) }
+    }
+
+    /**
      * 시계열용 — [cells] 를 [origin] 에서 시작하는 [step] 간격으로 서버마다 합친 것(호출자는 합친다 · 서버 · 간격순). 기본은 [cells] 를 읽어 합치고,
      * 저장소는 같은 합을 SQL 에서 낸다(긴 기간의 칸을 하나씩 읽어 오지 않게).
      */
@@ -84,6 +96,19 @@ interface TrafficReader {
             }
             .sortedWith(compareBy({ it.server }, { it.stepStart }))
 }
+
+/**
+ * 지도의 선 하나를 서버 · "채우는 중" 여부로 나눈 합 — [filling] 은 그 칸들이 그 서버의 읽기 진도로 "채우는 중"인가([TrafficReadProgress.isFilling]).
+ * 같은 `(server, service, caller, trafficClass, filling)` 은 한 행이다.
+ */
+data class TrafficEdgeTotals(
+    val server: String,
+    val service: String,
+    val caller: String,
+    val trafficClass: TrafficClass,
+    val filling: Boolean,
+    val totals: TrafficTotals,
+)
 
 /** 시계열의 간격 하나의 합(서버 하나) — [lastCellEnd] 는 그 간격에 든 칸 가운데 가장 늦게 끝나는 칸의 끝("채우는 중" 판정용) */
 data class TrafficStepTotals(val server: String, val stepStart: Instant, val lastCellEnd: Instant, val totals: TrafficTotals)
@@ -316,6 +341,7 @@ class TrafficStore(
     /**
      * 순번 요약을 고치고 읽기 진도를 민다([TrafficServerProgress] 의 규칙) — 요약 행을 먼저 잠근다(upsert 가 그 행을 잡는다). 두 자리가 같은 세대의
      * 다른 순번을 함께 받으면 뒤의 것은 이 행에서 앞의 것의 커밋까지 기다렸다가, 앞의 것이 넣은 열쇠까지 보고 진도를 민다.
+     * 처음 본 순번이 낮아졌으면 upsert 가 끝을 그 앞으로 되돌려 두었으므로 여기서 받은 열쇠를 따라 다시 잇는다(같은 행 잠금 안에서).
      */
     private fun advanceProgress(entry: TrafficEntry) {
         val received = entry.receivedAt.toEpochMilli()
@@ -361,6 +387,29 @@ class TrafficStore(
             RowCallbackHandler { row -> cells += row.toCell(CELL) }, maxOf(from, rawSince), to, *filterArguments,
         )
         return cells.sortedWith(compareBy({ it.server }, { it.bucketStart }, { it.service }, { it.caller }, { it.trafficClass.wireName }))
+    }
+
+    /**
+     * 지도의 합을 SQL 에서 — 서버의 읽기 진도(세대들의 `contiguous_read_ms` 가운데 가장 큰 것)와 칸의 끝(`bucket_ms + 30초`)을 견줘 채우는 중을 가르고
+     * (서버 · 서비스 · 호출자 · 갈래 · 채우는 중)으로 묶는다. 돌아오는 행은 선 × 서버 × 2 이하다.
+     */
+    override fun edgeTotals(from: Instant, to: Instant): List<TrafficEdgeTotals> {
+        ensureSchema()
+        val cell = CELL.toMillis()
+        val margin = TrafficReadProgress.FILLING_MARGIN.toMillis()
+        return query.query(
+            """WITH progress AS (SELECT server, max(contiguous_read_ms) AS read_ms FROM traffic_generation GROUP BY server)
+               SELECT segment.server, service, caller, class,
+                      (progress.read_ms IS NULL OR segment.bucket_ms + ? > progress.read_ms - ?) AS filling, $TOTALS_SUMMED
+               FROM traffic_segment segment LEFT JOIN progress ON progress.server = segment.server
+               WHERE segment.bucket_ms >= ? AND segment.bucket_ms < ?
+               GROUP BY segment.server, service, caller, class, filling""",
+            { row, _ ->
+                TrafficEdgeTotals(row.getString("server"), row.getString("service"), row.getString("caller"),
+                    requireNotNull(TrafficClass.of(row.getString("class"))) { "저장된 갈래를 모른다" }, row.getBoolean("filling"), row.toTotals())
+            },
+            cell, margin, from.toEpochMilli(), to.toEpochMilli(),
+        )
     }
 
     /** 칸을 간격으로 합치는 것까지 SQL 에서 — 원본(30초)과 5분 묶음을 이어 붙여 서버 · 간격마다 하나로 */
@@ -596,13 +645,19 @@ class TrafficStore(
             """INSERT INTO traffic_receipt (server, generation, seq, read_ms, received_ms, requests_dropped, requests_rejected, missing)
                VALUES (?,?,?,?,?,?,?,?) ON CONFLICT (server, generation, seq) DO NOTHING"""
 
-        /** 순번 요약 — 처음 보는 세대면 그 순번이 처음 본 순번이고 끝은 그 앞. 받은 수는 처음 본 순번 이상만 센다 */
+        /**
+         * 순번 요약 — 처음 본 순번은 그 세대에서 받은 가장 작은 순번이고(먼저 커밋된 순번이 아니다) 받은 수는 늘 센다. 처음 본 순번이 낮아지면
+         * 끝을 그 앞으로 되돌리고 끝의 `at` 을 비운다 — 받은 열쇠를 따라 다시 잇는다([advanceProgress]). SET 의 `summary.*` 는 고치기 전의 값이다
+         */
         private const val UPSERT_GENERATION =
             """INSERT INTO traffic_generation AS summary (server, generation, first_seq, max_seq, received_count, contiguous_seq, first_received_ms, last_received_ms)
                VALUES (?, ?, ?, ?, 1, ?, ?, ?)
                ON CONFLICT (server, generation) DO UPDATE SET
+                 first_seq = LEAST(summary.first_seq, EXCLUDED.first_seq),
                  max_seq = GREATEST(summary.max_seq, EXCLUDED.max_seq),
-                 received_count = summary.received_count + CASE WHEN EXCLUDED.first_seq >= summary.first_seq THEN 1 ELSE 0 END,
+                 received_count = summary.received_count + 1,
+                 contiguous_seq = CASE WHEN EXCLUDED.first_seq < summary.first_seq THEN EXCLUDED.contiguous_seq ELSE summary.contiguous_seq END,
+                 contiguous_read_ms = CASE WHEN EXCLUDED.first_seq < summary.first_seq THEN NULL ELSE summary.contiguous_read_ms END,
                  last_received_ms = GREATEST(summary.last_received_ms, EXCLUDED.last_received_ms)
                RETURNING contiguous_seq, contiguous_read_ms"""
 

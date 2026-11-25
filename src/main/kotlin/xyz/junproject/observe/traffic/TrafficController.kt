@@ -28,7 +28,8 @@ import java.time.format.DateTimeParseException
  *
  * - `GET /traffic/map?from=&to=` → `{from, to, servers, edges}`. 기간: 둘 다 없으면 최근 5분, 최대 24시간(정확히 24시간은 받는다). 원본 칸만 읽는다
  *   (`rawSince = from`). `edges[]`: `(service, caller, class)` 마다 `{service, caller, class, <statistics>, filling_count}` — 수치는 **채워진 칸만**,
- *   "채우는 중"인 칸([TrafficReadProgress.isFilling] — 그 칸의 서버의 읽기 진도로)의 수는 `filling_count` 에만. 서비스 · 호출자 · 갈래순.
+ *   "채우는 중"인 칸([TrafficReadProgress.isFilling] — 그 칸의 서버의 읽기 진도로)의 **요청 수**는 `filling_count` 에만(`count + filling_count` = 전체).
+ *   합은 [TrafficReader.edgeTotals] 가 낸다. 서비스 · 호출자 · 갈래순.
  * - `GET /traffic/series?service=&caller=&class=&from=&to=` → `{service, caller, class, from, to, step_ms, source, servers, points}`.
  *   `service` 필수, `caller` 선택(없으면 모든 호출자의 합 — 답의 `caller` 는 null), `class` 기본 `request`. 기간: 둘 다 없으면 최근 1시간, 최대 31일.
  *   간격 · 읽는 곳은 [xyz.junproject.observe.metric.SeriesPlan] 과 같다. `points[]`: 칸이 있는 간격마다 `{at, <statistics>, filling}` — `filling` 은 그 간격에
@@ -98,14 +99,13 @@ class TrafficController(
         val (start, end) = try { range(from, to, now, MAP_DEFAULT_RANGE, MAP_MAX_RANGE) } catch (error: Invalid) { return invalid(error.detail) }
         return answering("map") {
             val progress = reader.serverProgress()
-            val readProgress = progress.associate { it.server to it.readProgressAt }
-            // 단순화: 지도는 기간(최대 24시간)의 30초 칸을 하나씩 읽어 여기서 합친다 — 서버 넷 · 선 열 개면 24시간에 약 11만 칸. 느려지면 SQL 에서 서버 · 선 · 채우는 중으로 묶는다
-            val edges = reader.cells(TrafficCellQuery(start, end, start)).groupBy { Triple(it.service, it.caller, it.trafficClass) }
+            // 저장소가 (서버 · 선 · 채우는 중)마다 합쳐 준다 — 여기서는 서버들을 선마다 더하기만
+            val edges = reader.edgeTotals(start, end).groupBy { Triple(it.service, it.caller, it.trafficClass) }
                 .toSortedMap(compareBy({ it.first }, { it.second }, { it.third.wireName }))
-                .map { (key, cells) ->
-                    val (filling, settled) = cells.partition { TrafficReadProgress.isFilling(it.bucketStart.plus(it.width), readProgress[it.server]) }
+                .map { (key, rows) ->
+                    val (filling, settled) = rows.partition { it.filling }
                     mapOf("service" to key.first, "caller" to key.second, "class" to key.third.wireName) +
-                        statistics(settled.fold(TrafficTotals.EMPTY) { sum, cell -> sum + cell.totals }) +
+                        statistics(settled.fold(TrafficTotals.EMPTY) { sum, row -> sum + row.totals }) +
                         ("filling_count" to filling.sumOf { it.totals.count })
                 }
             ok(mapOf("from" to start.toString(), "to" to end.toString(), "servers" to servers(progress, start, end, now), "edges" to edges))

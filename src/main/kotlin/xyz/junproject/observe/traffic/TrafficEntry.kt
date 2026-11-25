@@ -148,12 +148,12 @@ object TrafficCellAge {
  *
  * 꼴(틀리면 `invalid_body`): body 는 객체이고 `sources`(객체의 배열) · `missing`([MISSING] 꼴 글자의 배열) · `segments` · `requests`(배열, [MAX_REQUESTS] 줄까지) ·
  * `requests_dropped`(0 이상 정수) · `dependencies`(배열 — 내용은 보지 않는다)가 모두 있다.
- * 묶음: `bucket_start_ms`(양의 정수, 30000 의 배수) · `service` · `caller`([NAME] 꼴 — 닫힌 목록이 아니다) · `class`(request · health · stream) · `count`(1 이상) ·
+ * 묶음: `bucket_start_ms`(양의 정수, 30000 의 배수) · `service` · `caller`([NAME] 꼴 — 닫힌 목록이 아니다) · `class`(request · health · stream) · `count`(1 이상 [MAX_CELL_COUNT] 이하 — 분포의 각 값도 그 이하) ·
  * `status`(다섯 열쇠 모두, 0 이상 정수, 합 = count) · `buckets`(0 이상 정수 20개) · `max_ms`(request 면 0 이상 정수, 아니면 null) — request 는 분포의 합 = count,
  * 아니면 분포가 모두 0. 한 항목 안에서 열쇠 `(bucket_start_ms, service, caller, class)` 는 겹치지 않는다.
  * 요청별 줄: `request_id`([REQUEST_ID]) · `service` · `caller`([NAME]) · `method`([METHOD]) · `path`(1024자까지, 제어 문자가 없다 — 규약 3.2)
- * — 경로에 `?` 가 있거나 주소 꼴(IPv4 점 넷 · IPv6 콜론 둘 이상의 16진 묶음, `%3A` · `%2E` 를 푼 뒤에도)이 들었으면 **그 줄만** 버리고
- * [TrafficEntry.requestsRejected] 에 센다(항목 · 묶음은 그대로 — 묶음에는 경로가 없다). 점 셋 미만(`/release/1.2.3`) · 콜론 하나(`/time/12:30`)는 주소가 아니다 ·
+ * — 경로에 `?` · `%3F` 가 있거나 주소 꼴([isPathAllowed])이 들었으면 **그 줄만** 버리고
+ * [TrafficEntry.requestsRejected] 에 센다(항목 · 묶음은 그대로 — 묶음에는 경로가 없다). 점 셋 미만(`/release/1.2.3`) · 콜론만 이은 낱말(`/time/12:30:00`)은 주소가 아니다 ·
  * `path_truncated`(참 · 거짓) · `status`(0~999 정수) · `end_ms`(양의 정수) · `duration_ms` · `bytes_sent`(0 이상 정수) · `upstream_ms`(0 이상 정수 또는 null) ·
  * `upstream_status` · `slot`(128자까지의 글자 또는 null). 칸은 생략하지 않는다(규약 4.3) — 빠지면 꼴이 틀린 것.
  */
@@ -179,11 +179,20 @@ object TrafficEntryParser {
     private val STREAM_FIELDS = listOf("v", "server", "generation", "seq", "at", "body")
     private val STATUS_KEYS = listOf("2xx", "3xx", "4xx", "5xx", "other")
 
-    /** 경로 안의 주소 꼴 — IPv4 는 점으로 이은 수 넷, IPv6 는 콜론 둘 이상으로 이은 16진 묶음 */
-    private val IPV4 = Regex("(?<![0-9])[0-9]{1,3}(\\.[0-9]{1,3}){3}(?![0-9])")
-    private val IPV6 = Regex("([0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f]{0,4}")
-    private val ENCODED_COLON = Regex("%3[Aa]")
-    private val ENCODED_DOT = Regex("%2[Ee]")
+    /** 한 칸의 `count` 와 분포의 각 값의 상한 — 넘치는 수 하나가 5분 묶음의 합을 오류로 만들어 그 구간의 묶음 · 삭제를 막지 않게 */
+    const val MAX_CELL_COUNT = 1_000_000_000L
+
+    /** 인코딩된 물음표 — 그 뒤의 검색어가 경로로 남는다 */
+    private val ENCODED_QUESTION = Regex("%3[Ff]")
+    /** 주소 꼴을 보기 전에 푸는 인코딩 — 콜론 · 점 · 대괄호 */
+    private val ENCODED_ADDRESS_CHARACTERS = mapOf(Regex("%3[Aa]") to ":", Regex("%2[Ee]") to ".", Regex("%5[Bb]") to "[", Regex("%5[Dd]") to "]")
+    /** 경로 안의 주소 꼴 — IPv4(점으로 이은 수 넷 · 앞뒤가 숫자가 아님) · 완전한 IPv6(16진 1~4자 묶음 여덟) · 겹콜론 꼴(`::` 의 앞이나 뒤에 16진 묶음) · 대괄호 안의 콜론 */
+    private val ADDRESS_SHAPES = listOf(
+        Regex("(?<![0-9])[0-9]{1,3}(\\.[0-9]{1,3}){3}(?![0-9])"),
+        Regex("(?<![0-9A-Fa-f])[0-9A-Fa-f]{1,4}(:[0-9A-Fa-f]{1,4}){7}(?![0-9A-Fa-f])"),
+        Regex("(?<![0-9A-Za-z])[0-9A-Fa-f]{1,4}::|::[0-9A-Fa-f]{1,4}(?![0-9A-Za-z])"),
+        Regex("\\[[^\\]]*:[^\\]]*]"),
+    )
 
     // 객체 뒤에 더 붙은 글자도 거절한다 — 지표의 해석과 같은 설정
     private val json = JsonMapper.builder().enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS).build()
@@ -239,11 +248,11 @@ object TrafficEntryParser {
         if (!node.isObject) throw Shape()
         val bucketStart = count(node, "bucket_start_ms").takeIf { it > 0 && it % CELL_MS == 0L } ?: throw Shape()
         val trafficClass = TrafficClass.of(text(field(node, "class"))) ?: throw Shape()
-        val count = count(node, "count").takeIf { it >= 1 } ?: throw Shape()
+        val count = count(node, "count").takeIf { it in 1..MAX_CELL_COUNT } ?: throw Shape()
         val statusNode = field(node, "status").takeIf { it.isObject } ?: throw Shape()
         val statuses = STATUS_KEYS.map { count(statusNode, it) }
         if (statuses.sum() != count) throw Shape()
-        val buckets = array(node, "buckets").map { counted(it) }
+        val buckets = array(node, "buckets").map { counted(it).takeIf { value -> value <= MAX_CELL_COUNT } ?: throw Shape() }
         if (buckets.size != TrafficDistribution.BUCKET_COUNT) throw Shape()
         val maxNode = field(node, "max_ms")
         val maxMs = if (trafficClass == TrafficClass.REQUEST) {
@@ -281,13 +290,13 @@ object TrafficEntryParser {
     }
 
     /**
-     * 요청별 줄의 경로로 받아도 되는가 — 쿼리(`?`)나 주소 꼴(퍼센트 인코딩한 `:` · `.` 를 푼 뒤에도)이 들었으면 아니다.
-     * 에이전트가 막는 것을 받는 쪽에서 한 번 더 막는다(규약 4.5 끝의 "그 줄만 버리는 경우").
+     * 요청별 줄의 경로로 받아도 되는가 — 날것 `?` · `%3F` 가 있거나, `%3A` · `%2E` · `%5B` · `%5D` 를 푼 뒤 주소 꼴([ADDRESS_SHAPES])이 들었으면 아니다.
+     * 에이전트가 막는 것을 받는 쪽에서 한 번 더 막는다(규약 4.5 끝의 "그 줄만 버리는 경우"). IPv4 꼴은 판 번호(`/release/1.2.3.4`)도 버린다 — 받아들인 한계.
      */
     private fun isPathAllowed(path: String): Boolean {
-        if ('?' in path) return false
-        val decoded = path.replace(ENCODED_COLON, ":").replace(ENCODED_DOT, ".")
-        return !IPV4.containsMatchIn(decoded) && !IPV6.containsMatchIn(decoded)
+        if ('?' in path || ENCODED_QUESTION.containsMatchIn(path)) return false
+        val decoded = ENCODED_ADDRESS_CHARACTERS.entries.fold(path) { text, (encoded, plain) -> text.replace(encoded, plain) }
+        return ADDRESS_SHAPES.none { it.containsMatchIn(decoded) }
     }
 
     /** 칸이 있어야 한다(JSON null 은 있는 것) — 칸은 생략하지 않는다(규약 4.3) */
