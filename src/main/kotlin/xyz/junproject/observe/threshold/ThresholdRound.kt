@@ -77,11 +77,15 @@ class ThresholdRound(
         if (dispatch != null && dispatch.delivered + dispatch.retrying + dispatch.rejected > 0) {
             log.info("observe:observe:alerts delivered {} · retrying {} · rejected {}", dispatch.delivered, dispatch.retrying, dispatch.rejected)
         }
-        // 이 판이 모르는 규칙 글자의 줄(섞인 판에서 새 판이 쓴 줄) — 잠금을 얻은 바퀴마다 한 줄. 줄은 남아 그 규칙을 아는 판이 보낸다
+        // 이 판이 모르는 규칙 글자의 줄(섞인 판에서 새 판이 쓴 줄) — 잠금을 얻은 바퀴마다 한 줄. 줄은 남아 그 규칙을 아는 판이 보낸다.
+        // 규칙 글자는 다른 판이 쓴 표의 값이라 로그에 찍을 때만 다듬는다: 제어 문자는 '?', 글자마다 64자, 규칙 글자 순으로 앞의 10가지
         val skipped = dispatch?.skippedUnknownRules.orEmpty()
         if (skipped.isNotEmpty()) {
-            log.warn("observe:observe:alerts skipped unknown rule lines (left for a version that knows the rule): {} · total {}",
-                skipped.toSortedMap().entries.joinToString(", ") { "${it.key}=${it.value}" }, skipped.values.sum())
+            val printed = skipped.toSortedMap().entries.take(LOGGED_RULES)
+                .joinToString(", ") { "${printableRule(it.key)}=${it.value}" }
+            val more = if (skipped.size > LOGGED_RULES) " (+${skipped.size - LOGGED_RULES} more)" else ""
+            log.warn("observe:observe:alerts skipped unknown rule lines (left for a version that knows the rule): {}{} · total {}",
+                printed, more, skipped.values.sum())
         }
         countAlerts()
         return dispatch
@@ -107,4 +111,13 @@ class ThresholdRound(
 
     /** 보낼 표의 건수(헬스용) — 읽지 못하면 null */
     fun alertCounts(): AlertCounts? = runCatching { queue.alertCounts() }.getOrNull()
+
+    private companion object {
+        const val LOGGED_RULES = 10
+        const val LOGGED_RULE_LENGTH = 64
+
+        /** 로그에 찍는 규칙 글자 — 줄바꿈 등으로 가짜 로그 줄을 만들 수 없게 제어 문자를 '?' 로, 길이를 [LOGGED_RULE_LENGTH] 까지 */
+        fun printableRule(rule: String): String =
+            rule.take(LOGGED_RULE_LENGTH).map { if (Character.isISOControl(it)) '?' else it }.joinToString("")
+    }
 }

@@ -15,7 +15,7 @@ import xyz.junproject.observe.threshold.ThresholdRound
  * 지표 수집의 헬스 칸 — `/health` 본문의 `metrics` 객체. **로그 수집의 `status` 와 HTTP 상태에는 넣지 않는다**(§10.3).
  * 실패 사유는 예외 종류 이름만(헬스는 인증이 없다).
  *
- * `metrics` 객체의 칸(값이 없으면 빈 문자열 · -1 — 기존 칸과 같은 관례):
+ * `metrics` 객체의 칸(값이 없으면 빈 문자열 · -1 — 기존 칸과 같은 관례. `skipped_unknown_rule_alerts` 만 null):
  * - `status`: 로그의 판정과 같은 낱말과 순서 — `unreachable`(지금 Redis 의 미확인 건수나 DB 의 마지막 저장 시각을 묻지 못함,
  *   표 없음 42P01 은 닿은 것으로 본다) → `failing`(마지막 바퀴 실패) → `ok`(마지막 성공 바퀴가 [stallAfter] 안) →
  *   `starting`(뜬 지 [stallAfter] 안, 아직 성공 없음) → `stalled`.
@@ -45,7 +45,7 @@ class MetricHealth(
     /**
      * 임계값 판정 · 보내기. 있으면 `metrics` 객체에 칸을 더한다: `last_judged_at`(마지막으로 판정한 시각, 없으면 빈 글자) ·
      * `last_judge_failure` · `last_dispatch_failure`(마지막 바퀴의 예외 종류, 없으면 빈 글자) · `undelivered_alerts` · `rejected_alerts` ·
-     * `skipped_unknown_rule_alerts`(못 보낸 줄 가운데 이 판이 모르는 규칙 글자라 건너뛰는 줄 — 읽지 못하면 -1).
+     * `skipped_unknown_rule_alerts`(못 보낸 줄 가운데 이 판이 모르는 규칙 글자라 건너뛰는 줄 — 세기 전 · 세지 못했으면 null).
      * 판정 · 보내기의 실패는 `metrics.status` 를 바꾸지 않는다. 없으면 칸도 없다(기존 칸 그대로).
      */
     private val thresholds: ThresholdRound? = null,
@@ -65,7 +65,7 @@ class MetricHealth(
     private val clockBehindLock = Any()
 
     /** `metrics` 객체 — 예외를 내지 않는다(묻지 못한 것은 위 규칙대로 칸에 남긴다) */
-    fun report(now: Instant): Map<String, Any> {
+    fun report(now: Instant): Map<String, Any?> {
         val lastLoopAt = collector.lastLoopAt
         val failure = collector.lastFailure
         // 바깥에 묻는 것은 모두 한꺼번에 시작해 합쳐 [readBudget] 안에서만 기다린다(§15 — 지표 칸이 헬스에 더하는 시간의 상한).
@@ -99,7 +99,7 @@ class MetricHealth(
                 "last_dispatch_failure" to (round.lastDispatchFailure ?: ""),
                 "undelivered_alerts" to (counts?.undelivered ?: -1L),
                 "rejected_alerts" to (counts?.rejected ?: -1L),
-                "skipped_unknown_rule_alerts" to (counts?.unknownRule ?: -1L),
+                "skipped_unknown_rule_alerts" to counts?.unknownRule,
                 "silent_judging" to runCatching { round.silentJudging(now) }.getOrDefault(false),
             )
         }.orEmpty()
