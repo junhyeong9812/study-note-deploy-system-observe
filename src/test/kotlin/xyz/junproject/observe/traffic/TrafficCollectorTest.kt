@@ -137,6 +137,19 @@ class TrafficCollectorTest {
     }
 
     @Test
+    fun `requests_dropped 나 상태 값이 10억을 넘는 항목은 꼴 틀림으로 세고 확인하며 다른 항목은 저장한다`() {
+        val cellStart = TrafficRecords.cellStart(now).toEpochMilli()
+        val wrappedStatus = TrafficRecords.body(segments = listOf("""{"bucket_start_ms": $cellStart, "service": "backend", "caller": "front", "class": "request",
+            "count": 1000000000, "status": {"2xx": ${Long.MAX_VALUE}, "3xx": ${Long.MAX_VALUE}, "4xx": 1000000002, "5xx": 0, "other": 0},
+            "buckets": [1000000000${", 0".repeat(19)}], "max_ms": 3}"""))
+        stream.add(good(1_000, 1, body = TrafficRecords.body(requestsDropped = 6_000_000_000_000_000_000)), good(2_000, 2, body = wrappedStatus), good(3_000, 3))
+        collector.runOnce()
+        assertEquals(2L, collector.droppedCounts()[TrafficDropReason.INVALID_BODY])
+        assertTrue(stream.pending.isEmpty(), "버린 항목을 확인하지 않아 영영 다시 받는다")
+        assertEquals(listOf(3L), sink.stored.keys.map { it.third })
+    }
+
+    @Test
     fun `다른 종류는 저장하지 않고 건너뛴 수를 세고 확인한다`() {
         stream.add(MetricStreamRecord("1000-0", mapOf("kind" to "resource", "v" to "1")), good(2_000, 1))
         collector.runOnce()

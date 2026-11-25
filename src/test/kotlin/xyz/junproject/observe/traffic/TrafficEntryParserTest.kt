@@ -233,6 +233,43 @@ class TrafficEntryParserTest {
     }
 
     @Test
+    fun `항목의 requests_dropped 도 세는 수라 10억까지 받고 10억 1 이면 꼴 틀림으로 항목을 버린다`() {
+        assertEquals(1_000_000_000L, accepted(fields(TrafficRecords.body(requestsDropped = 1_000_000_000))).requestsDropped)
+        assertDropped(TrafficDropReason.INVALID_BODY, fields(TrafficRecords.body(requestsDropped = 1_000_000_001)), "requests_dropped 10억 1")
+        assertDropped(TrafficDropReason.INVALID_BODY, fields(TrafficRecords.body(requestsDropped = 6_000_000_000_000_000_000)), "requests_dropped 6e18")
+    }
+
+    @Test
+    fun `상태의 각 값도 10억 이하여야 한다 — 넘친 값의 합이 count 로 돌아와도 속지 않는다`() {
+        fun segmentWith(count: Long, statuses: List<Long>) = """{"bucket_start_ms": ${cell.toEpochMilli()}, "service": "backend", "caller": "front", "class": "request",
+            "count": $count, "status": {"2xx": ${statuses[0]}, "3xx": ${statuses[1]}, "4xx": ${statuses[2]}, "5xx": ${statuses[3]}, "other": ${statuses[4]}},
+            "buckets": [$count${", 0".repeat(19)}], "max_ms": 3}"""
+        // Long 에서 넘쳐 합이 다시 10억이 되는 꼴
+        val wrapped = listOf(Long.MAX_VALUE, Long.MAX_VALUE, 1_000_000_002L, 0L, 0L)
+        assertEquals(1_000_000_000L, wrapped.sum(), "시험 자료의 전제 — Long 합이 10억으로 돌아온다")
+        assertDropped(TrafficDropReason.INVALID_BODY, fields(TrafficRecords.body(segments = listOf(segmentWith(1_000_000_000, wrapped)))), "넘쳐 돌아온 상태 합")
+        assertDropped(TrafficDropReason.INVALID_BODY, fields(TrafficRecords.body(segments = listOf(segmentWith(1_000_000_000, listOf(1_000_000_001, 0, 0, 0, 0))))),
+            "상태 한 값이 10억 1")
+        assertEquals(TrafficStatusCounts(500_000_000, 0, 0, 500_000_000, 0),
+            accepted(fields(TrafficRecords.body(segments = listOf(segmentWith(1_000_000_000, listOf(500_000_000, 0, 0, 500_000_000, 0))))))
+                .segments.single().totals.status, "10억 이하의 상태 값은 받는다")
+    }
+
+    @Test
+    fun `세는 수가 아닌 값(시각 · 걸린 시간 · 바이트 · max_ms)은 10억을 넘어도 받는다`() {
+        val big = 5_000_000_000L
+        val body = TrafficRecords.body(
+            segments = listOf("""{"bucket_start_ms": ${cell.toEpochMilli()}, "service": "backend", "caller": "front", "class": "request", "count": 1,
+                "status": {"2xx": 1, "3xx": 0, "4xx": 0, "5xx": 0, "other": 0}, "buckets": [0${", 0".repeat(18)}, 1], "max_ms": $big}"""),
+            requests = listOf(TrafficRecords.request(cell, durationMs = big, upstreamMs = big, bytesSent = 1_000_000_000_000)),
+        )
+        val entry = accepted(fields(body))
+        assertEquals(big, entry.segments.single().totals.maxMs)
+        assertEquals(listOf(big, big, 1_000_000_000_000L), entry.requests.single().let { listOf(it.durationMs, it.upstreamMs, it.bytesSent) })
+        assertTrue(entry.requests.single().endAt.toEpochMilli() > 1_000_000_000L, "시각은 epoch 밀리초 — 10억을 넘는 것이 정상이다")
+    }
+
+    @Test
     fun `다른 종류는 버리지 않고 OtherKind`() {
         assertEquals(TrafficEntryParse.OtherKind("resource"), parse(mapOf("kind" to "resource", "v" to "1")))
     }

@@ -19,6 +19,7 @@ import xyz.junproject.observe.metric.MetricStore
 import xyz.junproject.observe.metric.RedisMetricStreamSource
 import xyz.junproject.observe.traffic.TrafficCellQuery
 import xyz.junproject.observe.traffic.TrafficCollector
+import xyz.junproject.observe.traffic.TrafficController
 import xyz.junproject.observe.traffic.TrafficDropReason
 import xyz.junproject.observe.traffic.TrafficEntry
 import xyz.junproject.observe.traffic.TrafficEntryParse
@@ -31,6 +32,7 @@ import java.time.Duration
 import java.time.Instant
 import java.time.temporal.ChronoUnit
 import java.util.UUID
+import org.springframework.mock.web.MockHttpServletRequest
 
 /**
  * 실제 Redis 7.4 + PostgreSQL — 규약 4.1 · 4.5: 따로의 스트림을 지표와 같은 수집 코드(소비자 그룹 · 저장 뒤 확인)로 받는다.
@@ -168,6 +170,24 @@ class TrafficCollectEngineTest {
         // 이 세대에서 처음 저장된 순번이 4 다 — 관측 서버가 시작을 보지 못한 것으로 드러나고(1~3 은 틈이 아니다), 버린 이유는 위에서 센다
         assertEquals(4L, store.serverProgress().single().firstSeqSeen)
         assertEquals(0L, store.serverProgress().single().sequenceGaps)
+    }
+
+    @Test
+    fun `requests_dropped 가 6e18 인 항목 둘은 꼴 틀림으로 버려지고 그 기간의 지도는 200 이다`() {
+        val huge = TrafficRecords.body(listOf(TrafficRecords.segment(cell, listOf(200))), requestsDropped = 6_000_000_000_000_000_000)
+        for (sequence in 1L..2L) producer.opsForStream<String, String>().add(stream, TrafficRecords.fields(sequence, clock.minusSeconds(1), huge))
+        send(3)
+        val reader = source()
+        val collector = collector(reader)
+        assertEquals(3, collector.runOnce())
+        assertEquals(2L, collector.droppedCounts()[TrafficDropReason.INVALID_BODY])
+        assertEquals(0L, reader.unacknowledgedCount())
+        val response = TrafficController(store, "collect-secret").map(
+            MockHttpServletRequest("GET", "/traffic/map").apply { addHeader("X-Observe-Secret", "collect-secret") }, null, null, clock.plusSeconds(1))
+        assertEquals(200, response.statusCode.value(), "${response.body}")
+        @Suppress("UNCHECKED_CAST")
+        val server = (((response.body as Map<String, Any?>)["data"] as Map<String, Any?>)["servers"] as List<Map<String, Any?>>).single()
+        assertEquals(0L, server["requests_dropped"], "버렸어야 할 항목의 requests_dropped 가 요약에 들었다")
     }
 
     @Test
