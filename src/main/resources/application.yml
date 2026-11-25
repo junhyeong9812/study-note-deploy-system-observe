@@ -22,3 +22,18 @@ observe:
     failure-limit: ${OBSERVE_AUTH_FAILURE_LIMIT:5}
     lock-duration: ${OBSERVE_AUTH_LOCK_DURATION:15m}
     retention: ${OBSERVE_AUTH_RETENTION:90d}
+  metrics:                                         # 자원 지표 — agent 가 같은 Redis 의 이 스트림으로 보낸다
+    stream: ${METRICS_STREAM:metrics}
+    group: ${METRICS_GROUP:observe}
+    expected-servers: ${METRICS_EXPECTED_SERVERS:}  # 쉼표로 나눈 서버 이름 — 한 번도 안 보낸 서버도 GET /metrics/latest 에 "수신 없음"으로
+    rollup-interval-ms: ${METRICS_ROLLUP_INTERVAL_MS:60000}   # 5분 평균 바퀴의 간격
+    judge-interval-ms: ${METRICS_JUDGE_INTERVAL_MS:30000}   # 임계값 판정 · 알림 보내기 바퀴의 간격
+    # 임계값(선택 — 비우면 명세 기본값). 예: alert.memory-pct: ${METRICS_ALERT_MEMORY_PCT:90}. 키 목록은 ResourceThresholds 의 KDoc
+    alert:
+      silent-warm-up: ${METRICS_ALERT_SILENT_WARM_UP:3m}               # 끊김 판정은 뜬 지 이만큼 지나고 한 번 따라잡은 뒤부터(§15.1)
+      silent-give-up-after: ${METRICS_ALERT_SILENT_GIVE_UP_AFTER:15m}  # 따라잡지 못해도 뜬 지 이만큼 지나면 판정한다
+  alert:                                           # 알림 서버 POST /events — 비우면 보내지 않고 못 보낸 알림으로 남는다
+    events-url: ${ALERT_EVENTS_URL:}
+    secret: ${ALERT_SECRET:}
+    timeout-ms: ${ALERT_TIMEOUT_MS:3000}
+    dispatch-interval-ms: ${ALERT_DISPATCH_INTERVAL_MS:30000}   # 알림 보내기 바퀴의 간격 — 판정과 따로 돈다
