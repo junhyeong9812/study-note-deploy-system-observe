@@ -43,7 +43,7 @@ interface RuleStateStore {
 
 /** 보낼 표 — 보내는 쪽([AlertDispatcher])이 쓰는 면 */
 interface AlertQueue {
-    /** 아직 보내지 못했고 거절되지 않은 알림 — 오래된 것부터 [limit] 건 */
+    /** 아직 보내지 못했고 거절되지 않은 알림 — 오래된 것부터 [limit] 건(이 판이 모르는 규칙 글자의 줄은 나오지 않는다 — [unknownRuleCounts]) */
     fun pendingAlerts(limit: Int): List<QueuedAlert>
     /** 알림 서버가 받았다 — 다시 보내지 않는다 */
     fun markDelivered(id: Long, at: Instant)
@@ -215,7 +215,7 @@ class ThresholdStore(
     override fun pendingAlerts(limit: Int): List<QueuedAlert> {
         ensureSchema()
         return jdbc.query(
-            "SELECT * FROM resource_alert_outbox WHERE rejected_ms IS NULL ORDER BY created_ms, id LIMIT ?",
+            "SELECT * FROM resource_alert_outbox WHERE rejected_ms IS NULL AND rule IN $KNOWN_RULES ORDER BY created_ms, id LIMIT ?",
             { row, _ -> QueuedAlert(row.getLong("id"), row.toAlert(), row.getInt("attempts"), row.getString("last_failure")) },
             limit,
         )
@@ -224,6 +224,7 @@ class ThresholdStore(
     /**
      * 대상마다 거절되지 않은 알림의 오래된 [perTarget] 건과 그 대상의 마지막 시도 시각. 한 대상에 알림이 아무리 많아도 다른 대상의 머리가 읽힌다
      * (대상 수에는 제한이 없다 — 대상은 서버 · 규칙 · 컨테이너의 수만큼이다).
+     * 이 판이 모르는 규칙 글자의 줄은 SQL 에서 거른다 — 읽은 뒤에 거르면 모르는 줄이 대상마다의 [perTarget] 을 먹어 아는 줄이 굶는다.
      */
     override fun pendingByTarget(perTarget: Int): List<TargetQueue> {
         ensureSchema()
@@ -231,7 +232,7 @@ class ThresholdStore(
             """SELECT * FROM (
                  SELECT outbox.*, $RULE_GROUP AS rule_group,
                         row_number() OVER (PARTITION BY server, $RULE_GROUP, coalesce(target_name, '') ORDER BY created_ms, id) AS position
-                 FROM resource_alert_outbox outbox WHERE rejected_ms IS NULL) ranked
+                 FROM resource_alert_outbox outbox WHERE rejected_ms IS NULL AND rule IN $KNOWN_RULES) ranked
                WHERE position <= ? ORDER BY created_ms, id""",
             { row, _ -> QueuedAlert(row.getLong("id"), row.toAlert(), row.getInt("attempts"), row.getString("last_failure")) },
             perTarget,
@@ -296,9 +297,19 @@ class ThresholdStore(
     override fun alertCounts(): AlertCounts {
         ensureSchema()
         return jdbc.queryForObject(
-            "SELECT count(*) FILTER (WHERE rejected_ms IS NULL) AS undelivered, count(*) FILTER (WHERE rejected_ms IS NOT NULL) AS rejected FROM resource_alert_outbox",
-            { row, _ -> AlertCounts(row.getLong("undelivered"), row.getLong("rejected")) },
+            """SELECT count(*) FILTER (WHERE rejected_ms IS NULL) AS undelivered, count(*) FILTER (WHERE rejected_ms IS NOT NULL) AS rejected,
+                      count(*) FILTER (WHERE rejected_ms IS NULL AND rule NOT IN $KNOWN_RULES) AS unknown_rule
+               FROM resource_alert_outbox""",
+            { row, _ -> AlertCounts(row.getLong("undelivered"), row.getLong("rejected"), row.getLong("unknown_rule")) },
         )!!
+    }
+
+    override fun unknownRuleCounts(): Map<String, Long> {
+        ensureSchema()
+        return jdbc.query(
+            "SELECT rule, count(*) AS lines FROM resource_alert_outbox WHERE rejected_ms IS NULL AND rule NOT IN $KNOWN_RULES GROUP BY rule",
+            { row, _ -> row.getString("rule") to row.getLong("lines") },
+        ).toMap()
     }
 
     /** 지금 넘어 있는 규칙 — 조회용 연결로 커밋된 판정 상태를 읽는다(§16.2 — 판정 · 알림 연결이 다 잡혀도 답한다) */
@@ -325,6 +336,12 @@ class ThresholdStore(
         const val DISPATCH_LOCK = 7_310_420_002L
         const val MAX_REASON = 200
         const val UNDEFINED_TABLE = "42P01"   // PostgreSQL: relation does not exist
+        /**
+         * 이 판이 아는 규칙 글자(SQL 의 목록) — [ResourceRule] 에서 만든다(규칙이 늘면 따라온다). 글자가 정확히 같아야 아는 규칙이다.
+         * 이 목록에 없는 글자의 줄(섞인 판에서 새 판이 쓴 줄)은 보내기가 읽지도 표시하지도 지우지도 않는다 — 그 규칙을 아는 판이 보낸다.
+         * 글자는 고정값이다(입력이 아니다)
+         */
+        val KNOWN_RULES = ResourceRule.entries.joinToString(", ", "(", ")") { "'${it.wireName}'" }
         /** 규칙의 묶음(SQL) — [AlertTarget.groupOf] 와 같은 규칙. 글자는 고정값이다(입력이 아니다) */
         val RULE_GROUP = "CASE WHEN rule IN ('${ResourceRule.DISK_WARNING.wireName}', '${ResourceRule.DISK_CRITICAL.wireName}') THEN '${AlertTarget.DISK_GROUP}' ELSE rule END"
 

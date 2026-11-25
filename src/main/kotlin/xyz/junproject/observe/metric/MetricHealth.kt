@@ -44,7 +44,8 @@ class MetricHealth(
     private val startedAt: Instant = Instant.now(),
     /**
      * 임계값 판정 · 보내기. 있으면 `metrics` 객체에 칸을 더한다: `last_judged_at`(마지막으로 판정한 시각, 없으면 빈 글자) ·
-     * `last_judge_failure` · `last_dispatch_failure`(마지막 바퀴의 예외 종류, 없으면 빈 글자) · `undelivered_alerts` · `rejected_alerts`(읽지 못하면 -1).
+     * `last_judge_failure` · `last_dispatch_failure`(마지막 바퀴의 예외 종류, 없으면 빈 글자) · `undelivered_alerts` · `rejected_alerts` ·
+     * `skipped_unknown_rule_alerts`(못 보낸 줄 가운데 이 판이 모르는 규칙 글자라 건너뛰는 줄 — 읽지 못하면 -1).
      * 판정 · 보내기의 실패는 `metrics.status` 를 바꾸지 않는다. 없으면 칸도 없다(기존 칸 그대로).
      */
     private val thresholds: ThresholdRound? = null,
@@ -98,6 +99,7 @@ class MetricHealth(
                 "last_dispatch_failure" to (round.lastDispatchFailure ?: ""),
                 "undelivered_alerts" to (counts?.undelivered ?: -1L),
                 "rejected_alerts" to (counts?.rejected ?: -1L),
+                "skipped_unknown_rule_alerts" to (counts?.unknownRule ?: -1L),
                 "silent_judging" to runCatching { round.silentJudging(now) }.getOrDefault(false),
             )
         }.orEmpty()

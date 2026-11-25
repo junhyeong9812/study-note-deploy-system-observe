@@ -91,6 +91,7 @@ data class DispatchOutcome(val lockAcquired: Boolean, val delivered: Int, val re
  * 대상마다 오래된 [batchSize] 건), 한 바퀴에 합쳐 [batchSize] 건까지.
  * Delivered → [AlertQueue.markDelivered], Retry → [AlertQueue.markRetry], Rejected → [AlertQueue.markRejected].
  * 보내는 쪽이 예외를 내도 Retry 로 본다. 보내기 잠금은 한 바퀴 동안 쥔다 — 그 길이는 [roundBudget] 를 넘지 않는다.
+ * 이 판이 모르는 규칙 글자의 줄은 [AlertQueue.pendingByTarget] 에 나오지 않는다 — 그 수만 [AlertQueue.unknownRuleCounts] 로 세어 결과에 싣는다.
  */
 class AlertDispatcher(
     private val queue: AlertQueue,
@@ -111,6 +112,7 @@ class AlertDispatcher(
 ) {
     fun dispatch(now: Instant): DispatchOutcome = queue.whileHoldingDispatchLock {
         val started = clock()
+        val skippedUnknownRules = queue.unknownRuleCounts()
         var delivered = 0
         var retrying = 0
         var rejected = 0
@@ -138,6 +140,6 @@ class AlertDispatcher(
                 if (line.isEmpty()) iterator.remove()
             }
         }
-        DispatchOutcome(true, delivered, retrying, rejected)
+        DispatchOutcome(true, delivered, retrying, rejected, skippedUnknownRules)
     } ?: DispatchOutcome(false, 0, 0, 0)
 }

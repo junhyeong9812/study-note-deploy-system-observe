@@ -77,6 +77,12 @@ class ThresholdRound(
         if (dispatch != null && dispatch.delivered + dispatch.retrying + dispatch.rejected > 0) {
             log.info("observe:observe:alerts delivered {} · retrying {} · rejected {}", dispatch.delivered, dispatch.retrying, dispatch.rejected)
         }
+        // 이 판이 모르는 규칙 글자의 줄(섞인 판에서 새 판이 쓴 줄) — 잠금을 얻은 바퀴마다 한 줄. 줄은 남아 그 규칙을 아는 판이 보낸다
+        val skipped = dispatch?.skippedUnknownRules.orEmpty()
+        if (skipped.isNotEmpty()) {
+            log.warn("observe:observe:alerts skipped unknown rule lines (left for a version that knows the rule): {} · total {}",
+                skipped.toSortedMap().entries.joinToString(", ") { "${it.key}=${it.value}" }, skipped.values.sum())
+        }
         countAlerts()
         return dispatch
     }
