@@ -36,6 +36,7 @@ class CollectorHealth(
     private val stallAfter: Duration = Duration.ofSeconds(60),
     private val startedAt: Instant = Instant.now(),
     private val metrics: MetricHealth? = null,                          // 지표 수집의 칸 — 본문에만, 판정에 넣지 않는다
+    private val visits: xyz.junproject.observe.visit.VisitHealth? = null,   // 방문 수집의 칸 — 본문에만, 판정에 넣지 않는다
 ) {
     data class Report(val healthy: Boolean, val body: Map<String, Any>)
 
