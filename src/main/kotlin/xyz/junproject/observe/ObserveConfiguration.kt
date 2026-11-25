@@ -274,6 +274,16 @@ class ObserveConfiguration {
             silentGate = SilentGate(Instant.now(), { collector.caughtUpAt }, warmUp, giveUpAfter))
     }
 
+    /**
+     * 통신 저장소 — 로그 · 지표와 같은 DB, 연결 풀은 통신 전용(`observe-traffic-ingest` 2 · `observe-traffic-query` 2 · `observe-traffic-health` 1 ·
+     * `observe-traffic-health-detail` 1). 네 풀 모두 드라이버 설정 `logServerErrorDetail=false` — 드라이버 예외 글에 서버 오류의 상세(행의 값)와
+     * 묶음 문장의 값이 실리지 않게(항목의 경로가 예외 글을 타고 로그에 새지 않게).
+     * [gapWait] 는 `observe.traffic.gap-wait`(환경 변수 `TRAFFIC_GAP_WAIT`, 기본 `10m` — `DurationStyle` 꼴, 0 이하면 뜰 때 실패).
+     * 뼈대: 구현에서 `@Bean` 과 인자마다 `@Value`(`observe.db.url` · `observe.db.user` · `observe.db.password` · `observe.traffic.gap-wait:10m`)를 달고 본문을 채운다
+     * (뼈대에 달면 앱이 뜰 때 이 본문이 불린다). 이 이름과 인자는 엔진 테스트가 직접 부른다.
+     */
+    fun trafficStore(url: String, user: String, password: String, gapWait: String): xyz.junproject.observe.traffic.TrafficStore = TODO("뼈대: 구현 워커가 채운다")
+
     @Bean
     fun logStreamSource(
         redis: StringRedisTemplate,

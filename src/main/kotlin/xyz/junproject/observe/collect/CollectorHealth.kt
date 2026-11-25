@@ -36,6 +36,9 @@ class CollectorHealth(
     private val stallAfter: Duration = Duration.ofSeconds(60),
     private val startedAt: Instant = Instant.now(),
     private val metrics: MetricHealth? = null,                          // 지표 수집의 칸 — 본문에만, 판정에 넣지 않는다
+    // 뼈대: 통신 수집의 칸 — 있으면 본문에 `traffic` 객체([xyz.junproject.observe.traffic.TrafficHealth.report])를 더한다(지표 칸과 같이 판정이 끝난 뒤에,
+    // 동시에 읽기 시작 · 만들다 실패하면 `{status:"failing", failure:"health <종류>"}`). 본문은 구현 워커가 채운다 — 지금은 쓰지 않는다.
+    @Suppress("unused") private val traffic: xyz.junproject.observe.traffic.TrafficHealth? = null,
 ) {
     data class Report(val healthy: Boolean, val body: Map<String, Any>)
 
