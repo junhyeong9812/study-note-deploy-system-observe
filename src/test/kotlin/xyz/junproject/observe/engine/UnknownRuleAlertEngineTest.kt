@@ -14,6 +14,7 @@ import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
 import org.slf4j.LoggerFactory
+import org.springframework.dao.QueryTimeoutException
 import org.springframework.jdbc.core.JdbcTemplate
 import xyz.junproject.observe.log.StreamId
 import xyz.junproject.observe.metric.FakeMetricSink
@@ -25,8 +26,10 @@ import xyz.junproject.observe.metric.MetricStore
 import xyz.junproject.observe.metric.ResourceSample
 import xyz.junproject.observe.threshold.AlertCounts
 import xyz.junproject.observe.threshold.AlertDispatcher
+import xyz.junproject.observe.threshold.AlertQueue
 import xyz.junproject.observe.threshold.AlertSender
 import xyz.junproject.observe.threshold.AlertSeverity
+import xyz.junproject.observe.threshold.AlertTarget
 import xyz.junproject.observe.threshold.DispatchOutcome
 import xyz.junproject.observe.threshold.JudgeResult
 import xyz.junproject.observe.threshold.ResourceAlert
@@ -45,7 +48,9 @@ import kotlin.math.roundToLong
  * 예외로 끝나지 않고 아는 줄은 모르는 줄이 없을 때와 같은 순서로 전부 나간다 · 모르는 줄은 지워지지도 표시(횟수 · 사유 · 시도 시각 · 거절)되지도 않고
  * 대상의 시도 시각도 남기지 않는다(다음 판이 처음 보내는 줄처럼 읽는다) · 규칙 글자마다의 건수가 보내기 결과([DispatchOutcome.skippedUnknownRules]) ·
  * 보낼 표의 건수([AlertCounts.unknownRule] · [ThresholdStore.unknownRuleCounts]) · 헬스의 `skipped_unknown_rule_alerts` · 보내기마다 WARN 한 줄에 드러난다 ·
- * 수천 건이어도 아는 줄이 굶지 않고 한 바퀴의 건수 · 대상의 차례를 먹지 않는다 · 판정 한 바퀴가 모르는 줄을 지우지 않는다.
+ * 수천 건이어도 아는 줄이 굶지 않고 한 바퀴의 건수 · 대상의 차례를 먹지 않는다 · 모르는 규칙의 글자가 아는 묶음의 이름(`disk`)과 같아도
+ * 같은 묶음의 아는 줄이 굶지 않는다(모르는 줄은 대상마다의 머리를 고르기 전에 SQL 에서 걸러진다) · 모르는 줄을 세는 조회가 실패해도 아는 줄은
+ * 실제 표에서 전부 보내지고 지워진다(건너뛴 수는 "세지 못함" — null) · 판정 한 바퀴가 모르는 줄을 지우지 않는다.
  * 모르는 규칙 글자: 다음 판의 `log_silent` · `log_silent_all`, 엉뚱한 글자, 빈 글자, 대소문자만 다른 글자(`MEMORY` — 글자는 그대로 맞춰 본다).
  * 모르는 줄은 새 판이 쓸 꼴을 흉내 내 SQL 로 직접 넣는다. 표는 전용 스키마(`unknown_rule`).
  */
@@ -213,7 +218,7 @@ class UnknownRuleAlertEngineTest {
         assertEquals(DispatchOutcome(true, 4, 0, 0, emptyMap()), AlertDispatcher(store, RecordingSender()).dispatch(now.plusSeconds(1)))
     }
 
-    private fun health(round: ThresholdRound): Map<String, Any> {
+    private fun health(round: ThresholdRound): Map<String, Any?> {
         val collector = MetricCollector(FakeMetricStream(), FakeMetricSink(), block = Duration.ZERO, clock = { now }).also { it.runOnce() }
         return MetricHealth(collector, { 0L }, { 0L }, { null }, { emptyMap() }, { null }, { null }, { null }, startedAt = now, thresholds = round).report(now)
     }
@@ -224,7 +229,9 @@ class UnknownRuleAlertEngineTest {
     fun `헬스의 지표 칸에 건너뛴 모르는 줄의 수가 나오고 보내기 한 바퀴마다 WARN 한 줄에 규칙 글자와 수가 남는다`() {
         val sender = RecordingSender()
         val round = ThresholdRound(metricStore, store, ThresholdJudge(), AlertDispatcher(store, sender), store, emptySet())
-        assertEquals(-1L, (health(round)["skipped_unknown_rule_alerts"] as? Number)?.toLong(), "아직 세지 않았는데 수가 나왔거나 칸이 없다")
+        val before = health(round)
+        assertTrue(before.containsKey("skipped_unknown_rule_alerts"), "헬스에 skipped_unknown_rule_alerts 칸이 없다: $before")
+        assertNull(before["skipped_unknown_rule_alerts"], "아직 세지 않았는데 수가 나왔다")
 
         repeat(4) { insertUnknown("silent-$it", "log_silent", at(it.toLong()), targetName = "svc-$it") }
         repeat(2) { insertUnknown("silent-all-$it", "log_silent_all", at(10L + it), targetName = null) }
@@ -289,6 +296,50 @@ class UnknownRuleAlertEngineTest {
         assertEquals(listOf("d-1", "a-2"), timed.sent)
         assertEquals(setOf("memory"), targetGroups())
         assertEquals(5, unknownRows().size)
+    }
+
+    @Test
+    fun `모르는 규칙의 글자가 아는 묶음의 이름(disk)과 같은 줄이 한 대상에 50건 넘게 먼저 있어도 같은 대상의 아는 디스크 줄은 그 바퀴에 나간다`() {
+        // 아는 디스크 규칙의 묶음 이름과 같은 글자 — 대상(서버 · 묶음 · 대상 이름)이 아는 디스크 줄과 같아진다
+        jdbc.update(
+            """INSERT INTO resource_alert_outbox (event_id, alert_key, kind, severity, title, detail, server, rule, target_name, created_ms)
+               SELECT 'disk-named-' || n, 'log:ci-agent-158:disk', 'log_silent', 'warning', 't', 'd', 'ci-agent-158', 'disk', NULL, ? + n
+               FROM generate_series(1, 120) AS n""", now.toEpochMilli())
+        enqueueKnown(listOf(known("disk-warning-1", "ci-agent-158", at(10_000), ResourceRule.DISK_WARNING)))
+
+        val heads = store.pendingByTarget(50)
+        assertEquals(listOf(AlertTarget("ci-agent-158", "disk", null)), heads.map { it.target }, "대상의 머리에 아는 디스크 줄의 대상이 없다")
+        assertEquals(listOf("disk-warning-1"), heads.single().alerts.map { it.alert.eventId }, "모르는 줄이 대상의 머리를 먹었다")
+
+        val sender = RecordingSender()
+        val outcome = AlertDispatcher(store, sender).dispatch(now.plusSeconds(20))
+        assertEquals(listOf("disk-warning-1"), sender.sent, "같은 묶음 이름의 모르는 줄 뒤에서 아는 디스크 줄이 굶었다")
+        assertEquals(DispatchOutcome(true, 1, 0, 0, mapOf("disk" to 120L)), outcome)
+        assertEquals(120, unknownRows().size)
+        assertTrue(unknownRows().all { it["attempts"] == 0 && it["last_attempt_ms"] == null && it["rejected_ms"] == null }, "모르는 줄이 표시됐다")
+    }
+
+    @Test
+    fun `모르는 줄을 세는 조회가 실패해도 실제 표의 아는 줄은 그 바퀴에 전부 보내지고 지워지며 보내기 바퀴는 실패로 남지 않는다`() {
+        unknownRules.forEachIndexed { index, rule -> insertUnknown("unknown-$index", rule, at(index.toLong())) }
+        enqueueKnown(knownSet())
+        val countFails = object : AlertQueue by store {
+            override fun unknownRuleCounts(): Map<String, Long> = throw QueryTimeoutException("canceling statement due to statement timeout")
+        }
+        val sender = RecordingSender()
+        val round = ThresholdRound(metricStore, store, ThresholdJudge(), AlertDispatcher(countFails, sender), store, emptySet())
+        val outcome = round.dispatchOnce(now.plusSeconds(1))
+        assertNull(round.lastDispatchFailure, "세는 조회의 실패가 보내기 실패로 남았다")
+        assertNotNull(outcome, "세는 조회의 실패가 보내기 바퀴를 실패로 만들었다")
+        assertEquals(listOf(true, 4, 0, 0), listOf(outcome!!.lockAcquired, outcome.delivered, outcome.retrying, outcome.rejected), "$outcome")
+        assertNull(outcome.skippedUnknownRules, "세지 못한 바퀴의 건너뛴 수가 null 이 아니다")
+        assertEquals(setOf("memory-1", "memory-2", "cpu-1", "restart-1"), sender.sent.toSet())
+        assertEquals(unknownRules.size, outboxRows().size, "보낸 아는 줄이 지워지지 않았거나 모르는 줄이 지워졌다")
+        assertEquals(unknownRules.size, unknownRows().size)
+        val warnings = unknownRuleWarnings()
+        assertEquals(1, warnings.size, "세지 못한 바퀴의 WARN 이 한 줄이 아니다: ${appender.list.map { "${it.level} ${it.formattedMessage}" }}")
+        assertTrue(warnings.single().formattedMessage.contains("QueryTimeoutException"))
+        assertFalse(warnings.single().formattedMessage.contains("statement timeout"), "WARN 에 예외의 문구가 실렸다")
     }
 
     // ── 판정은 모르는 줄을 지우지 않는다 ─────────────────
