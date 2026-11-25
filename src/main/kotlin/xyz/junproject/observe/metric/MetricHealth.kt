@@ -99,7 +99,7 @@ class MetricHealth(
                 "last_dispatch_failure" to (round.lastDispatchFailure ?: ""),
                 "undelivered_alerts" to (counts?.undelivered ?: -1L),
                 "rejected_alerts" to (counts?.rejected ?: -1L),
-                "skipped_unknown_rule_alerts" to counts?.unknownRule,
+                "skipped_unknown_rule_alerts" to counts?.unknownRules?.values?.sum(),
                 "silent_judging" to runCatching { round.silentJudging(now) }.getOrDefault(false),
             )
         }.orEmpty()

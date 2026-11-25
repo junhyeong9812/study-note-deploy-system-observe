@@ -9,6 +9,7 @@ import java.sql.PreparedStatement
 import java.sql.ResultSet
 import java.sql.SQLException
 import java.sql.Types
+import java.time.Duration
 import java.time.Instant
 
 /** 판정 한 바퀴의 결과 — 잠금을 얻지 못했으면(다른 자리가 판정 중) [judged] 는 false 이고 아무것도 바꾸지 않았다 */
@@ -19,9 +20,9 @@ data class QueuedAlert(val id: Long, val alert: ResourceAlert, val attempts: Int
 
 /**
  * 보낼 표의 건수 — [undelivered] 는 아직 보내지 못한 것(다시 보낼 것), [rejected] 는 알림 서버가 거절해 다시 보내지 않는 것.
- * [unknownRule] 은 [undelivered] 가운데 이 판이 모르는 규칙 글자의 줄(보내지 않고 건너뛰며 지우지 않는다 — 그 규칙을 아는 판이 보낸다)
+ * [unknownRules] 는 [undelivered] 가운데 이 판이 모르는 규칙 글자의 줄(보내지 않고 건너뛰며 지우지 않는다 — 그 규칙을 아는 판이 보낸다) — 규칙 글자 → 건수(없으면 빈 맵), 합은 이 맵에서
  */
-data class AlertCounts(val undelivered: Long, val rejected: Long, val unknownRule: Long = 0)
+data class AlertCounts(val undelivered: Long, val rejected: Long, val unknownRules: Map<String, Long> = emptyMap())
 
 /** `GET /metrics/latest` 의 `firing[]` 한 줄 — `{server, rule, target, severity, since, last_value}` (target 은 재시작 규칙의 컨테이너 이름, 그 밖은 null) */
 data class FiringRule(val server: String, val rule: String, val target: String?, val severity: String, val since: Instant, val lastValue: Double?)
@@ -113,6 +114,8 @@ class ThresholdStore(
      * 기본값은 [jdbc](지금 동작과 같다 — 배선에서 조회용 풀을 넘긴다). [failpoint] 를 끝 람다로 넘기는 호출이 그대로 되게 그 앞에 둔다
      */
     private val query: JdbcTemplate = jdbc,
+    /** 건수 세기([alertCounts])의 조회 시간 상한 — 뼈대: 아직 쓰지 않는다 */
+    private val countTimeout: Duration = Duration.ofSeconds(2),
     private val failpoint: (String) -> Unit = {},
 ) : RuleStateStore, AlertQueue, FiringSource {
     private val dataSource = requireNotNull(jdbc.dataSource) { "JdbcTemplate 에 DataSource 가 없다" }
@@ -300,7 +303,7 @@ class ThresholdStore(
             """SELECT count(*) FILTER (WHERE rejected_ms IS NULL) AS undelivered, count(*) FILTER (WHERE rejected_ms IS NOT NULL) AS rejected,
                       count(*) FILTER (WHERE rejected_ms IS NULL AND rule NOT IN $KNOWN_RULES) AS unknown_rule
                FROM resource_alert_outbox""",
-            { row, _ -> AlertCounts(row.getLong("undelivered"), row.getLong("rejected"), row.getLong("unknown_rule")) },
+            { row, _ -> AlertCounts(row.getLong("undelivered"), row.getLong("rejected")) },   // 뼈대: 규칙 글자별 맵은 아직 채우지 않는다
         )!!
     }
 
