@@ -49,16 +49,17 @@ enum class VisitDropReason(val wireName: String) {
 
 /** 스트림 항목 하나를 해석한 결과 */
 sealed interface VisitEntryParse {
-    /** 저장할 방문. [queryStripped] 는 경로에 붙어 온 `?` · `#` 뒤를 잘라 냈는지 */
+    /** 저장할 방문. [queryStripped] 는 경로에 붙어 온 `?` · `#` · `;` 뒤를 잘라 냈는지 */
     data class Accepted(val visit: Visit, val queryStripped: Boolean) : VisitEntryParse
     /** 꼴이 틀린 항목 — 이유를 세고 확인한다(다시 받지 않는다) */
     data class Dropped(val reason: VisitDropReason) : VisitEntryParse
 }
 
 /**
- * 스트림 항목의 해석(순수 함수). 검사 순서: ID → 칸 없음(TRIMMED) → 필수 칸 → 버전 → 제어 문자(받은 글 그대로) → 길이 →
- * 칸마다의 꼴(경로 → 화면 → 들어온 곳 → 기기 → 구분값 → 주소). 경로는 처음 나오는 `?` · `#` 의 앞까지만 남긴다(검색어를 남기지 않는다) —
- * 길이와 꼴은 잘라 낸 뒤의 경로로 본다. 모르는 칸은 보지도 싣지도 않는다.
+ * 스트림 항목의 해석(순수 함수). 검사 순서: ID → 칸 없음(TRIMMED) → 필수 칸 → 버전 → 제어 문자 → 길이 →
+ * 칸마다의 꼴(경로 → 화면 → 들어온 곳 → 기기 → 구분값 → 주소). 경로는 **먼저 자르고 나서 검사한다** — 처음 나오는 `?` · `#` · `;` 의
+ * 앞까지만 남기고(검색어 · 조각 · `;jsessionid=…` 같은 세션 값을 남기지 않는다), 제어 문자(Cc) · 서식 문자(Cf) · 길이 · 꼴은 자른 뒤의
+ * 경로로 본다(잘려 나간 부분에만 있던 것으로는 버리지 않는다). 다른 칸의 제어 문자는 받은 글 그대로 본다. 모르는 칸은 보지도 싣지도 않는다.
  */
 object VisitEntryParser {
     const val VERSION = "1"
@@ -68,7 +69,7 @@ object VisitEntryParser {
     const val MAX_IP_LENGTH = 45
 
     private val REQUIRED_FIELDS = listOf("v", "path", "screen", "device", "visitor", "ip")
-    private val CHECKED_FIELDS = listOf("path", "screen", "referrer_host", "device", "visitor", "ip")
+    private val CHECKED_FIELDS = listOf("screen", "referrer_host", "device", "visitor", "ip")   // 경로는 자른 뒤에 따로 본다
     private val SCREEN = Regex("^[a-z][a-z0-9_-]{0,31}$")
     private val HOST_NAME = Regex("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$")
     private val VISITOR = Regex("^[0-9a-f]{64}$")
@@ -81,17 +82,18 @@ object VisitEntryParser {
         if (fields.isEmpty()) return dropped(VisitDropReason.TRIMMED)
         if (REQUIRED_FIELDS.any { fields[it].isNullOrEmpty() }) return dropped(VisitDropReason.MISSING_FIELD)
         if (fields["v"] != VERSION) return dropped(VisitDropReason.UNSUPPORTED_VERSION)
-        if (CHECKED_FIELDS.any { field -> fields[field]?.any { Character.isISOControl(it) } == true }) return dropped(VisitDropReason.CONTROL_CHARACTER)
         val receivedPath = fields.getValue("path")
-        val cut = receivedPath.indexOfFirst { it == '?' || it == '#' }
+        val cut = receivedPath.indexOfFirst { it == '?' || it == '#' || it == ';' }
         val path = if (cut < 0) receivedPath else receivedPath.substring(0, cut)
+        if (CHECKED_FIELDS.any { field -> fields[field]?.any { Character.isISOControl(it) } == true }) return dropped(VisitDropReason.CONTROL_CHARACTER)
+        if (path.codePoints().anyMatch { Character.isISOControl(it) || Character.getType(it) == Character.FORMAT.toInt() }) return dropped(VisitDropReason.CONTROL_CHARACTER)
         val screen = fields.getValue("screen")
         val referrerHost = fields["referrer_host"]?.takeIf { it.isNotEmpty() }
         val ip = fields.getValue("ip")
         if (path.length > MAX_PATH_LENGTH || screen.length > MAX_SCREEN_LENGTH || (referrerHost?.length ?: 0) > MAX_REFERRER_LENGTH || ip.length > MAX_IP_LENGTH) {
             return dropped(VisitDropReason.TOO_LONG)
         }
-        if (!path.startsWith('/') || path.any(Char::isWhitespace)) return dropped(VisitDropReason.INVALID_PATH)
+        if (!path.startsWith('/') || path.startsWith("//") || path.any(Char::isWhitespace)) return dropped(VisitDropReason.INVALID_PATH)
         if (!SCREEN.matches(screen)) return dropped(VisitDropReason.INVALID_SCREEN)
         if (referrerHost != null && !HOST_NAME.matches(referrerHost)) return dropped(VisitDropReason.INVALID_REFERRER)
         val device = VisitDevice.of(fields.getValue("device")) ?: return dropped(VisitDropReason.INVALID_DEVICE)

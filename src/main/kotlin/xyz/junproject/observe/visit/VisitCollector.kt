@@ -22,7 +22,8 @@ interface VisitSink {
  * 방문 스트림(`visits`)의 수집 — 지표 수집([xyz.junproject.observe.metric.MetricCollector])과 같은 규칙의 한 바퀴.
  * - 받아들인 것을 저장한 **뒤에만** 확인한다. 저장이 실패하면 확인하지 않는다(다음 바퀴에 다시 받는다 — 잃지 않는다).
  * - 꼴이 틀린 항목은 `<스트림 ID>: <이유>` 만 로그에 남기고 [droppedCounts] 를 센 뒤 확인한다(다시 받지 않는다). 같은 묶음의 다른 항목은 저장한다.
- * - 경로의 `?` · `#` 뒤를 잘라 낸 항목은 저장과 확인이 끝난 뒤에 [queryStripped] 를 센다(다시 받아 두 번 세지 않게).
+ * - 저장 수 · 경로의 `?` · `#` · `;` 뒤를 잘라 낸 수는 저장소가 새로 넣었다고 돌려준 항목만, 저장과 확인이 끝난 뒤에 센다(다시 받아 두 번 세지 않게).
+ *   표에 이미 있던 항목(앞 프로세스가 저장하고 확인 전에 죽음)은 [alreadyStored] 로 따로 센다.
  * - **주소 원문을 어디에도 내지 않는다**: 실패의 로그와 [lastFailure] 에는 예외의 종류 이름(과 SQLSTATE)만 — PostgreSQL 드라이버의
  *   묶음 저장 오류 글에는 넣으려던 값(주소 · 구분값)이 실린다.
  */
@@ -46,11 +47,11 @@ class VisitCollector(
     @Volatile var lastLoopAt: Instant? = null; private set
     /** 마지막 바퀴가 실패했으면 예외 종류 이름(스키마 단계면 앞에 "schema "), 성공했으면 null */
     @Volatile var lastFailure: String? = null; private set
-    /** 이 프로세스가 뜬 뒤 저장한 항목 수 */
+    /** 이 프로세스가 뜬 뒤 저장한(표에 새로 넣은) 항목 수 */
     @Volatile var storedTotal: Long = 0; private set
-    /** 이 프로세스가 뜬 뒤 경로의 `?` · `#` 뒤를 잘라 내고 저장한 항목 수 */
+    /** 이 프로세스가 뜬 뒤 경로의 `?` · `#` · `;` 뒤를 잘라 내고 저장한(표에 새로 넣은) 항목 수 */
     @Volatile var queryStripped: Long = 0; private set
-    /** 이 프로세스가 뜬 뒤 받았지만 표에 이미 있어(같은 스트림 ID) 넣지 않은 항목 수 — 뼈대: 구현 워커가 센다 */
+    /** 이 프로세스가 뜬 뒤 받았지만 표에 이미 있어(같은 스트림 ID) 넣지 않은 항목 수 */
     @Volatile var alreadyStored: Long = 0; private set
 
     /** 이 프로세스가 뜬 뒤 버린 항목 수 — 이유마다(모든 이유가 들고, 없으면 0) */
@@ -100,11 +101,11 @@ class VisitCollector(
         if (records.isEmpty()) return 0
         val accepted = ArrayList<Visit>(records.size)
         val acceptedIds = ArrayList<String>(records.size)
-        var strippedNow = 0
+        val strippedIds = HashSet<StreamId>()
         val droppedNow = ArrayList<Pair<String, VisitDropReason>>()
         for (record in records) {
             when (val parsed = VisitEntryParser.parse(record)) {
-                is VisitEntryParse.Accepted -> { accepted += parsed.visit; acceptedIds += record.id; if (parsed.queryStripped) strippedNow++ }
+                is VisitEntryParse.Accepted -> { accepted += parsed.visit; acceptedIds += record.id; if (parsed.queryStripped) strippedIds += parsed.visit.id }
                 is VisitEntryParse.Dropped -> droppedNow += record.id to parsed.reason
             }
         }
@@ -117,10 +118,11 @@ class VisitCollector(
             }
         }
         if (accepted.isNotEmpty()) {
-            sink.insertAll(accepted)                     // 실패하면 예외 → 아래 확인을 하지 않는다(다음 바퀴에 다시 받는다)
+            val inserted = sink.insertAll(accepted)      // 실패하면 예외 → 아래 확인을 하지 않는다(다음 바퀴에 다시 받는다)
             source.acknowledge(acceptedIds)
-            storedTotal += accepted.size
-            queryStripped += strippedNow
+            storedTotal += inserted.size
+            alreadyStored += accepted.count { it.id !in inserted }
+            queryStripped += strippedIds.count { it in inserted }
         }
         return records.size
     }

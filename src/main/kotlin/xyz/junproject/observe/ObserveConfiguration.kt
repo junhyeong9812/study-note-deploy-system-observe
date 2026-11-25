@@ -34,6 +34,7 @@ import java.time.Duration
 import kotlin.reflect.full.primaryConstructor
 import jakarta.annotation.PreDestroy
 import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler
+import org.springframework.scheduling.annotation.Scheduled
 import java.time.Instant
 import java.util.concurrent.CopyOnWriteArrayList
 import xyz.junproject.observe.threshold.SilentGate
@@ -284,6 +285,8 @@ class ObserveConfiguration {
      * 방문 쪽이 무겁거나 실패해도 로그 · 지표의 풀을 잡지 않는다. 헬스 풀은 지표의 헬스 풀과 같은 꼴(연결 하나 · 대기 2초 · 문장 2초).
      * 단순화: 90일 삭제는 수집과 연결 하나를 나눠 쓴다 — 삭제하는 동안 수집 바퀴가 연결을 5초 넘게 기다리면 실패로 남고 다시 시도한다(항목은 잃지 않는다).
      * 하루치 삭제가 몇 초 안에 끝나는 동안(하루 방문 수만 줄 안팎)은 문제없다 — 삭제가 그보다 길어지면 삭제 전용 연결을 따로 둔다.
+     * 세 풀 모두 서버 오류의 세부를 드라이버 예외 글에 싣지 않는다([withoutServerErrorDetail]) — 연결이 끊긴 쪽 오류면 풀이 그 예외를
+     * 통째로 로그에 남기는데, 묶음 저장의 값이나 서버 오류의 세부(DETAIL)에 주소 · 구분값이 실린다.
      */
     @Bean
     fun visitStore(
@@ -291,10 +294,18 @@ class ObserveConfiguration {
         @Value("\${observe.db.user}") user: String,
         @Value("\${observe.db.password}") password: String,
     ): VisitStore {
-        val ingest = pool("observe-visit-ingest", url, user, password, size = 1, statementTimeoutMs = 30_000)
-        val query = pool("observe-visit-query", url, user, password, size = 1, statementTimeoutMs = 10_000)
-        val health = pool("observe-visit-health", url, user, password, size = 1, statementTimeoutMs = 2_000, connectionTimeoutMs = 2_000, validationTimeoutMs = 1_000)
+        val visitUrl = withoutServerErrorDetail(url)
+        val ingest = pool("observe-visit-ingest", visitUrl, user, password, size = 1, statementTimeoutMs = 30_000)
+        val query = pool("observe-visit-query", visitUrl, user, password, size = 1, statementTimeoutMs = 10_000)
+        val health = pool("observe-visit-health", visitUrl, user, password, size = 1, statementTimeoutMs = 2_000, connectionTimeoutMs = 2_000, validationTimeoutMs = 1_000)
         return VisitStore(JdbcTemplate(ingest), JdbcTemplate(query), JdbcTemplate(health))
+    }
+
+    /** JDBC 주소에 `logServerErrorDetail=false` — 이미 `?` 가 있으면 `&` 로 잇고, 그 매개변수가 이미 있으면 덧붙이지 않고 값을 false 로 바꾼다 */
+    private fun withoutServerErrorDetail(url: String): String {
+        val existing = Regex("([?&])logServerErrorDetail=[^&]*")
+        return if (existing.containsMatchIn(url)) url.replace(existing, "$1logServerErrorDetail=false")
+        else url + (if ('?' in url) "&" else "?") + "logServerErrorDetail=false"
     }
 
     private var sharedVisitStreamSource: RedisMetricStreamSource? = null
@@ -318,15 +329,26 @@ class ObserveConfiguration {
         store: VisitStore,
     ) = VisitCollector(visitStreamSource(redis, stream, group), store)
 
-    /** 방문 수집 스레드와 90일 삭제(`observe.visits.retention-cron`, 서울) */
+    /**
+     * 방문 수집 스레드와 90일 삭제(`observe.visits.retention-cron`, 서울). 삭제를 끄는 값(`-`)은 받지 않는다 — 주소를 저장하면서 삭제를 끌 수 없다.
+     * 묶음 크기(1 이상)와 시간 예산(0 보다 긴 기간)이 틀리면 뜰 때 실패한다.
+     */
     @Bean
     fun visitSchedule(
         collector: VisitCollector,
         retention: VisitRetention,
-        @Value("\${observe.visits.retention-cron:0 40 3 * * *}") retentionCron: String,            // 뼈대: 구현 워커가 `-`(끔)을 거절한다
-        @Value("\${observe.visits.retention-batch-size:5000}") retentionBatchSize: Int,          // 뼈대: 구현 워커가 넘기고 검사한다
-        @Value("\${observe.visits.retention-time-budget:5m}") retentionTimeBudget: String,       // 뼈대: 구현 워커가 넘기고 검사한다
-    ) = VisitSchedule(collector, retention)
+        @Value("\${observe.visits.retention-cron:0 40 3 * * *}") retentionCron: String,
+        @Value("\${observe.visits.retention-batch-size:5000}") retentionBatchSize: Int,
+        @Value("\${observe.visits.retention-time-budget:5m}") retentionTimeBudget: String,
+    ): VisitSchedule {
+        require(retentionCron.trim() != Scheduled.CRON_DISABLED) {
+            "observe.visits.retention-cron 은 '-'(끔)일 수 없다 — 방문자의 주소를 저장하므로 90일 삭제를 끌 수 없다"
+        }
+        require(retentionBatchSize >= 1) { "observe.visits.retention-batch-size 는 1 이상이어야 한다: $retentionBatchSize" }
+        val timeBudget = runCatching { DurationStyle.detectAndParse(retentionTimeBudget.trim()) }.getOrNull()
+        require(timeBudget != null && timeBudget > Duration.ZERO) { "observe.visits.retention-time-budget 은 0 보다 긴 기간이어야 한다(예: 5m): $retentionTimeBudget" }
+        return VisitSchedule(collector, retention, retentionBatchSize = retentionBatchSize, retentionTimeBudget = timeBudget)
+    }
 
     @Bean
     fun visitHealth(

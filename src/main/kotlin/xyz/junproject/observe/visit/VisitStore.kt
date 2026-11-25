@@ -36,7 +36,7 @@ interface VisitReader {
 
 /** 보관 삭제의 면 */
 interface VisitRetention {
-    /** [cutoff] 보다 오래된 줄을 한 문장으로 많아야 [limit] 줄 지운다. 지운 줄 수. 실패는 예외 */
+    /** [cutoff] 보다 오래된 줄을 한 문장으로 많아야 [limit] 줄 지운다. 지운 줄 수. 실패는 예외 — 나눠 지우기는 부르는 쪽([VisitSchedule])이 잇는다 */
     fun deleteOlderThan(cutoff: Instant, limit: Int): Int
 }
 
@@ -120,11 +120,17 @@ class VisitStore(private val ingest: JdbcTemplate, private val query: JdbcTempla
         )
     }
 
-    // 뼈대: [limit] 을 아직 지키지 않는다 — 구현 워커가 한 문장 [limit] 줄까지로 바꾼다
-    override fun deleteOlderThan(cutoff: Instant, limit: Int): Int = ingest.update("DELETE FROM visit_event WHERE stream_ms < ?", cutoff.toEpochMilli())
+    /**
+     * PostgreSQL 에는 `DELETE … LIMIT` 이 없다 — 기본 키(`stream_ms` 가 앞 칸)로 고른 [limit] 줄의 줄 위치(ctid)로 지운다.
+     * `ORDER BY stream_ms` 는 오래된 것부터 지우려는 것이자, 같은 연결에서 문장이 되풀이되어 값과 무관한 일반 계획으로 바뀌어도
+     * 기본 키 색인을 타게 하려는 것이다(없으면 일반 계획이 표 전체 훑기로 바뀐다 — EXPLAIN 으로 확인).
+     */
+    override fun deleteOlderThan(cutoff: Instant, limit: Int): Int = ingest.update(
+        "DELETE FROM visit_event WHERE ctid IN (SELECT ctid FROM visit_event WHERE stream_ms < ? ORDER BY stream_ms LIMIT ?)", cutoff.toEpochMilli(), limit,
+    )
 
-    /** 가장 오래된 방문의 시각(헬스용) — 뼈대: 구현 워커가 헬스 풀로 읽는다(비었으면 null) */
-    fun oldestStoredAt(): Instant? = null
+    /** 가장 오래된 방문의 시각(헬스용) — 비었으면 null, 표가 없으면 SQLSTATE 42P01 예외, DB 에 닿지 못하면 예외 */
+    fun oldestStoredAt(): Instant? = health.queryForObject("SELECT min(stream_ms) FROM visit_event", Long::class.javaObjectType)?.let(Instant::ofEpochMilli)
 
     /** 가장 최근에 저장된 방문의 시각(헬스용) — 비었으면 null, 표가 없으면 SQLSTATE 42P01 예외, DB 에 닿지 못하면 예외 */
     fun latestStoredAt(): Instant? = health.query(

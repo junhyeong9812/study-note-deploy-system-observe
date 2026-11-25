@@ -18,10 +18,12 @@ import java.util.concurrent.TimeoutException
  * 칸(값이 없으면 빈 문자열 · -1 — 지표 칸과 같은 관례):
  * - `status`: 지표 칸과 같은 낱말과 순서 — `unreachable`(Redis 의 미확인 건수나 DB 의 마지막 저장 시각을 묻지 못함, 표 없음 42P01 은 닿은 것) →
  *   `failing`(마지막 바퀴 실패) → `ok`(마지막 성공 바퀴가 [stallAfter] 안) → `starting`(뜬 지 [stallAfter] 안, 아직 성공 없음) → `stalled`.
- * - `last_loop_at` · `last_stored_at`(가장 최근 방문의 스트림 시각) · `stored_since_start` · `unacknowledged` · `lag` · `failure`
+ *   `ok` 일 때 가장 오래된 줄이 `now − (90일 + [RETENTION_GRACE])` 보다 엄격히 오래되면 `retention_overdue`(90일 삭제가 밀림 — `ok` 만 대신한다).
+ * - `last_loop_at` · `last_stored_at`(가장 최근 방문의 스트림 시각) · `oldest_stored_at`(가장 오래된 방문의 스트림 시각) · `stored_since_start` ·
+ *   `already_stored`(받았지만 표에 이미 있던 항목 수) · `unacknowledged` · `lag` · `failure`
  * - `dropped`: 이유 글자 → 건수(모든 이유, 없으면 0) · `dropped_total` · `query_stripped`
  * - `last_retention_at` · `last_retention_deleted` · `last_retention_failure`(90일 삭제)
- * 바깥에 묻는 것(미확인 · 밀린 건수, 마지막 저장 시각)은 한꺼번에 시작해 합쳐 [readBudget] 안에서만 기다린다 — 넘기면 `TimeoutException` 실패와 같다.
+ * 바깥에 묻는 것(미확인 · 밀린 건수, 마지막 · 가장 오래된 저장 시각)은 한꺼번에 시작해 합쳐 [readBudget] 안에서만 기다린다 — 넘기면 `TimeoutException` 실패와 같다.
  */
 class VisitHealth(
     private val collector: VisitCollector,
@@ -29,7 +31,7 @@ class VisitHealth(
     private val lag: () -> Long?,
     private val latestStoredAt: () -> Instant?,
     private val lastRetention: () -> RetentionResult?,
-    private val oldestStoredAt: () -> Instant?,                      // 뼈대: 구현 워커가 retention_overdue · oldest_stored_at 에 쓴다
+    private val oldestStoredAt: () -> Instant?,
     private val stallAfter: Duration = Duration.ofSeconds(60),
     private val startedAt: Instant = Instant.now(),
     private val readBudget: Duration = Duration.ofSeconds(2),
@@ -45,16 +47,20 @@ class VisitHealth(
         val pendingRead = startRead(unacknowledged)
         val storedRead = startRead(latestStoredAt)
         val lagRead = startRead(lag)
+        val oldestRead = startRead(oldestStoredAt)
         val pending = awaitRead(pendingRead, deadline)
         val stored = awaitRead(storedRead, deadline).recoverCatching { if (isTableMissing(it)) null else throw it }
-        val problems = listOfNotNull(pending.exceptionOrNull()?.let { "redis" to it }, stored.exceptionOrNull()?.let { "database" to it })
+        val oldest = awaitRead(oldestRead, deadline).recoverCatching { if (isTableMissing(it)) null else throw it }
+        val databaseError = stored.exceptionOrNull() ?: oldest.exceptionOrNull()     // 같은 DB — 사유는 하나만
+        val problems = listOfNotNull(pending.exceptionOrNull()?.let { "redis" to it }, databaseError?.let { "database" to it })
             .joinToString("; ") { (where, error) -> "$where ${error.javaClass.simpleName}" }
         if (problems != lastLoggedProblem && problems.isNotEmpty()) log.warn("observe:observe:visit health check unreachable: {}", problems)
         lastLoggedProblem = problems
         val status = when {
             problems.isNotEmpty() -> "unreachable"
             failure != null -> "failing"
-            lastLoopAt != null && Duration.between(lastLoopAt, now) < stallAfter -> "ok"
+            lastLoopAt != null && Duration.between(lastLoopAt, now) < stallAfter ->
+                if (oldest.getOrNull()?.isBefore(now.minus(VisitStore.RETENTION).minus(RETENTION_GRACE)) == true) "retention_overdue" else "ok"
             lastLoopAt == null && Duration.between(startedAt, now) < stallAfter -> "starting"
             else -> "stalled"
         }
@@ -64,7 +70,9 @@ class VisitHealth(
             "status" to status,
             "last_loop_at" to (lastLoopAt?.toString() ?: ""),
             "last_stored_at" to (stored.getOrNull()?.toString() ?: ""),
+            "oldest_stored_at" to (oldest.getOrNull()?.toString() ?: ""),
             "stored_since_start" to collector.storedTotal,
+            "already_stored" to collector.alreadyStored,
             "unacknowledged" to (pending.getOrNull() ?: -1L),
             "lag" to (awaitRead(lagRead, deadline).getOrNull() ?: -1L),
             "failure" to problems.ifEmpty { failure ?: "" },
@@ -99,5 +107,7 @@ class VisitHealth(
     private companion object {
         val READERS = Executors.newVirtualThreadPerTaskExecutor()!!
         const val UNDEFINED_TABLE = "42P01"   // PostgreSQL: relation does not exist
+        /** 하루 한 번의 삭제가 한 번 늦거나 예산에 걸려 남겨도 밀렸다고 보지 않는 여유(하루 + 2시간) */
+        val RETENTION_GRACE: Duration = Duration.ofHours(26)
     }
 }

@@ -322,7 +322,7 @@ front ── XADD visits ──▶ Redis ──▶ 관측 서버(방문 전용 �
 | 칸 | 필수 | 꼴 |
 |---|---|---|
 | `v` | ○ | `1` |
-| `path` | ○ | `/` 로 시작 · 빈칸 · 제어 문자 없음 · 한글 가능. 처음 나오는 `?` · `#` 의 뒤(검색어 · 조각)는 잘라 버리고 저장하지 않는다(센 수는 헬스의 `visits.query_stripped`). 자른 뒤 512자까지 |
+| `path` | ○ | 먼저 자른다 — 처음 나오는 `?` · `#` · `;` 의 뒤(검색어 · 조각 · `;jsessionid=…` 같은 세션 값)는 잘라 버리고 저장하지 않는다(센 수는 헬스의 `visits.query_stripped`). 그다음 자른 뒤의 경로를 본다: `/` 로 시작(`//` 로 시작하면 `invalid_path`) · 빈칸 없음 · 제어 문자(Cc)와 서식 문자(Cf — 글 방향 뒤집기 · 폭 없는 빈칸 등) 없음(있으면 `control_character` — 잘려 나간 부분에만 있던 것은 보지 않는다) · 한글 가능 · 512자까지 |
 | `screen` | ○ | `^[a-z][a-z0-9_-]{0,31}$` |
 | `referrer_host` | × | 없거나 빈 글자 = 직접. 소문자 호스트 이름만(포트 · 스킴 · 경로 없음), 253자까지 |
 | `device` | ○ | `desktop` · `mobile` · `bot` |
@@ -356,21 +356,27 @@ front ── XADD visits ──▶ Redis ──▶ 관측 서버(방문 전용 �
 
 | 칸 | 뜻 |
 |---|---|
-| `status` | 지표와 같은 낱말 · 판정 순서(`unreachable` → `failing` → `ok` → `starting` → `stalled`), 방문 수집 바퀴 · `visits` 스트림 · `visit_event` 표 기준 |
-| `last_loop_at` · `last_stored_at` · `stored_since_start` · `unacknowledged` · `lag` · `failure` | 로그의 같은 칸과 같은 뜻. `last_stored_at` 은 가장 최근 방문의 시각. `failure` 는 예외 종류 이름만 |
-| `dropped` · `dropped_total` · `query_stripped` | 이 프로세스가 뜬 뒤 버린 항목 수(이유별 — 모든 이유가 0 부터) · 그 합 · 경로의 `?` · `#` 뒤를 잘라 내고 저장한 수 |
+| `status` | 지표와 같은 낱말 · 판정 순서(`unreachable` → `failing` → `ok` → `starting` → `stalled`), 방문 수집 바퀴 · `visits` 스트림 · `visit_event` 표 기준. 수집은 `ok` 인데 가장 오래된 줄이 `지금 − (90일 + 26시간)` 보다 오래되면 `ok` 대신 `retention_overdue` — 90일 삭제가 밀려 보관 기한을 넘긴 주소가 남아 있다(실패 · 예산 초과가 이어짐). 로그 수집의 `status` · HTTP 상태는 바꾸지 않는다 |
+| `last_loop_at` · `last_stored_at` · `stored_since_start` · `unacknowledged` · `lag` · `failure` | 로그의 같은 칸과 같은 뜻. `last_stored_at` 은 가장 최근 방문의 시각. `stored_since_start` 는 표에 새로 넣은 수. `failure` 는 예외 종류 이름만 |
+| `already_stored` | 이 프로세스가 뜬 뒤 받았지만 표에 이미 있어(같은 스트림 ID — 앞 자리가 저장하고 확인 전에 죽음) 넣지 않은 수. 저장 수 · 자른 수에 들지 않는다 |
+| `oldest_stored_at` | 가장 오래된 방문의 시각(표가 비거나 없으면 빈 문자열) |
+| `dropped` · `dropped_total` · `query_stripped` | 이 프로세스가 뜬 뒤 버린 항목 수(이유별 — 모든 이유가 0 부터) · 그 합 · 경로의 `?` · `#` · `;` 뒤를 잘라 내고 새로 저장한 수 |
 | `last_retention_at` · `last_retention_deleted` · `last_retention_failure` | 마지막 90일 삭제의 시각 · 지운 줄 수 · 실패 종류(안 돌았으면 빈 문자열 · -1) |
 
 ### 보관 · 설정
 
 - 90일: 매일 03:40(서울, `VISITS_RETENTION_CRON`) `지금 − 90일` 보다 오래된 줄을 지운다(시각 기준 — 서울의 날짜로 자르지 않는다). 지운 수는 서버 로그와 헬스에, 실패는 종류 이름만. 로그 · 지표 · 로그인 시도 삭제와 따로 돈다.
+- 나눠 지운다: 한 문장에 `VISITS_RETENTION_BATCH_SIZE` 줄까지, 문장마다 따로 커밋해 그 사이에 수집이 연결을 쓴다. 한 문장이 그보다 적게 지우면 끝. 한 번의 실행이 `VISITS_RETENTION_TIME_BUDGET` 을 넘기면 그 문장 뒤에 멈추고(로그 한 줄 — 지운 수와 남았다는 것) 다음 실행이 잇는다. 밀린 것이 남아 하루를 넘기면 헬스가 `retention_overdue` 다.
+- **삭제는 끌 수 없다**: `VISITS_RETENTION_CRON=-` 이면 서버가 뜨지 않는다(주소를 저장하면서 삭제를 끌 수 없다). 묶음 크기가 1 보다 작거나 예산이 0 이하여도 뜨지 않는다.
 - 연결 풀은 방문 전용(수집 1 — 하루 한 번의 삭제와 함께 쓴다 · 조회 1 · 헬스 1).
 
 | 설정(환경변수) | 기본 | 뜻 |
 |---|---|---|
 | `VISITS_STREAM` | `visits` | 받는 스트림(front 의 같은 이름 설정과 같은 값) |
 | `VISITS_GROUP` | `observe` | 소비자 그룹 이름 |
-| `VISITS_RETENTION_CRON` | `0 40 3 * * *` | 90일 삭제의 예약(서울 시각) |
+| `VISITS_RETENTION_CRON` | `0 40 3 * * *` | 90일 삭제의 예약(서울 시각). `-`(끔)은 받지 않는다 |
+| `VISITS_RETENTION_BATCH_SIZE` | `5000` | 90일 삭제의 한 문장이 지우는 줄 수의 상한(1 이상) |
+| `VISITS_RETENTION_TIME_BUDGET` | `5m` | 90일 삭제 한 번의 시간 예산(0 보다 길게) — 넘기면 멈추고 다음 실행이 잇는다 |
 
 ## 무중단 배포와 두 자리
 
