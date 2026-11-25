@@ -1,6 +1,5 @@
 package xyz.junproject.observe.threshold
 
-import org.slf4j.LoggerFactory
 import tools.jackson.databind.json.JsonMapper
 import java.net.URI
 import java.net.http.HttpClient
@@ -80,20 +79,16 @@ class HttpAlertSender(
     }
 }
 
-/**
- * 보내기 한 바퀴의 결과 — 잠금을 얻지 못했으면 [lockAcquired] 가 false 이고 아무것도 보내지 않았다.
- * [skippedUnknownRules] 는 그 바퀴에 건너뛴 모르는 규칙 글자의 줄([AlertQueue.unknownRuleCounts] — 규칙 글자 → 건수, 없으면 빈 맵, 세지 못했으면 null)
- */
-data class DispatchOutcome(val lockAcquired: Boolean, val delivered: Int, val retrying: Int, val rejected: Int,
-                           val skippedUnknownRules: Map<String, Long>? = emptyMap())
+/** 보내기 한 바퀴의 결과 — 잠금을 얻지 못했으면 [lockAcquired] 가 false 이고 아무것도 보내지 않았다 */
+data class DispatchOutcome(val lockAcquired: Boolean, val delivered: Int, val retrying: Int, val rejected: Int)
 
 /**
  * 보낼 표를 읽어 보낸다 — 보내기 잠금을 얻은 자리만(같은 알림을 두 자리가 함께 보내지 않는다). 대상마다 줄의 머리만([AlertQueue.pendingByTarget] —
  * 대상마다 오래된 [batchSize] 건), 한 바퀴에 합쳐 [batchSize] 건까지.
  * Delivered → [AlertQueue.markDelivered], Retry → [AlertQueue.markRetry], Rejected → [AlertQueue.markRejected].
  * 보내는 쪽이 예외를 내도 Retry 로 본다. 보내기 잠금은 한 바퀴 동안 쥔다 — 그 길이는 [roundBudget] 를 넘지 않는다.
- * 이 판이 모르는 규칙 글자의 줄은 [AlertQueue.pendingByTarget] 에 나오지 않는다 — 그 수만 [AlertQueue.unknownRuleCounts] 로 세어 결과에 싣는다.
- * 세는 일은 보내기를 막지 않는다: 아는 줄을 다 보내고 표시한 뒤에 한 번 세고, 실패하면 결과의 수는 null 이고 WARN 한 줄(예외의 종류 이름만)을 남긴다.
+ * 이 판이 모르는 규칙 글자의 줄은 [AlertQueue.pendingByTarget] 에 나오지 않는다. 보내는 쪽은 아무것도 세지 않는다 — 모르는 줄의 수는
+ * 바퀴가 보내기 잠금을 놓은 뒤에 [AlertQueue.alertCounts] 로 센다([ThresholdRound.dispatchOnce]).
  */
 class AlertDispatcher(
     private val queue: AlertQueue,
@@ -112,8 +107,6 @@ class AlertDispatcher(
      */
     private val sendTimeout: Duration = Duration.ofSeconds(3),
 ) {
-    private val log = LoggerFactory.getLogger("observe")
-
     fun dispatch(now: Instant): DispatchOutcome = queue.whileHoldingDispatchLock {
         val started = clock()
         var delivered = 0
@@ -143,10 +136,6 @@ class AlertDispatcher(
                 if (line.isEmpty()) iterator.remove()
             }
         }
-        val skippedUnknownRules = runCatching { queue.unknownRuleCounts() }.getOrElse {
-            log.warn("observe:observe:alerts could not count unknown rule lines: {}", it.javaClass.simpleName)   // 문구 · 예외는 싣지 않는다
-            null
-        }
-        DispatchOutcome(true, delivered, retrying, rejected, skippedUnknownRules)
+        DispatchOutcome(true, delivered, retrying, rejected)
     } ?: DispatchOutcome(false, 0, 0, 0)
 }

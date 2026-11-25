@@ -44,7 +44,7 @@ interface RuleStateStore {
 
 /** 보낼 표 — 보내는 쪽([AlertDispatcher])이 쓰는 면 */
 interface AlertQueue {
-    /** 아직 보내지 못했고 거절되지 않은 알림 — 오래된 것부터 [limit] 건(이 판이 모르는 규칙 글자의 줄은 나오지 않는다 — [unknownRuleCounts]) */
+    /** 아직 보내지 못했고 거절되지 않은 알림 — 오래된 것부터 [limit] 건(이 판이 모르는 규칙 글자의 줄은 나오지 않는다 — [AlertCounts.unknownRules]) */
     fun pendingAlerts(limit: Int): List<QueuedAlert>
     /** 알림 서버가 받았다 — 다시 보내지 않는다 */
     fun markDelivered(id: Long, at: Instant)
@@ -54,13 +54,11 @@ interface AlertQueue {
     fun markRejected(id: Long, at: Instant, reason: String)
     /** 보내기 잠금(자리 둘 중 한쪽만)을 기다리지 않고 시도해 얻으면 [block] 을 돌리고 그 값을, 얻지 못하면 null */
     fun <T> whileHoldingDispatchLock(block: () -> T): T?
-    fun alertCounts(): AlertCounts
-
     /**
-     * 아직 보내지 못했고 거절되지 않은 줄 가운데 이 판이 모르는 규칙 글자의 줄 — 규칙 글자 → 건수(없으면 빈 맵).
-     * 그 줄은 [pendingByTarget] 에 나오지 않고 표시(`mark…`)되지도 지워지지도 않는다
+     * 보낼 표의 건수 — 이 판이 모르는 규칙 글자의 줄은 [AlertCounts.unknownRules] 에 규칙 글자별로(그 줄은 [pendingByTarget] 에 나오지 않고
+     * 표시(`mark…`)되지도 지워지지도 않는다)
      */
-    fun unknownRuleCounts(): Map<String, Long> = emptyMap()
+    fun alertCounts(): AlertCounts
 
     /**
      * §16 · §16.1: 대상([AlertTarget])마다 아직 보내지 못했고 거절되지 않은 알림의 가장 오래된 [perTarget] 건(오래된 것부터)과
@@ -114,7 +112,7 @@ class ThresholdStore(
      * 기본값은 [jdbc](지금 동작과 같다 — 배선에서 조회용 풀을 넘긴다). [failpoint] 를 끝 람다로 넘기는 호출이 그대로 되게 그 앞에 둔다
      */
     private val query: JdbcTemplate = jdbc,
-    /** 건수 세기([alertCounts])의 조회 시간 상한 — 뼈대: 아직 쓰지 않는다 */
+    /** 건수 세기([alertCounts])의 조회 시간 상한 — 그 조회의 트랜잭션에만 건다(`SET LOCAL` — 끝나면 연결에 남지 않는다) */
     private val countTimeout: Duration = Duration.ofSeconds(2),
     private val failpoint: (String) -> Unit = {},
 ) : RuleStateStore, AlertQueue, FiringSource {
@@ -297,22 +295,23 @@ class ThresholdStore(
         }
     }
 
+    /**
+     * 건수를 한 문장으로 센다(못 보낸 · 거절된 수와 모르는 규칙의 줄이 같은 때의 값). 아는 규칙은 SQL 에서 가른다([KNOWN_RULES]).
+     * 조회는 [countTimeout] 에서 끊긴다 — 그 상한은 이 트랜잭션에만 걸려(`set_config(…, true)` = `SET LOCAL`) 커밋 · 되돌림과 함께 사라진다
+     */
     override fun alertCounts(): AlertCounts {
         ensureSchema()
-        return jdbc.queryForObject(
-            """SELECT count(*) FILTER (WHERE rejected_ms IS NULL) AS undelivered, count(*) FILTER (WHERE rejected_ms IS NOT NULL) AS rejected,
-                      count(*) FILTER (WHERE rejected_ms IS NULL AND rule NOT IN $KNOWN_RULES) AS unknown_rule
-               FROM resource_alert_outbox""",
-            { row, _ -> AlertCounts(row.getLong("undelivered"), row.getLong("rejected")) },   // 뼈대: 규칙 글자별 맵은 아직 채우지 않는다
-        )!!
-    }
-
-    override fun unknownRuleCounts(): Map<String, Long> {
-        ensureSchema()
-        return jdbc.query(
-            "SELECT rule, count(*) AS lines FROM resource_alert_outbox WHERE rejected_ms IS NULL AND rule NOT IN $KNOWN_RULES GROUP BY rule",
-            { row, _ -> row.getString("rule") to row.getLong("lines") },
-        ).toMap()
+        return transaction.execute {
+            jdbc.queryForObject("SELECT set_config('statement_timeout', ?, true)", String::class.java, countTimeout.toMillis().toString())
+            val groups = jdbc.query(
+                """SELECT CASE WHEN rule IN $KNOWN_RULES THEN NULL ELSE rule END AS unknown_rule,
+                          count(*) FILTER (WHERE rejected_ms IS NULL) AS undelivered, count(*) FILTER (WHERE rejected_ms IS NOT NULL) AS rejected
+                   FROM resource_alert_outbox GROUP BY 1""",
+                { row, _ -> Triple(row.getString("unknown_rule"), row.getLong("undelivered"), row.getLong("rejected")) },
+            )
+            AlertCounts(groups.sumOf { it.second }, groups.sumOf { it.third },
+                groups.filter { it.first != null && it.second > 0 }.associate { it.first!! to it.second })
+        }!!
     }
 
     /** 지금 넘어 있는 규칙 — 조회용 연결로 커밋된 판정 상태를 읽는다(§16.2 — 판정 · 알림 연결이 다 잡혀도 답한다) */
