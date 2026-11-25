@@ -17,8 +17,11 @@ data class RoundOutcome(val judged: Boolean, val eventsCreated: Int)
 /** 보낼 표의 한 줄 — [attempts] 는 지금까지 보낸 횟수, [lastFailure] 는 마지막 실패 사유 */
 data class QueuedAlert(val id: Long, val alert: ResourceAlert, val attempts: Int, val lastFailure: String?)
 
-/** 보낼 표의 건수 — [undelivered] 는 아직 보내지 못한 것(다시 보낼 것), [rejected] 는 알림 서버가 거절해 다시 보내지 않는 것 */
-data class AlertCounts(val undelivered: Long, val rejected: Long)
+/**
+ * 보낼 표의 건수 — [undelivered] 는 아직 보내지 못한 것(다시 보낼 것), [rejected] 는 알림 서버가 거절해 다시 보내지 않는 것.
+ * [unknownRule] 은 [undelivered] 가운데 이 판이 모르는 규칙 글자의 줄(보내지 않고 건너뛰며 지우지 않는다 — 그 규칙을 아는 판이 보낸다)
+ */
+data class AlertCounts(val undelivered: Long, val rejected: Long, val unknownRule: Long = 0)
 
 /** `GET /metrics/latest` 의 `firing[]` 한 줄 — `{server, rule, target, severity, since, last_value}` (target 은 재시작 규칙의 컨테이너 이름, 그 밖은 null) */
 data class FiringRule(val server: String, val rule: String, val target: String?, val severity: String, val since: Instant, val lastValue: Double?)
@@ -51,6 +54,12 @@ interface AlertQueue {
     /** 보내기 잠금(자리 둘 중 한쪽만)을 기다리지 않고 시도해 얻으면 [block] 을 돌리고 그 값을, 얻지 못하면 null */
     fun <T> whileHoldingDispatchLock(block: () -> T): T?
     fun alertCounts(): AlertCounts
+
+    /**
+     * 아직 보내지 못했고 거절되지 않은 줄 가운데 이 판이 모르는 규칙 글자의 줄 — 규칙 글자 → 건수(없으면 빈 맵).
+     * 그 줄은 [pendingByTarget] 에 나오지 않고 표시(`mark…`)되지도 지워지지도 않는다
+     */
+    fun unknownRuleCounts(): Map<String, Long> = emptyMap()
 
     /**
      * §16 · §16.1: 대상([AlertTarget])마다 아직 보내지 못했고 거절되지 않은 알림의 가장 오래된 [perTarget] 건(오래된 것부터)과

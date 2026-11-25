@@ -79,8 +79,12 @@ class HttpAlertSender(
     }
 }
 
-/** 보내기 한 바퀴의 결과 — 잠금을 얻지 못했으면 [lockAcquired] 가 false 이고 아무것도 보내지 않았다 */
-data class DispatchOutcome(val lockAcquired: Boolean, val delivered: Int, val retrying: Int, val rejected: Int)
+/**
+ * 보내기 한 바퀴의 결과 — 잠금을 얻지 못했으면 [lockAcquired] 가 false 이고 아무것도 보내지 않았다.
+ * [skippedUnknownRules] 는 그 바퀴에 건너뛴 모르는 규칙 글자의 줄([AlertQueue.unknownRuleCounts] — 규칙 글자 → 건수, 없으면 빈 맵)
+ */
+data class DispatchOutcome(val lockAcquired: Boolean, val delivered: Int, val retrying: Int, val rejected: Int,
+                           val skippedUnknownRules: Map<String, Long> = emptyMap())
 
 /**
  * 보낼 표를 읽어 보낸다 — 보내기 잠금을 얻은 자리만(같은 알림을 두 자리가 함께 보내지 않는다). 대상마다 줄의 머리만([AlertQueue.pendingByTarget] —
