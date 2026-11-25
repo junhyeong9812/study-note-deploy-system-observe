@@ -8,6 +8,7 @@ import xyz.junproject.observe.collect.FakeLogSink
 import xyz.junproject.observe.collect.FakeLogStream
 import xyz.junproject.observe.collect.LogCollector
 import xyz.junproject.observe.log.RetentionResult
+import xyz.junproject.observe.log.StreamId
 import xyz.junproject.observe.metric.FakeMetricSink
 import xyz.junproject.observe.metric.FakeMetricStream
 import xyz.junproject.observe.metric.MetricCollector
@@ -64,7 +65,7 @@ class VisitHealthTest {
         assertEquals(setOf(
             "status", "last_loop_at", "last_stored_at", "stored_since_start", "unacknowledged", "lag", "failure",
             "dropped", "dropped_total", "query_stripped", "last_retention_at", "last_retention_deleted", "last_retention_failure",
-            "already_stored", "oldest_stored_at",
+            "already_stored", "oldest_stored_at", "store_result_unknown",
         ), body.keys)
         assertEquals("ok", body["status"])
         assertEquals(now.toString(), body["last_stored_at"])
@@ -77,6 +78,7 @@ class VisitHealthTest {
         assertEquals("", body["last_retention_at"])
         assertEquals(-1, body["last_retention_deleted"])
         assertEquals(0L, body["already_stored"])
+        assertEquals(0L, body["store_result_unknown"])
         assertEquals("", body["oldest_stored_at"], "표가 비었는데 가장 오래된 시각이 있다")
     }
 
@@ -129,9 +131,10 @@ class VisitHealthTest {
         assertEquals(now.toString(), body["last_retention_at"])
         assertEquals(42, body["last_retention_deleted"])
         assertEquals("", body["last_retention_failure"])
-        retention = RetentionResult(now, null, "QueryTimeoutException")
+        retention = RetentionResult(now, 10_000, "QueryTimeoutException")      // 셋째 묶음에서 실패 — 앞의 둘은 지워졌다
         body = visitHealth().report(now)
         assertEquals("QueryTimeoutException", body["last_retention_failure"])
+        assertEquals(10_000, body["last_retention_deleted"], "도중에 실패한 삭제의 지운 수가 사라졌다")
         assertEquals("ok", body["status"], "삭제 실패가 수집의 상태를 바꿨다")
     }
 
@@ -197,6 +200,18 @@ class VisitHealthTest {
         val body = visitHealth().report(now)
         assertEquals(1L, body["stored_since_start"])
         assertEquals(1L, body["already_stored"])
+    }
+
+    @Test
+    fun `저장소가 결과 모름을 돌려준 수를 store_result_unknown 으로 보인다`() {
+        sink.resultUnknownFor = setOf(StreamId(1_000, 0), StreamId(2_000, 0))
+        stream.add(VisitRecords.record("1000-0"), VisitRecords.record("2000-0"), VisitRecords.record("3000-0"))
+        collector.runOnce()
+        val body = visitHealth().report(now)
+        assertEquals(2L, body["store_result_unknown"], "$body")
+        assertEquals(1L, body["stored_since_start"], "$body")
+        assertEquals(0L, body["already_stored"], "$body")
+        assertEquals("ok", body["status"], "결과 모름은 수집의 실패가 아니다: $body")
     }
 
     @Test

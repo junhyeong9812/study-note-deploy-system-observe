@@ -67,7 +67,7 @@ class VisitScheduleTest {
     fun `삭제가 실패하면 예외를 내지 않고 종류 이름만 남기며 예외의 글은 로그에 없다`() {
         retention.failure = QueryTimeoutException("canceling statement — 내부 문구 ('$ADDRESS_V4')")
         assertNull(schedule.deleteOldVisits(now))
-        assertEquals(RetentionResult(now, null, "QueryTimeoutException"), schedule.lastRetention)
+        assertEquals(RetentionResult(now, 0, "QueryTimeoutException"), schedule.lastRetention, "첫 문장에서 실패하면 지운 수는 0 이다")
         assertTrue(logs.lines().any { it.contains("QueryTimeoutException") }, "삭제 실패가 로그에 없다: ${logs.lines()}")
         assertFalse(logs.text().contains(ADDRESS_V4), "삭제 실패의 로그에 주소가 나왔다: ${logs.text()}")
         assertFalse(logs.text().contains("내부 문구"), "삭제 실패의 로그에 예외의 글이 실렸다: ${logs.text()}")
@@ -153,8 +153,46 @@ class VisitScheduleTest {
         val schedule = VisitSchedule(collector, failing, retentionBatchSize = 5_000, retentionTimeBudget = Duration.ofMinutes(5))
         assertNull(schedule.deleteOldVisits(now))
         assertEquals(2, failing.statements, "실패한 뒤에도 이었다")
-        assertEquals("QueryTimeoutException", schedule.lastRetention?.failure)
+        assertEquals(RetentionResult(now, 5_000, "QueryTimeoutException"), schedule.lastRetention, "실패 앞에서 지운 수가 사라졌다")
         assertFalse(logs.text().contains(ADDRESS_V4), logs.text())
+    }
+
+    /** 문장마다 [answers] 의 수를 차례로 돌려주고, 다 쓰면 [failure] 를 던지는 삭제 */
+    private class FailingAfter(private val answers: List<Int>, private val failure: RuntimeException) : VisitRetention {
+        var statements = 0
+        override fun deleteOlderThan(cutoff: Instant, limit: Int): Int = answers.getOrNull(statements++) ?: throw failure
+    }
+
+    @Test
+    fun `셋째 묶음에서 실패하면 앞의 두 묶음에서 지운 수와 실패의 종류가 결과와 헬스와 ERROR 로그 한 줄에 함께 남는다`() {
+        val failing = FailingAfter(listOf(5_000, 5_000), QueryTimeoutException("canceling statement — 내부 문구 ('$ADDRESS_V4')"))
+        val schedule = VisitSchedule(collector, failing, retentionBatchSize = 5_000, retentionTimeBudget = Duration.ofMinutes(5))
+        assertNull(schedule.deleteOldVisits(now), "실패한 실행이 성공처럼 지운 수를 돌려줬다")
+        assertEquals(3, failing.statements)
+        assertEquals(RetentionResult(now, 10_000, "QueryTimeoutException"), schedule.lastRetention, "도중에 실패한 삭제의 지운 수가 사라졌다")
+
+        val health = VisitHealth(collector, unacknowledged = { 0L }, lag = { 0L }, latestStoredAt = { null }, lastRetention = { schedule.lastRetention },
+            oldestStoredAt = { null }).report(now)
+        assertEquals(10_000, health["last_retention_deleted"], "$health")
+        assertEquals("QueryTimeoutException", health["last_retention_failure"], "$health")
+
+        val errors = logs.errorLines()
+        assertEquals(1, errors.size, "삭제 실패의 ERROR 줄이 하나가 아니다: $errors")
+        assertTrue(errors.single().contains("10000") && errors.single().contains("QueryTimeoutException"), "ERROR 줄에 지운 수와 종류가 함께 없다: $errors")
+        assertFalse(errors.single().contains(ADDRESS_V4), "ERROR 줄에 주소가 나왔다: $errors")
+        assertFalse(logs.text().contains("내부 문구") || logs.text().contains(ADDRESS_V4), "로그에 예외의 글이 실렸다: ${logs.text()}")
+    }
+
+    @Test
+    fun `첫 묶음에서 실패하면 지운 수는 0 이고 ERROR 줄에 종류가 있다`() {
+        val failing = FailingAfter(emptyList(), QueryTimeoutException("canceling statement ('$ADDRESS_V4')"))
+        val schedule = VisitSchedule(collector, failing, retentionBatchSize = 5_000, retentionTimeBudget = Duration.ofMinutes(5))
+        assertNull(schedule.deleteOldVisits(now))
+        assertEquals(RetentionResult(now, 0, "QueryTimeoutException"), schedule.lastRetention)
+        val errors = logs.errorLines()
+        assertEquals(1, errors.size, "$errors")
+        assertTrue(errors.single().contains("QueryTimeoutException"), "$errors")
+        assertFalse(errors.single().contains(ADDRESS_V4), "$errors")
     }
 
     // ── 설정 — 삭제를 끌 수 없다 ────────────────────────────

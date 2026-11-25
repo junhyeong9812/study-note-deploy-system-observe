@@ -52,7 +52,10 @@ object VisitRecords {
     ) = Visit(StreamId(millis, sequence), path, screen, referrerHost, device, visitor, ip)
 }
 
-/** 메모리 저장소 — 같은 스트림 ID 는 한 번만(새로 넣은 ID 만 돌려준다). [failure] 가 있으면 저장이 그 예외로 실패한다 */
+/**
+ * 메모리 저장소 — 같은 스트림 ID 는 한 번만(새로 넣은 ID 만 돌려준다). [failure] 가 있으면 저장이 그 예외로 실패한다.
+ * [resultUnknownFor] 에 든 ID 는 드라이버가 "결과 모름"을 돌려준 것처럼 — 넣었는지와 무관하게 [VisitInsertion.resultUnknown] 으로 돌려준다.
+ */
 class FakeVisitSink(private val events: MutableList<String> = mutableListOf()) : VisitSink {
     val stored = LinkedHashMap<StreamId, Visit>()
     var failure: RuntimeException? = null
@@ -64,10 +67,14 @@ class FakeVisitSink(private val events: MutableList<String> = mutableListOf()) :
         schemaCreations++
     }
 
-    override fun insertAll(visits: List<Visit>): Set<StreamId> {
+    var resultUnknownFor: Set<StreamId> = emptySet()
+
+    override fun insertAll(visits: List<Visit>): VisitInsertion {
         failure?.let { events += "insert-failed"; throw it }
         visits.forEach { events += "insert:${it.id}" }
-        return visits.filter { stored.putIfAbsent(it.id, it) == null }.map { it.id }.toSet()
+        val inserted = visits.filter { stored.putIfAbsent(it.id, it) == null }.map { it.id }.toSet()
+        val unknown = visits.map { it.id }.filter { it in resultUnknownFor }.toSet()
+        return VisitInsertion(inserted - unknown, unknown)
     }
 }
 
@@ -83,6 +90,12 @@ class CapturedLogs : AutoCloseable {
     }
 
     fun lines(): List<String> = synchronized(appender) { appender.list.toList() }.map { it.formattedMessage }
+
+    /** ERROR 수준의 줄만 — 문구와 예외(원인 사슬 포함)의 글까지 */
+    fun errorLines(): List<String> = synchronized(appender) { appender.list.toList() }.filter { it.level == ch.qos.logback.classic.Level.ERROR }.map { event ->
+        val causes = generateSequence(event.throwableProxy) { it.cause }.joinToString(" ") { "${it.className}: ${it.message}" }
+        "${event.formattedMessage} $causes".trim()
+    }
 
     override fun close() { root.detachAppender(appender) }
 }

@@ -310,6 +310,11 @@ class ObserveConfiguration {
 
     private var sharedVisitStreamSource: RedisMetricStreamSource? = null
 
+    companion object {
+        /** 방문 풀 셋의 JDBC 주소 — 뼈대: 지금은 [withoutServerErrorDetail] 만. 구현 워커가 `reWriteBatchedInserts=false` 도 박고 [visitStore] 가 이것을 쓰게 한다 */
+        internal fun visitJdbcUrl(url: String): String = ObserveConfiguration().withoutServerErrorDetail(url)
+    }
+
     /**
      * 방문 스트림 읽기 — 지표의 스트림 읽기([RedisMetricStreamSource] — 칸 전부를 넘긴다)를 스트림 이름만 바꿔 쓴다. 빈으로 두지 않는다:
      * 같은 타입의 빈이 둘이면 지표 수집기 · 헬스의 주입이 모호해진다. 수집기와 헬스가 이 하나를 나눠 쓴다.

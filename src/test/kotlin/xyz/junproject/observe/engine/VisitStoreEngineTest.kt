@@ -15,6 +15,7 @@ import xyz.junproject.observe.visit.ReferrerViews
 import xyz.junproject.observe.visit.Visit
 import xyz.junproject.observe.visit.VisitDay
 import xyz.junproject.observe.visit.VisitDevice
+import xyz.junproject.observe.visit.VisitInsertion
 import xyz.junproject.observe.visit.VisitRecords
 import xyz.junproject.observe.visit.VisitRecords.ADDRESS_V4
 import xyz.junproject.observe.visit.VisitRecords.ADDRESS_V6
@@ -79,7 +80,7 @@ class VisitStoreEngineTest {
             VisitRecords.visit(1_764_000_000_000, 1, path = "/wiki/쿠버네티스", screen = "search", referrerHost = null, device = VisitDevice.MOBILE,
                 visitor = VISITOR_TWO, ip = ADDRESS_V6),
         )
-        assertEquals(visits.map { it.id }.toSet(), store.insertAll(visits))
+        assertEquals(VisitInsertion(visits.map { it.id }.toSet(), emptySet()), store.insertAll(visits))
         assertEquals(listOf(
             mapOf("stream_ms" to 1_764_000_000_000L, "stream_seq" to 0, "path" to "/wiki/kubernetes/pod", "screen" to "topic", "referrer_host" to "www.google.com",
                 "device" to "desktop", "visitor" to VISITOR_ONE, "ip" to ADDRESS_V4),
@@ -90,9 +91,9 @@ class VisitStoreEngineTest {
 
     @Test
     fun `같은 스트림 ID 를 두 번 저장해도 한 줄이고 처음 것이 남는다`() {
-        assertEquals(setOf(StreamId(1_000, 0)), store.insertAll(listOf(VisitRecords.visit(1_000))))
-        assertEquals(emptySet<StreamId>(), store.insertAll(listOf(VisitRecords.visit(1_000, path = "/other"))))
-        assertEquals(setOf(StreamId(2_000, 0)), store.insertAll(listOf(VisitRecords.visit(1_000), VisitRecords.visit(2_000))), "이미 있던 것까지 새로 넣었다고 했다")
+        assertEquals(setOf(StreamId(1_000, 0)), store.insertAll(listOf(VisitRecords.visit(1_000))).inserted)
+        assertEquals(VisitInsertion(emptySet(), emptySet()), store.insertAll(listOf(VisitRecords.visit(1_000, path = "/other"))))
+        assertEquals(VisitInsertion(setOf(StreamId(2_000, 0)), emptySet()), store.insertAll(listOf(VisitRecords.visit(1_000), VisitRecords.visit(2_000))), "이미 있던 것까지 새로 넣었다고 했다")
         assertEquals(listOf(1_000L, 2_000L), rows().map { it["stream_ms"] })
         assertEquals("/wiki/kubernetes/pod", rows().first()["path"])
     }

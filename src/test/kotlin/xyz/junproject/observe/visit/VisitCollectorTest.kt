@@ -125,6 +125,20 @@ class VisitCollectorTest {
     }
 
     @Test
+    fun `저장소가 결과 모름을 돌려준 항목은 저장 수에도 이미 있음에도 잘라 낸 수에도 세지 않고 따로 세며 확인한다`() {
+        sink.insertAll(listOf(VisitRecords.visit(3_000)))
+        sink.resultUnknownFor = setOf(StreamId(1_000, 0), StreamId(3_000, 0))
+        stream.add(VisitRecords.record("1000-0", VisitRecords.fields(path = "/search?q=$SEARCH_WORDS", screen = "search")), good(2_000), good(3_000))
+        assertEquals(3, collector.runOnce())
+        assertNull(collector.lastFailure, "결과 모름은 바퀴의 실패가 아니다")
+        assertTrue(stream.pending.isEmpty(), "결과 모름인 항목을 확인하지 않았다 — 영영 다시 받는다")
+        assertEquals(1L, collector.storedTotal, "결과 모름을 저장 수에 셌다")
+        assertEquals(2L, collector.storeResultUnknown, "결과 모름을 따로 세지 않았다")
+        assertEquals(0L, collector.alreadyStored, "결과 모름을 이미 있음으로 짐작했다")
+        assertEquals(0L, collector.queryStripped, "결과 모름인 항목의 잘라 냄을 셌다")
+    }
+
+    @Test
     fun `기동 직후 지난번에 확인하지 못한 항목부터 받고 같은 항목은 한 줄만 남는다`() {
         stream.add(good(1_000), good(2_000))
         stream.ensureGroup()

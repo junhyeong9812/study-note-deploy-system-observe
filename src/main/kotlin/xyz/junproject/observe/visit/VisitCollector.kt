@@ -10,12 +10,18 @@ import java.time.Instant
 import java.util.EnumMap
 import java.util.concurrent.atomic.AtomicLong
 
+/**
+ * 묶음 저장의 결과 — [inserted] 는 새로 넣은 줄의 스트림 ID, [resultUnknown] 은 드라이버가 "결과 모름"(`Statement.SUCCESS_NO_INFO`)을 돌려준 항목.
+ * 둘 다 아닌 항목은 표에 이미 있던 것이다. 뼈대: 구현 워커가 [resultUnknown] 을 채우고 센다.
+ */
+data class VisitInsertion(val inserted: Set<StreamId>, val resultUnknown: Set<StreamId> = emptySet())
+
 /** 수집 쪽이 쓰는 면 */
 interface VisitSink {
     /** 표를 만든다(있으면 그대로). 실패는 예외 */
     fun createSchema()
     /** 묶음을 저장한다. 이미 있는 항목(같은 스트림 ID)은 건너뛴다. 새로 들어간 줄의 스트림 ID 를 돌려준다(이미 있던 것은 빠진다). 실패는 예외 */
-    fun insertAll(visits: List<Visit>): Set<StreamId>
+    fun insertAll(visits: List<Visit>): VisitInsertion
 }
 
 /**
@@ -53,6 +59,8 @@ class VisitCollector(
     @Volatile var queryStripped: Long = 0; private set
     /** 이 프로세스가 뜬 뒤 받았지만 표에 이미 있어(같은 스트림 ID) 넣지 않은 항목 수 */
     @Volatile var alreadyStored: Long = 0; private set
+    /** 이 프로세스가 뜬 뒤 저장소가 "결과 모름"을 돌려준 항목 수 — 뼈대: 구현 워커가 센다 */
+    @Volatile var storeResultUnknown: Long = 0; private set
 
     /** 이 프로세스가 뜬 뒤 버린 항목 수 — 이유마다(모든 이유가 들고, 없으면 0) */
     fun droppedCounts(): Map<VisitDropReason, Long> = dropped.mapValues { it.value.get() }
@@ -118,7 +126,7 @@ class VisitCollector(
             }
         }
         if (accepted.isNotEmpty()) {
-            val inserted = sink.insertAll(accepted)      // 실패하면 예외 → 아래 확인을 하지 않는다(다음 바퀴에 다시 받는다)
+            val inserted = sink.insertAll(accepted).inserted      // 실패하면 예외 → 아래 확인을 하지 않는다(다음 바퀴에 다시 받는다)
             source.acknowledge(acceptedIds)
             storedTotal += inserted.size
             alreadyStored += accepted.count { it.id !in inserted }

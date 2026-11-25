@@ -65,15 +65,16 @@ class VisitStore(private val ingest: JdbcTemplate, private val query: JdbcTempla
         )
     }
 
-    override fun insertAll(visits: List<Visit>): Set<StreamId> {
-        if (visits.isEmpty()) return emptySet()
+    override fun insertAll(visits: List<Visit>): VisitInsertion {
+        if (visits.isEmpty()) return VisitInsertion(emptySet())
         val results = ingest.batchUpdate(
             """INSERT INTO visit_event (stream_ms, stream_seq, path, screen, referrer_host, device, visitor, ip)
                VALUES (?,?,?,?,?,?,?,?) ON CONFLICT (stream_ms, stream_seq) DO NOTHING""",
             visits.map { arrayOf<Any?>(it.id.millis, it.id.sequence, it.path, it.screen, it.referrerHost, it.device.wireName, it.visitor, it.ip) },
             intArrayOf(Types.BIGINT, Types.INTEGER, Types.VARCHAR, Types.VARCHAR, Types.VARCHAR, Types.VARCHAR, Types.VARCHAR, Types.VARCHAR),
         )
-        return visits.filterIndexed { index, _ -> results[index] > 0 || results[index] == java.sql.Statement.SUCCESS_NO_INFO }.map { it.id }.toSet()
+        // 뼈대: 아직 "결과 모름"을 넣은 것으로 친다 — 구현 워커가 resultUnknown 으로 가른다
+        return VisitInsertion(visits.filterIndexed { index, _ -> results[index] > 0 || results[index] == java.sql.Statement.SUCCESS_NO_INFO }.map { it.id }.toSet())
     }
 
     /**
