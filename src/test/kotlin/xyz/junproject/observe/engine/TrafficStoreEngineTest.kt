@@ -254,6 +254,38 @@ class TrafficStoreEngineTest {
     }
 
     @Test
+    fun `처음 본 순번은 그 세대에서 받은 가장 작은 순번이다 — 5 · 3 · 4 · 1 이면 2 가 틈으로 드러나고 진도는 1 에서 멈추며 2 가 오면 5 까지 이어진다`() {
+        val atOf = { sequence: Long -> now.minusSeconds(100 - sequence * 10) }
+        fun receivedOf(order: Int) = now.minusSeconds(60L - order)
+        store(5, at = atOf(5), receivedAt = receivedOf(1))
+        store(3, at = atOf(3), receivedAt = receivedOf(2))
+        store(4, at = atOf(4), receivedAt = receivedOf(3))
+        store(1, at = atOf(1), receivedAt = receivedOf(4))
+        val waiting = progressOf()
+        assertEquals(1L, waiting.firstSeqSeen, "먼저 커밋된 순번을 처음 본 순번으로 남겼다")
+        assertEquals(1L, waiting.sequenceGaps, "앞의 순번 사이에서 잃은 2 가 틈으로 드러나지 않았다")
+        assertEquals(atOf(1), waiting.readProgressAt, "틈(2) 너머로 진도를 두었다")
+        store(2, at = atOf(2), receivedAt = receivedOf(5))
+        assertEquals(TrafficServerProgress(TrafficRecords.SERVER, atOf(5), receivedOf(5), 0, receivedOf(5), 1), progressOf(),
+            "늦게 온 2 로 진도가 5 의 at 까지 다시 이어지지 않았다")
+    }
+
+    @Test
+    fun `인코딩된 물음표(%3F · %3f)가 든 경로의 줄은 저장되지 않고 버린 수로 센다`() {
+        val cell = now.minusSeconds(30)
+        val outcome = store(1, body(TrafficRecords.segment(cell, listOf(200, 200, 200)), requests = listOf(
+            TrafficRecords.request(cell, requestId = "req-plain"),
+            TrafficRecords.request(cell, requestId = "req-upper", path = "/search%3Fq=MARKER-upper"),
+            TrafficRecords.request(cell, requestId = "req-lower", path = "/search%3fq=MARKER-lower"))))
+        assertEquals(1, outcome.requestsStored)
+        assertEquals(listOf(1, 0, 0), listOf("req-plain", "req-upper", "req-lower").map { store.requestSpans(it, 10).size })
+        assertEquals(2L, store.entrySummaries(now.minusSeconds(1), now.plusSeconds(1)).getValue(TrafficRecords.SERVER).requestsRejected)
+        assertEquals(3L, totalsAt(cell).count)
+        val stored = administrationJdbc.queryForList("SELECT row_to_json(t)::text FROM $schema.traffic_request t", String::class.java).joinToString()
+        assertFalse(stored.contains("MARKER"), "인코딩된 쿼리가 저장됐다")
+    }
+
+    @Test
     fun `서버마다 따로 센다 — 한 서버의 틈과 진도가 다른 서버에 섞이지 않는다`() {
         store(1, at = now.minusSeconds(40))
         store(3, at = now.minusSeconds(10))

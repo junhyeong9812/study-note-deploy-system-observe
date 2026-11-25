@@ -1,7 +1,13 @@
 package xyz.junproject.observe.traffic
 
 import org.junit.jupiter.api.Assertions.*
+import ch.qos.logback.classic.Logger
+import ch.qos.logback.classic.spi.ILoggingEvent
+import ch.qos.logback.core.read.ListAppender
 import org.junit.jupiter.api.Test
+import org.mockito.Mockito
+import org.slf4j.LoggerFactory
+import xyz.junproject.observe.metric.MetricHealth
 import xyz.junproject.observe.collect.CollectorHealth
 import xyz.junproject.observe.collect.FakeLogStream
 import xyz.junproject.observe.collect.LogCollector
@@ -86,6 +92,32 @@ class TrafficHealthTest {
     private class QuietLogSink : LogSink {
         override fun createSchema() {}
         override fun insertAll(entries: List<LogEntry>): Int = entries.size
+    }
+
+    @Test
+    fun `지표 칸이 실패하면 기존 로그 그대로 종류와 문구 200자까지 · 통신 칸이 실패하면 종류만 남긴다`() {
+        val logCollector = LogCollector(FakeLogStream(), QuietLogSink(), block = Duration.ZERO, clock = { now })
+        logCollector.runOnce()
+        val metric = Mockito.mock(MetricHealth::class.java)
+        Mockito.doThrow(IllegalStateException("metric detail " + "m".repeat(300))).`when`(metric).report(now)
+        val traffic = Mockito.mock(TrafficHealth::class.java)
+        Mockito.doThrow(IllegalStateException("traffic detail MARKER-path")).`when`(traffic).report(now)
+        val logs = ListAppender<ILoggingEvent>().also { it.start() }
+        val logger = LoggerFactory.getLogger("observe") as Logger
+        logger.addAppender(logs)
+        val report = try {
+            CollectorHealth(logCollector, { 0L }, { 0L }, { null }, { null }, startedAt = now.minusSeconds(1), metrics = metric, traffic = traffic).report(now)
+        } finally {
+            logger.detachAppender(logs)
+        }
+        val lines = logs.list.map { it.formattedMessage }
+        val metricText = ("metric detail " + "m".repeat(300)).take(200)
+        assertTrue(lines.contains("observe:observe:metric health failed: IllegalStateException: $metricText"), "지표 헬스 실패 로그가 기존과 다르다: $lines")
+        assertTrue(lines.contains("observe:observe:traffic health failed: IllegalStateException"), "통신 헬스 실패 로그가 종류만이 아니다: $lines")
+        assertFalse(lines.any { it.contains("MARKER") }, "통신 쪽 예외 문구가 로그에 실렸다: $lines")
+        assertTrue(report.healthy, "칸의 실패가 판정을 바꿨다")
+        assertEquals(mapOf("status" to "failing", "failure" to "health IllegalStateException"), report.body["metrics"])
+        assertEquals(mapOf("status" to "failing", "failure" to "health IllegalStateException"), report.body["traffic"])
     }
 
     @Test

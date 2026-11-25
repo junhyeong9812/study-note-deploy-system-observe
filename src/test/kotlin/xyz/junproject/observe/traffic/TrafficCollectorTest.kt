@@ -125,6 +125,18 @@ class TrafficCollectorTest {
     }
 
     @Test
+    fun `한 칸의 수가 10억을 넘는 항목은 꼴 틀림으로 세고 확인하며 같은 묶음의 다른 항목은 저장한다`() {
+        val huge = 1_000_000_001L
+        val overflowing = TrafficRecords.body(segments = listOf("""{"bucket_start_ms": ${TrafficRecords.cellStart(now).toEpochMilli()}, "service": "backend", "caller": "front",
+            "class": "request", "count": $huge, "status": {"2xx": $huge, "3xx": 0, "4xx": 0, "5xx": 0, "other": 0}, "buckets": [$huge${", 0".repeat(19)}], "max_ms": 3}"""))
+        stream.add(good(1_000, 1, body = overflowing), good(2_000, 2))
+        collector.runOnce()
+        assertEquals(1L, collector.droppedCounts()[TrafficDropReason.INVALID_BODY])
+        assertTrue(stream.pending.isEmpty(), "넘친 항목을 확인하지 않아 영영 다시 받는다")
+        assertEquals(listOf(2L), sink.stored.keys.map { it.third })
+    }
+
+    @Test
     fun `다른 종류는 저장하지 않고 건너뛴 수를 세고 확인한다`() {
         stream.add(MetricStreamRecord("1000-0", mapOf("kind" to "resource", "v" to "1")), good(2_000, 1))
         collector.runOnce()

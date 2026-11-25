@@ -190,13 +190,46 @@ class TrafficEntryParserTest {
     }
 
     @Test
-    fun `주소 꼴은 IPv4 · IPv6 · 퍼센트 인코딩까지 그 줄만 버린다 — 점 셋 미만 · 콜론 하나는 주소가 아니다`() {
-        val rejected = listOf("/peer/10.0.0.1/status", "/ip/::1", "/node/fe80::1ff:fe23:4567:890a", "/ip/2001:db8:0:0:0:0:2:1", "/ip/fe80%3A%3A1", "/ip/10%2E0%2E0%2E1")
-        val kept = listOf("/api/doc", "/docs/v1.2/guide", "/release/1.2.3", "/time/12:30", "/search;q=x", "/search%3Fq=x")
-        val body = TrafficRecords.body(requests = (rejected + kept).mapIndexed { index, path -> TrafficRecords.request(cell.plusMillis(index.toLong()), requestId = "req-$index", path = path) })
-        val entry = accepted(fields(body))
-        assertEquals(kept, entry.requests.map { it.path })
-        assertEquals(rejected.size.toLong(), entry.requestsRejected)
+    fun `경로 판정 표 — 날것 ? · %3F · 주소 꼴(IPv4 · 완전한 IPv6 · 겹콜론 꼴 · 대괄호 · 인코딩된 것)만 그 줄을 버리고 나머지는 받는다`() {
+        val kept = listOf(
+            "/api/doc", "/docs/v1.2/guide", "/v1.2.3", "/release/1.2.3", "/time/12:30", "/time/12:30:00", "/a:b:c", "/hex/dead:beef:cafe",
+            "/wiki/C++::std", "/search;q=x", "/wiki/[draft]",
+        )
+        val rejected = listOf(
+            "/search?q=x",                                  // 날것 ?
+            "/search%3Fq=x", "/search%3fq=x",               // 인코딩된 ? — 대소문자 모두
+            "/peer/10.0.0.1/status", "/release/1.2.3.4",    // IPv4 꼴 — 판 번호도(받아들인 한계)
+            "/ip/2001:db8:0:0:0:0:2:1",                     // 묶음 여덟
+            "/ip/fe80::1", "/ip/::1", "/ns/a::b", "/ip/::ffff:192.0.2.1",
+            "/peer/[2001:db8::1]:8080",                     // 대괄호
+            "/ip/fe80%3a%3a1", "/ip/FE80%3A%3A1",           // 인코딩된 콜론 — 대소문자 모두
+            "/peer/%5b2001:db8::1%5d", "/peer/%5B2001:db8::1%5D", // 인코딩된 대괄호
+            "/peer/[1:2]", "/peer/%5B1:2%5D", "/peer/%5b1%3a2%5d",       // 대괄호 안에 콜론 — 다른 주소 꼴이 없어도
+        )
+        val failures = mutableListOf<String>()
+        for (path in kept + rejected) {
+            val entry = accepted(fields(TrafficRecords.body(
+                segments = listOf(TrafficRecords.segment(cell, listOf(200, 200))),
+                requests = listOf(TrafficRecords.request(cell, requestId = "req-other", path = "/api/other"), TrafficRecords.request(cell, requestId = "req-judged", path = path)),
+            )))
+            val expectRejected = path in rejected
+            val stored = entry.requests.map { it.requestId }
+            val ok = if (expectRejected) stored == listOf("req-other") && entry.requestsRejected == 1L else stored == listOf("req-other", "req-judged") && entry.requestsRejected == 0L
+            if (!ok) failures += "$path → ${if (expectRejected) "버려야 한다" else "받아야 한다"}(남은 줄 $stored · 버림 ${entry.requestsRejected})"
+            if (entry.segments.single().totals.count != 2L) failures += "$path → 같은 항목의 묶음이 달라졌다"
+        }
+        assertEquals(emptyList<String>(), failures)
+    }
+
+    @Test
+    fun `한 칸의 수는 10억까지 받고 10억 1 이면 꼴 틀림으로 항목을 버린다`() {
+        fun segmentOf(count: Long) = """{"bucket_start_ms": ${cell.toEpochMilli()}, "service": "backend", "caller": "front", "class": "request", "count": $count,
+            "status": {"2xx": $count, "3xx": 0, "4xx": 0, "5xx": 0, "other": 0}, "buckets": [$count${", 0".repeat(19)}], "max_ms": 3}"""
+        assertEquals(1_000_000_000L, accepted(fields(TrafficRecords.body(segments = listOf(segmentOf(1_000_000_000))))).segments.single().totals.count)
+        assertDropped(TrafficDropReason.INVALID_BODY, fields(TrafficRecords.body(segments = listOf(segmentOf(1_000_000_001)))), "count · 분포 칸이 10억 1")
+        // 분포의 한 칸만 넘는 꼴(합은 맞지 않아도 먼저 상한으로 걸린다)
+        val overBucket = segmentOf(1_000_000_000).replace("\"buckets\": [1000000000, 0,", "\"buckets\": [1000000001, 0,")
+        assertDropped(TrafficDropReason.INVALID_BODY, fields(TrafficRecords.body(segments = listOf(overBucket))), "분포의 한 칸이 10억 1")
     }
 
     @Test

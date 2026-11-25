@@ -102,6 +102,36 @@ class TrafficConcurrencyEngineTest {
     }
 
     @Test
+    fun `두 자리가 한 세대의 순번을 홀짝으로 엇갈려 넣어도 여러 판에서 받은 수 · 처음 본 순번 · 틈 · 진도가 늘 맞다`() {
+        val rounds = 15
+        val lastSequence = 60L
+        val failures = ConcurrentLinkedQueue<Throwable>()
+        repeat(rounds) { round ->
+            val server = "race-$round"
+            val start = CountDownLatch(1)
+            val places = listOf(blue to 1L, green to 2L).map { (store, first) ->
+                thread(name = "observe-test-race-$round-$first") {
+                    start.await()
+                    for (sequence in first..lastSequence step 2) runCatching {
+                        store.store(TrafficRecords.entry(sequence, now.minusSeconds(lastSequence - sequence), now, server = server))
+                    }.onFailure { failures += it }
+                }
+            }
+            start.countDown()
+            places.forEach { it.join(30_000) }
+        }
+        assertEquals(emptyList<Throwable>(), failures.toList())
+        val progress = blue.serverProgress().associateBy { it.server }
+        val wrong = (0 until rounds).map { "race-$it" }.mapNotNull { server ->
+            val state = progress.getValue(server)
+            val receivedCount = administrationJdbc.queryForObject("SELECT count(*) FROM $schema.traffic_receipt WHERE server = ?", Long::class.java, server)
+            if (state.firstSeqSeen == 1L && state.sequenceGaps == 0L && state.readProgressAt == now && receivedCount == lastSequence) null
+            else "$server: first=${state.firstSeqSeen} gaps=${state.sequenceGaps} progress=${state.readProgressAt} receipts=$receivedCount"
+        }
+        assertEquals(emptyList<String>(), wrong, "엇갈린 판에서 받은 수 · 처음 본 순번 · 틈 · 진도가 어긋났다")
+    }
+
+    @Test
     fun `서로 다른 항목이 같은 칸을 동시에 채우면 모두 더해진다`() {
         val sequences = (1L..40L).toList()
         val failures = ConcurrentLinkedQueue<Throwable>()
