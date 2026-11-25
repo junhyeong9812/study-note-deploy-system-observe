@@ -443,6 +443,53 @@ class UnknownRuleAlertEngineTest {
         assertCountedAsFailed(round)
     }
 
+    // ── 세기의 시간 상한은 그 조회에만 — 풀의 연결에 남지 않는다 ─────────
+
+    private val countPoolSize = 3
+
+    /** 풀의 연결을 모두 한꺼번에 빌려(같은 연결을 두 번 보지 않게) 연결마다 `SHOW statement_timeout` */
+    private fun statementTimeoutsOfEveryConnection(countPool: HikariDataSource): List<String> {
+        val borrowed = (1..countPoolSize).map { countPool.connection }
+        try {
+            return borrowed.map { connection -> connection.createStatement().use { statement -> statement.executeQuery("SHOW statement_timeout").use { it.next(); it.getString(1) } } }
+        } finally {
+            borrowed.forEach { it.close() }
+        }
+    }
+
+    @Test
+    fun `건수 세기가 끝난 뒤 그 풀의 어느 연결에도 세기의 시간 상한이 남지 않는다`() {
+        insertUnknown("unknown-0", "log_silent", at(0))
+        enqueueKnown(listOf(known("memory-1", "ci-agent-158", at(10))))
+        pool(countPoolSize).use { countPool ->
+            val counting = ThresholdStore(JdbcTemplate(countPool), countTimeout = Duration.ofSeconds(1)).also { it.prepareSchema() }
+            val before = statementTimeoutsOfEveryConnection(countPool)
+            assertEquals(countPoolSize, before.size)
+            repeat(countPoolSize * 2) { assertEquals(AlertCounts(2, 0, mapOf("log_silent" to 1L)), counting.alertCounts()) }
+            assertEquals(before, statementTimeoutsOfEveryConnection(countPool), "세기의 시간 상한이 풀의 연결에 남았다(같은 풀의 다른 문장도 끊긴다)")
+            // 남은 상한이 실제로 다른 문장을 끊지 않는다 — 상한(1초)보다 오래 걸리는 문장이 같은 풀에서 끝난다
+            assertDoesNotThrow { JdbcTemplate(countPool).execute("SELECT pg_sleep(1.5)") }
+        }
+    }
+
+    @Test
+    fun `건수 세기가 시간 상한에서 끊긴 뒤에도 그 풀의 어느 연결에도 세기의 시간 상한이 남지 않는다`() {
+        insertUnknown("unknown-0", "log_silent", at(0))
+        pool(countPoolSize).use { countPool ->
+            val counting = ThresholdStore(JdbcTemplate(countPool), countTimeout = Duration.ofSeconds(1)).also { it.prepareSchema() }
+            val before = statementTimeoutsOfEveryConnection(countPool)
+            val holder = lockOutbox()
+            try {
+                val failure = CompletableFuture.supplyAsync { runCatching { counting.alertCounts() } }.get(15, TimeUnit.SECONDS).exceptionOrNull()
+                assertNotNull(failure, "표를 잠갔는데 세기가 시간 상한에서 끊기지 않았다")
+            } finally {
+                release(holder)
+            }
+            assertEquals(before, statementTimeoutsOfEveryConnection(countPool), "시간 초과로 끝난 세기의 상한이 풀의 연결에 남았다")
+            assertDoesNotThrow { JdbcTemplate(countPool).execute("SELECT pg_sleep(1.5)") }
+        }
+    }
+
     // ── 판정은 모르는 줄을 지우지 않는다 ─────────────────
 
     private fun highMemory(server: String, endingAt: Instant) = (0 until 10).map {
