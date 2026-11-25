@@ -32,6 +32,10 @@ observe:
     alert:
       silent-warm-up: ${METRICS_ALERT_SILENT_WARM_UP:3m}               # 끊김 판정은 뜬 지 이만큼 지나고 한 번 따라잡은 뒤부터(§15.1)
       silent-give-up-after: ${METRICS_ALERT_SILENT_GIVE_UP_AFTER:15m}  # 따라잡지 못해도 뜬 지 이만큼 지나면 판정한다
+  visits:                                          # 방문 — front 가 같은 Redis 의 이 스트림으로 보낸다. 주소 원문은 visit_event 표에만(90일)
+    stream: ${VISITS_STREAM:visits}
+    group: ${VISITS_GROUP:observe}
+    retention-cron: ${VISITS_RETENTION_CRON:0 40 3 * * *}   # 90일 삭제 — 서울 시각
   alert:                                           # 알림 서버 POST /events — 비우면 보내지 않고 못 보낸 알림으로 남는다
     events-url: ${ALERT_EVENTS_URL:}
     secret: ${ALERT_SECRET:}

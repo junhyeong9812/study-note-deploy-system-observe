@@ -37,6 +37,10 @@ import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler
 import java.time.Instant
 import java.util.concurrent.CopyOnWriteArrayList
 import xyz.junproject.observe.threshold.SilentGate
+import xyz.junproject.observe.visit.VisitCollector
+import xyz.junproject.observe.visit.VisitHealth
+import xyz.junproject.observe.visit.VisitSchedule
+import xyz.junproject.observe.visit.VisitStore
 
 /** 조립 — 연결 정보는 환경변수에서. DB 비밀번호 같은 값은 로그에 내지 않는다. */
 @Configuration
@@ -274,6 +278,62 @@ class ObserveConfiguration {
             silentGate = SilentGate(Instant.now(), { collector.caughtUpAt }, warmUp, giveUpAfter))
     }
 
+    /**
+     * 방문 저장소 — 로그와 같은 DB, 연결 풀은 방문 전용(수집 1 — 하루 한 번의 90일 삭제와 함께 쓴다 · 조회 1 · 헬스 1).
+     * 방문 쪽이 무겁거나 실패해도 로그 · 지표의 풀을 잡지 않는다. 헬스 풀은 지표의 헬스 풀과 같은 꼴(연결 하나 · 대기 2초 · 문장 2초).
+     * 단순화: 90일 삭제는 수집과 연결 하나를 나눠 쓴다 — 삭제하는 동안 수집 바퀴가 연결을 5초 넘게 기다리면 실패로 남고 다시 시도한다(항목은 잃지 않는다).
+     * 하루치 삭제가 몇 초 안에 끝나는 동안(하루 방문 수만 줄 안팎)은 문제없다 — 삭제가 그보다 길어지면 삭제 전용 연결을 따로 둔다.
+     */
+    @Bean
+    fun visitStore(
+        @Value("\${observe.db.url}") url: String,
+        @Value("\${observe.db.user}") user: String,
+        @Value("\${observe.db.password}") password: String,
+    ): VisitStore {
+        val ingest = pool("observe-visit-ingest", url, user, password, size = 1, statementTimeoutMs = 30_000)
+        val query = pool("observe-visit-query", url, user, password, size = 1, statementTimeoutMs = 10_000)
+        val health = pool("observe-visit-health", url, user, password, size = 1, statementTimeoutMs = 2_000, connectionTimeoutMs = 2_000, validationTimeoutMs = 1_000)
+        return VisitStore(JdbcTemplate(ingest), JdbcTemplate(query), JdbcTemplate(health))
+    }
+
+    private var sharedVisitStreamSource: RedisMetricStreamSource? = null
+
+    /**
+     * 방문 스트림 읽기 — 지표의 스트림 읽기([RedisMetricStreamSource] — 칸 전부를 넘긴다)를 스트림 이름만 바꿔 쓴다. 빈으로 두지 않는다:
+     * 같은 타입의 빈이 둘이면 지표 수집기 · 헬스의 주입이 모호해진다. 수집기와 헬스가 이 하나를 나눠 쓴다.
+     */
+    @Synchronized
+    private fun visitStreamSource(redis: StringRedisTemplate, stream: String, group: String): RedisMetricStreamSource = sharedVisitStreamSource
+        ?: RedisMetricStreamSource(redis, stream, group).also {
+            log.info("observe:observe:collecting visit stream '{}' as group '{}'", stream, group)
+            sharedVisitStreamSource = it
+        }
+
+    @Bean
+    fun visitCollector(
+        redis: StringRedisTemplate,
+        @Value("\${observe.visits.stream:visits}") stream: String,
+        @Value("\${observe.visits.group:observe}") group: String,
+        store: VisitStore,
+    ) = VisitCollector(visitStreamSource(redis, stream, group), store)
+
+    /** 방문 수집 스레드와 90일 삭제(`observe.visits.retention-cron`, 서울) */
+    @Bean
+    fun visitSchedule(collector: VisitCollector, store: VisitStore) = VisitSchedule(collector, store)
+
+    @Bean
+    fun visitHealth(
+        collector: VisitCollector,
+        redis: StringRedisTemplate,
+        @Value("\${observe.visits.stream:visits}") stream: String,
+        @Value("\${observe.visits.group:observe}") group: String,
+        store: VisitStore,
+        schedule: VisitSchedule,
+    ): VisitHealth {
+        val source = visitStreamSource(redis, stream, group)
+        return VisitHealth(collector, { source.unacknowledgedCount() }, { source.lag() }, { store.latestStoredAt() }, { schedule.lastRetention })
+    }
+
     @Bean
     fun logStreamSource(
         redis: StringRedisTemplate,
@@ -288,7 +348,8 @@ class ObserveConfiguration {
     fun logCollector(source: RedisLogStreamSource, store: LogStore) = LogCollector(source, store)
 
     @Bean
-    fun collectorHealth(collector: LogCollector, source: RedisLogStreamSource, store: LogStore, schedule: ObserveSchedule, metricHealth: MetricHealth) =
+    fun collectorHealth(collector: LogCollector, source: RedisLogStreamSource, store: LogStore, schedule: ObserveSchedule, metricHealth: MetricHealth,
+                        visitHealth: VisitHealth) =
         CollectorHealth(collector, { source.unacknowledgedCount() }, { source.lag() }, { store.latestStoredAt() }, { schedule.lastRetention },
-            lastAuthRetention = { schedule.lastAuthRetention }, metrics = metricHealth)
+            lastAuthRetention = { schedule.lastAuthRetention }, metrics = metricHealth, visits = visitHealth)
 }
