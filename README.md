@@ -326,7 +326,7 @@ ci-cd agent(서버마다, 30초쯤) ── XADD traffic ──▶ Redis ──�
   - `%3A` · `%2E` · `%5B` · `%5D`(대소문자 모두)를 푼 뒤의 주소 꼴: IPv4(점으로 이은 수 넷 — 앞뒤가 숫자가 아님) · 완전한 IPv6(16진 1~4자 묶음 여덟) · 겹콜론 꼴(`::` 의 바로 앞이나 뒤에 16진 묶음 — `fe80::1` · `::1` · `a::b`) · 대괄호 안에 콜론이 든 꼴(`[2001:db8::1]` · `[1:2]`).
   - 받는 것의 예: `/time/12:30:00` · `/a:b:c` · `/hex/dead:beef:cafe` · `/wiki/C++::std` · `/wiki/[draft]` · `/release/1.2.3`.
   - **받아들인 한계**: IPv4 꼴은 판 번호(`/release/1.2.3.4`)도 버린다 — 판 번호와 주소를 가를 수 없다. 버린 수는 `requests_rejected` 로 드러난다. 16진 글자(1~4자)로만 된 낱말이 `::` 에 바로 붙은 경로(`/x/cafe::bar` 의 `cafe::`)도 주소 꼴로 본다.
-- **한 칸의 수의 상한**: 구간 묶음의 `count` 와 분포(`buckets`)의 각 값은 10억까지다. 넘으면 항목 전체를 `invalid_body` 로 버린다 — 넘치는 수 하나가 5분 묶음의 합을 오류로 만들어 그 구간의 묶음과 삭제를 영영 막지 않게.
+- **세는 수의 상한**: 항목 안의 세는 수 — 구간 묶음의 `count` · 상태(`status`)의 각 값 · 분포(`buckets`)의 각 값, 항목의 `requests_dropped` — 는 모두 10억까지다(상태는 값마다 먼저 거른 뒤 합을 `count` 와 견준다). 넘으면 항목 전체를 `invalid_body` 로 버리고 세어 확인한다 — 넘치는 수 하나가 5분 묶음 · 지도 · 요약의 합을 오류로 만들어 그 구간의 묶음 · 삭제 · 조회를 막지 않게. 시각 · 걸린 시간 · 바이트 · `max_ms` 에는 상한이 없다.
 - **버리는 항목** — 이유를 세고(헬스의 `traffic.dropped`) 서버 로그에 스트림 ID 와 이유만 남긴 뒤 확인한다: `invalid_id` · `trimmed` · `missing_field` · `unsupported_version` · `invalid_server` · `invalid_generation` · `invalid_seq` · `invalid_at` · `body_too_large` · `body_not_json` · `invalid_body`. 모르는 칸은 무시한다(저장하지 않는다). `kind` 가 `traffic` 이 아니면 건너뛰어 확인한다(`skipped_other_kind`).
 - 로그 · 헬스에는 항목의 내용(경로 · 요청 ID)과 예외 문구를 싣지 않는다 — 예외 종류 이름만. 통신의 연결 풀 넷은 드라이버 설정 `logServerErrorDetail=false` 로 열어 드라이버 예외 글에도 행의 값이 실리지 않는다.
 - 통신 수집은 로그 · 지표 수집과 **다른 스레드**(`observe-traffic-collector`)와 다른 연결 풀로 돈다 — 통신 쪽이 막히거나 실패해도 로그 · 지표 수집과 헬스의 판정은 그대로다.

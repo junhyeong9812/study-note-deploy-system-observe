@@ -147,8 +147,8 @@ object TrafficCellAge {
  * `at` 과 칸의 시각으로는 버리지 않는다 — 칸은 저장이 순번 다음에 거른다.
  *
  * 꼴(틀리면 `invalid_body`): body 는 객체이고 `sources`(객체의 배열) · `missing`([MISSING] 꼴 글자의 배열) · `segments` · `requests`(배열, [MAX_REQUESTS] 줄까지) ·
- * `requests_dropped`(0 이상 정수) · `dependencies`(배열 — 내용은 보지 않는다)가 모두 있다.
- * 묶음: `bucket_start_ms`(양의 정수, 30000 의 배수) · `service` · `caller`([NAME] 꼴 — 닫힌 목록이 아니다) · `class`(request · health · stream) · `count`(1 이상 [MAX_CELL_COUNT] 이하 — 분포의 각 값도 그 이하) ·
+ * `requests_dropped`(세는 수 — 0 이상 [MAX_CELL_COUNT] 이하) · `dependencies`(배열 — 내용은 보지 않는다)가 모두 있다.
+ * 묶음: `bucket_start_ms`(양의 정수, 30000 의 배수) · `service` · `caller`([NAME] 꼴 — 닫힌 목록이 아니다) · `class`(request · health · stream) · `count`(1 이상 [MAX_CELL_COUNT] 이하 — 상태 · 분포의 각 값도 그 이하) ·
  * `status`(다섯 열쇠 모두, 0 이상 정수, 합 = count) · `buckets`(0 이상 정수 20개) · `max_ms`(request 면 0 이상 정수, 아니면 null) — request 는 분포의 합 = count,
  * 아니면 분포가 모두 0. 한 항목 안에서 열쇠 `(bucket_start_ms, service, caller, class)` 는 겹치지 않는다.
  * 요청별 줄: `request_id`([REQUEST_ID]) · `service` · `caller`([NAME]) · `method`([METHOD]) · `path`(1024자까지, 제어 문자가 없다 — 규약 3.2)
@@ -179,7 +179,7 @@ object TrafficEntryParser {
     private val STREAM_FIELDS = listOf("v", "server", "generation", "seq", "at", "body")
     private val STATUS_KEYS = listOf("2xx", "3xx", "4xx", "5xx", "other")
 
-    /** 한 칸의 `count` 와 분포의 각 값의 상한 — 넘치는 수 하나가 5분 묶음의 합을 오류로 만들어 그 구간의 묶음 · 삭제를 막지 않게 */
+    /** 항목 안의 세는 수([tallied])의 상한 — 넘치는 수 하나가 합(5분 묶음 · 지도 · 요약)을 오류로 만들어 그 구간의 묶음 · 삭제 · 조회를 막지 않게 */
     const val MAX_CELL_COUNT = 1_000_000_000L
 
     /** 인코딩된 물음표 — 그 뒤의 검색어가 경로로 남는다 */
@@ -239,7 +239,7 @@ object TrafficEntryParser {
         val kept = requests.filter { isPathAllowed(it.path) }
         return TrafficEntry(
             server = server, generation = generation, sequence = sequence, readAt = readAt, receivedAt = receivedAt,
-            segments = segments, requests = kept, requestsDropped = count(tree, "requests_dropped"), missing = missing,
+            segments = segments, requests = kept, requestsDropped = tallied(field(tree, "requests_dropped")), missing = missing,
             requestsRejected = (requests.size - kept.size).toLong(),
         )
     }
@@ -248,11 +248,11 @@ object TrafficEntryParser {
         if (!node.isObject) throw Shape()
         val bucketStart = count(node, "bucket_start_ms").takeIf { it > 0 && it % CELL_MS == 0L } ?: throw Shape()
         val trafficClass = TrafficClass.of(text(field(node, "class"))) ?: throw Shape()
-        val count = count(node, "count").takeIf { it in 1..MAX_CELL_COUNT } ?: throw Shape()
+        val count = tallied(field(node, "count")).takeIf { it >= 1 } ?: throw Shape()
         val statusNode = field(node, "status").takeIf { it.isObject } ?: throw Shape()
-        val statuses = STATUS_KEYS.map { count(statusNode, it) }
+        val statuses = STATUS_KEYS.map { tallied(field(statusNode, it)) }      // 값마다 상한으로 먼저 거른다 — 합은 그 뒤에(넘쳐 돌아온 합에 속지 않게)
         if (statuses.sum() != count) throw Shape()
-        val buckets = array(node, "buckets").map { counted(it).takeIf { value -> value <= MAX_CELL_COUNT } ?: throw Shape() }
+        val buckets = array(node, "buckets").map(::tallied)
         if (buckets.size != TrafficDistribution.BUCKET_COUNT) throw Shape()
         val maxNode = field(node, "max_ms")
         val maxMs = if (trafficClass == TrafficClass.REQUEST) {
@@ -321,4 +321,10 @@ object TrafficEntryParser {
         if (!node.isIntegralNumber || !node.canConvertToLong() || node.longValue() < 0) throw Shape()
         return node.longValue()
     }
+
+    /**
+     * 세는 수 — 0 이상 [MAX_CELL_COUNT] 이하의 정수, 넘으면 꼴 틀림. **건수를 뜻하고 뒤에서 더해지는 수는 이 함수로 읽는다**
+     * (묶음의 `count` · `status` 각 값 · `buckets` 각 값, 항목의 `requests_dropped` — 새 칸도). 시각 · 걸린 시간 · 바이트 · `max_ms` 는 세는 수가 아니다([counted]).
+     */
+    private fun tallied(node: JsonNode): Long = counted(node).takeIf { it <= MAX_CELL_COUNT } ?: throw Shape()
 }
