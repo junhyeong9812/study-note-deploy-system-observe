@@ -125,9 +125,28 @@ class LogPatternEngineTest {
         line(now.plusSeconds(60), "result=limit_reached")
         round.judgeOnce(now.plusSeconds(90))
         assertEquals(1, outboxRows().size, "창 안에 또 보냈다")
+        // 그사이의 바퀴 — 운영처럼 30초마다(판정이 멈춘 것을 흉내 내지 않게)
+        for (at in generateSequence(now.plusSeconds(120)) { it.plusSeconds(30) }.takeWhile { it.isBefore(now.plus(Duration.ofMinutes(10))) }) round.judgeOnce(at)
+        assertEquals(1, outboxRows().size, "창 안에 또 보냈다")
         round.judgeOnce(now.plus(Duration.ofMinutes(10)))
         assertEquals(listOf("1줄 맞음 · 첫 줄 요청 ID req-start · 시각 ${now.minusSeconds(40)}", "2줄 맞음 · 첫 줄 요청 ID req-later · 시각 ${now.plusSeconds(30)}"),
             outboxRows().map { it["detail"] })
+    }
+
+    @Test
+    fun `규칙을 뺐다가 한참 뒤 같은 이름으로 다시 넣어도 옛 맞춤으로 사건을 내지 않고 그 뒤 새 줄만으로 한 건을 낸다`() {
+        line(now.minusSeconds(40), "result=limit_reached", requestId = "req-revive-1")
+        round().judgeOnce(now)                                                          // 첫 사건
+        line(now.plusSeconds(10), "result=limit_reached", requestId = "req-revive-2")
+        round().judgeOnce(now.plusSeconds(30))                                          // 창 안 — 쌓인 수 1
+        round(settings = LogPatternSettings(emptyList(), emptyList())).judgeOnce(now.plusSeconds(60))   // 규칙을 뺀 설정의 바퀴 — 상태는 남는다
+        assertEquals(1, outboxRows().size)
+        val later = now.plus(Duration.ofDays(7))
+        round().judgeOnce(later)                                                        // 다시 넣은 첫 바퀴 — 새 줄 없음
+        assertEquals(1, outboxRows().size, "다시 넣은 첫 바퀴에 7일 전의 맞춤으로 사건을 냈다: ${outboxRows().map { it["detail"] }}")
+        line(later.plusSeconds(5), "result=limit_reached", requestId = "req-revive-3")
+        round().judgeOnce(later.plusSeconds(30))
+        assertEquals(listOf("1줄 맞음 · 첫 줄 요청 ID req-revive-3 · 시각 ${later.plusSeconds(5)}"), outboxRows().drop(1).map { it["detail"] })
     }
 
     @Test

@@ -36,6 +36,10 @@ class LogPatternJudgeTest {
     private var states: List<LogPatternState> = emptyList()
     private fun round(now: Instant): List<ResourceAlert> = judge.judge(now, states, lines).also { states = it.states }.events
 
+    /** [from] 부터 [until] 앞까지 30초마다 판정한다 — 운영의 바퀴(판정이 멈춘 것을 뜻하지 않게 흉내 내지 않는다). 그사이 낸 사건 */
+    private fun roundsEvery30Seconds(from: Instant, until: Instant): List<ResourceAlert> =
+        generateSequence(from) { it.plusSeconds(30) }.takeWhile { it.isBefore(until) }.flatMap { round(it) }.toList()
+
     private fun add(at: Instant, message: String = "claude run: result=limit_reached auto=false duration_ms=12", requestId: String = "req-a", service: String = "backend") {
         lines.lines += Line(at, service, message, requestId)
     }
@@ -60,6 +64,7 @@ class LogPatternJudgeTest {
         add(start.plusSeconds(120), requestId = "req-later-2")
         assertEquals(0, round(start.plusSeconds(90)).size)
         assertEquals(0, round(start.plusSeconds(150)).size)
+        assertEquals(0, roundsEvery30Seconds(start.plusSeconds(180), start.plusSeconds(30).plus(Duration.ofMinutes(10))).size, "10분이 되기 전에 다시 냈다")
         assertEquals(0, round(start.plusSeconds(30).plus(Duration.ofMinutes(10)).minusMillis(1)).size, "10분이 되기 전에 다시 냈다")
         val events = round(start.plusSeconds(30).plus(Duration.ofMinutes(10)))   // 맞춤이 그친 뒤에도 창이 지나면 낸다
         assertEquals(listOf("2줄 맞음 · 첫 줄 요청 ID req-later-1 · 시각 ${start.plusSeconds(60)}"), events.map { it.detail })
@@ -115,7 +120,13 @@ class LogPatternJudgeTest {
         assertEquals("1줄", first.events.single().detail.substringBefore(" 맞음"))
         val second = fresh.judge(start.plusSeconds(60), first.states, lines)                 // 경계 바로 뒤의 줄을 센다(창 안 — 쌓기만)
         assertEquals(emptyList<ResourceAlert>(), second.events)
-        val third = fresh.judge(start.plusSeconds(30).plus(Duration.ofMinutes(10)), second.states, lines)
+        var between = second.states                                                       // 그사이의 바퀴 — 30초마다
+        for (at in generateSequence(start.plusSeconds(90)) { it.plusSeconds(30) }.takeWhile { it.isBefore(start.plusSeconds(30).plus(Duration.ofMinutes(10))) }) {
+            val result = fresh.judge(at, between, lines)
+            assertEquals(emptyList<ResourceAlert>(), result.events, "창 안에 냈다: $at")
+            between = result.states
+        }
+        val third = fresh.judge(start.plusSeconds(30).plus(Duration.ofMinutes(10)), between, lines)
         assertEquals("1줄", third.events.single().detail.substringBefore(" 맞음"), "경계의 줄을 빠뜨렸거나 두 번 셌다")
     }
 
@@ -124,6 +135,50 @@ class LogPatternJudgeTest {
         add(start.plus(Duration.ofMinutes(2)))                                     // 받은 때보다 2분 앞선 줄
         assertEquals(0, round(start.plusSeconds(30)).size)
         assertEquals(1, round(start.plus(Duration.ofMinutes(2)).plusSeconds(30)).size)
+    }
+
+    /** 쌓인 수가 있는 앞 상태 — 마지막으로 본 곳이 [checkedUntil], 마지막 알림은 그보다 1분 앞 */
+    private fun pendingState(checkedUntil: Instant) =
+        LogPatternState(limit.name, checkedUntil, checkedUntil.minusSeconds(60), 3, "req-old", checkedUntil.minusSeconds(10))
+
+    @Test
+    fun `앞에서 본 곳이 5분보다 오래된 상태의 쌓인 수와 첫 줄은 버린다 — 새 맞춤이 없으면 사건도 없고 마지막 알림은 남는다`() {
+        val now = start.plus(Duration.ofDays(7))
+        val old = pendingState(start)
+        val result = LogPatternJudge(LogPatternSettings(listOf(limit), emptyList())).judge(now, listOf(old), lines)
+        assertEquals(emptyList<ResourceAlert>(), result.events, "옛 맞춤으로 사건을 냈다")
+        val state = result.states.single { it.name == limit.name }
+        assertEquals(0L, state.pendingCount)
+        assertNull(state.pendingFirstRequestId)
+        assertNull(state.pendingFirstAt)
+        assertEquals(old.lastNotifiedAt, state.lastNotifiedAt, "마지막 알림까지 버렸다 — 10분 창의 간격이 깨진다")
+    }
+
+    @Test
+    fun `오래된 앞 상태 뒤의 새 창에 둘이 맞으면 수는 둘이고 첫 줄은 새 창의 것이다`() {
+        val now = start.plus(Duration.ofDays(7))
+        add(now.minusSeconds(40), requestId = "req-new-1")
+        add(now.minusSeconds(30), requestId = "req-new-2")
+        val result = LogPatternJudge(LogPatternSettings(listOf(limit), emptyList())).judge(now, listOf(pendingState(start)), lines)
+        assertEquals(listOf("2줄 맞음 · 첫 줄 요청 ID req-new-1 · 시각 ${now.minusSeconds(40)}"), result.events.map { it.detail }, "옛 수가 더해졌다")
+    }
+
+    @Test
+    fun `앞에서 본 곳이 정확히 5분 전이면 이어 쓰고 1ms 더 오래되면 버린다`() {
+        val now = start.plus(Duration.ofHours(1))
+        val judge = LogPatternJudge(LogPatternSettings(listOf(limit), emptyList()))
+        val edge = judge.judge(now, listOf(pendingState(now.minus(Duration.ofMinutes(5)))), lines).states.single { it.name == limit.name }
+        assertEquals(3L, edge.pendingCount, "정확히 5분 전의 상태를 버렸다 — 늦은 줄의 경계(5분 넘게)와 같은 쪽이어야 한다")
+        assertEquals("req-old", edge.pendingFirstRequestId)
+        val over = judge.judge(now, listOf(pendingState(now.minus(Duration.ofMinutes(5)).minusMillis(1))), lines).states.single { it.name == limit.name }
+        assertEquals(0L, over.pendingCount)
+    }
+
+    @Test
+    fun `자기 설정에 없는 규칙의 오래된 상태는 쌓인 수까지 그대로 돌려준다 — 버리는 것은 자기 규칙을 판정할 때뿐`() {
+        val foreign = LogPatternState("other_place_rule", start, start.minusSeconds(60), 3, "req-x", start.minusSeconds(10))
+        val result = LogPatternJudge(LogPatternSettings(listOf(limit), emptyList())).judge(start.plus(Duration.ofDays(7)), listOf(foreign), lines)
+        assertTrue(foreign in result.states, "다른 자리의 상태를 비웠다: ${result.states}")
     }
 
     @Test
