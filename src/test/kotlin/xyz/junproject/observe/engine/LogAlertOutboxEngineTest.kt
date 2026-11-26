@@ -170,6 +170,34 @@ class LogAlertOutboxEngineTest {
             "건너뛴 줄이 WARN 에 드러나지 않았다: ${appender.list.map { "${it.level} ${it.formattedMessage}" }}")
     }
 
+    @Test
+    fun `같은 바퀴에 별표 이름의 서비스 · 전체 한 줄 · 숨은 문자만 다른 두 서비스 · 평범한 서비스가 넘으면 다섯 건이 모두 줄로 남고 한 바퀴에 모두 보내진다`() {
+        val lastLog = now.minus(Duration.ofHours(1))
+        val alerts = listOf(
+            LogAlerts.silent("*", "ci-agent-158", lastLog, threshold, now, resolved = false),
+            LogAlerts.silentAll(lastLog, threshold, now, resolved = false),
+            LogAlerts.silent("a\u200Bb", "ci-agent-158", lastLog, threshold, now, resolved = false),
+            LogAlerts.silent("a\u200Cb", "ci-agent-158", lastLog, threshold, now, resolved = false),
+            LogAlerts.silent("backend", "ci-agent-9", lastLog, threshold, now, resolved = false),
+        )
+        assertEquals(5, enqueue(alerts).eventsCreated, "서로 다른 대상의 알림이 같은 고유 키로 겹쳐 조용히 버려졌다")
+        assertEquals(alerts.map { it.eventId }.toSet(), outboxRows().map { it["event_id"] }.toSet())
+        val sender = RecordingSender()
+        assertEquals(5, AlertDispatcher(store, sender).dispatch(now.plusSeconds(1)).delivered)
+        assertEquals(alerts.map { it.key }.toSet(), sender.sent.map { it.key }.toSet())
+    }
+
+    @Test
+    fun `같은 대상의 같은 판정 시각 알림을 두 번 넣으면 한 건만 남는다 — 같은 판정의 되풀이를 고유 키로 한 번만 남기는 것이 의도다`() {
+        val alert = LogAlerts.silent("backend", "ci-agent-158", null, threshold, now, resolved = false)
+        assertEquals(1, enqueue(listOf(alert, alert)).eventsCreated)
+        assertEquals(0, enqueue(listOf(LogAlerts.silent("backend", "ci-agent-158", null, threshold, now, resolved = false))).eventsCreated,
+            "같은 판정을 다시 기록했는데 줄이 늘었다")
+        assertEquals(listOf(alert.eventId), outboxRows().map { it["event_id"] })
+        assertEquals(1, enqueue(listOf(LogAlerts.silent("backend", "ci-agent-158", null, threshold, now.plusSeconds(3600), resolved = false))).eventsCreated,
+            "다른 판정 시각(다시 알림)이 같은 알림으로 버려졌다")
+    }
+
     // ── 차례와 몫 ──────────────────────────────────────
 
     @Test
