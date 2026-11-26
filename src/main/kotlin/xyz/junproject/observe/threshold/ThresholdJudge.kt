@@ -10,7 +10,24 @@ import java.time.Instant
  * [kind] 는 알림 서버 `POST /events` 의 `kind`. 디스크는 단계마다 규칙 하나(경고 · 위험 — 같은 key 를 알림 서버가 10분 억제하므로
  * 단계가 바뀐 알림이 억제되지 않게 key 를 나눈다).
  */
-enum class ResourceRule(val wireName: String, val kind: String) {
+/**
+ * 보낼 표에 드는 알림의 규칙 — 자원 규칙([ResourceRule])과 로그 규칙([LogRule]). [wireName] 은 보낼 표의 `rule` 칸 · 알림 key 의 규칙 자리,
+ * [kind] 는 알림 서버 `POST /events` 의 `kind`. 뼈대(02b): 변환은 아직 없다
+ */
+sealed interface AlertRule {
+    val wireName: String
+    val kind: String
+
+    companion object {
+        /** 이 판이 아는 규칙 전부 */
+        val entries: List<AlertRule> get() = ResourceRule.entries + LogRule.entries
+
+        /** 규칙 글자 → 규칙 — 글자가 정확히 같아야 한다. 모르는 글자는 예외. 뼈대: 아직 없다 */
+        fun fromWireName(wireName: String): AlertRule = TODO("02b: 규칙 글자 → 규칙")
+    }
+}
+
+enum class ResourceRule(override val wireName: String, override val kind: String) : AlertRule {
     DISK_WARNING("disk_warning", "resource_disk"),
     DISK_CRITICAL("disk_critical", "resource_disk"),
     MEMORY("memory", "resource_memory"),
@@ -20,7 +37,14 @@ enum class ResourceRule(val wireName: String, val kind: String) {
 }
 
 /** 알림 서버의 `severity` 글자(알림 서버가 받는 셋 — info · warning · critical) */
-enum class AlertSeverity(val wireName: String) { INFO("info"), WARNING("warning"), CRITICAL("critical") }
+enum class AlertSeverity(val wireName: String) {
+    INFO("info"), WARNING("warning"), CRITICAL("critical");
+
+    companion object {
+        /** 등급 글자 → 등급 — 글자가 정확히 같아야 한다. 모르는 글자는 예외. 뼈대: 아직 없다 */
+        fun fromWireName(wireName: String): AlertSeverity = TODO("02b: 등급 글자 → 등급")
+    }
+}
 
 /**
  * 수치(명세 §2.4 의 표가 기본값). 설정 키는 `observe.metrics.alert.<칸 이름의 케밥꼴>`, 환경 변수는 `METRICS_ALERT_<대문자 밑줄꼴>`
@@ -104,7 +128,7 @@ data class ResourceAlert(
     val title: String,
     val detail: String,
     val server: String,
-    val rule: ResourceRule,
+    val rule: AlertRule,
     val targetName: String?,
     val createdAt: Instant,
 ) {

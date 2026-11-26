@@ -77,7 +77,7 @@ data class AlertTarget(val server: String, val ruleGroup: String, val targetName
         const val DISK_GROUP = "disk"
 
         /** 규칙의 묶음 — 디스크 두 단계는 한 묶음(경고 · 위험 · 그 해소의 도착 순서가 바뀌지 않게) */
-        fun groupOf(rule: ResourceRule): String =
+        fun groupOf(rule: AlertRule): String =
             if (rule == ResourceRule.DISK_WARNING || rule == ResourceRule.DISK_CRITICAL) DISK_GROUP else rule.wireName
 
         /** 알림 하나의 대상 */
