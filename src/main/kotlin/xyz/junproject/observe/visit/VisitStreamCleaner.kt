@@ -1,5 +1,8 @@
 package xyz.junproject.observe.visit
 
+import io.lettuce.core.XTrimArgs
+import io.lettuce.core.api.async.RedisStreamAsyncCommands
+import org.springframework.data.redis.connection.stream.RecordId
 import org.springframework.data.redis.core.StringRedisTemplate
 import java.time.Instant
 
@@ -7,8 +10,8 @@ import java.time.Instant
 data class VisitStreamTrimResult(val ranAt: Instant, val trimmed: Long?, val failure: String?)
 
 /**
- * 방문 스트림에서 항목을 지우는 면(V2b) — 주소가 든 원문이 저장 뒤에 Redis 에 남지 않게. 방문 스트림에만 쓴다(로그 · 지표 스트림은 지우지 않는다).
- * 뼈대: 본문은 구현 워커가 채운다.
+ * 방문 스트림에서 항목을 지우는 면(V2b) — 주소가 든 원문이 저장 뒤에 Redis 에 남지 않게. 방문 스트림에만 쓴다(로그 · 지표 스트림은 지우지 않는다 —
+ * 함께 쓰는 [xyz.junproject.observe.collect.RedisLogStreamSource.acknowledge] 는 지우지 않는다).
  */
 interface VisitStreamCleaner {
     /** `XDEL` — 지운 수(이미 없는 ID 는 세지 않는다 · 오류가 아니다). 실패는 예외 */
@@ -20,8 +23,20 @@ interface VisitStreamCleaner {
     fun trimOlderThan(cutoff: Instant): Long
 }
 
-/** Redis 의 방문 스트림 하나 — 뼈대: 구현 워커가 채운다 */
+/**
+ * Redis 의 방문 스트림 하나. 자르기는 Lettuce 의 명령을 직접 쓴다 — Spring Data Redis 의 자르기는 개수(MAXLEN)만 받고, `MINID` 를 정확히(`=`) 주려면
+ * `XTrimArgs.minId(…).exactTrimming()` 이 필요하다(근사 `~` 면 경계의 노드 하나가 통째로 남거나 남지 않아 기준 시각이 흔들린다). `MINID` 는 Redis 6.2 부터.
+ */
 class RedisVisitStreamCleaner(private val redis: StringRedisTemplate, private val stream: String) : VisitStreamCleaner {
-    override fun delete(ids: List<String>): Long = TODO("뼈대: 구현 워커가 채운다")
-    override fun trimOlderThan(cutoff: Instant): Long = TODO("뼈대: 구현 워커가 채운다")
+    override fun delete(ids: List<String>): Long {
+        if (ids.isEmpty()) return 0
+        return redis.opsForStream<String, String>().delete(stream, *ids.map { RecordId.of(it) }.toTypedArray()) ?: 0
+    }
+
+    override fun trimOlderThan(cutoff: Instant): Long = redis.execute { connection ->
+        @Suppress("UNCHECKED_CAST")
+        val commands = connection.nativeConnection as RedisStreamAsyncCommands<ByteArray, ByteArray>
+        // MINID <밀리초> — ID 가 `<밀리초>-0` 보다 작은 항목만 지운다(같은 밀리초는 남는다). 연결의 명령 제한 시간이 걸려 있다
+        commands.xtrim(stream.toByteArray(), XTrimArgs.Builder.minId(cutoff.toEpochMilli().toString()).exactTrimming()).get()
+    } ?: 0
 }

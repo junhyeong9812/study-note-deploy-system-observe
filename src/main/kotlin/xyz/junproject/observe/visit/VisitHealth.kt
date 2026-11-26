@@ -23,6 +23,8 @@ import java.util.concurrent.TimeoutException
  *   `already_stored`(받았지만 표에 이미 있던 항목 수) · `store_result_unknown`(저장소가 "결과 모름"을 돌려준 항목 수) · `unacknowledged` · `lag` · `failure`
  * - `dropped`: 이유 글자 → 건수(모든 이유, 없으면 0) · `dropped_total` · `query_stripped`
  * - `last_retention_at` · `last_retention_deleted` · `last_retention_failure`(90일 삭제)
+ * - 스트림에서 지우기: `stream_deleted` · `stream_delete_failed` · `stream_delete_pending`(수집기가 센 수), 하루 한 번의 정리: `last_stream_trim_at` ·
+ *   `last_stream_trimmed` · `last_stream_trim_failure` — 상태 판정에는 넣지 않는다(지우기의 실패는 수집의 실패가 아니다)
  * 바깥에 묻는 것(미확인 · 밀린 건수, 마지막 · 가장 오래된 저장 시각)은 한꺼번에 시작해 합쳐 [readBudget] 안에서만 기다린다 — 넘기면 `TimeoutException` 실패와 같다.
  */
 class VisitHealth(
@@ -35,11 +37,8 @@ class VisitHealth(
     private val stallAfter: Duration = Duration.ofSeconds(60),
     private val startedAt: Instant = Instant.now(),
     private val readBudget: Duration = Duration.ofSeconds(2),
-    /**
-     * 뼈대(V2b): 마지막 스트림 정리 — 칸 `last_stream_trim_at` · `last_stream_trimmed`(-1) · `last_stream_trim_failure`("")와 수집기의
-     * `stream_deleted` · `stream_delete_failed` · `stream_delete_pending` 을 더한다(상태 판정은 그대로). 본문은 구현 워커가 채운다.
-     */
-    @Suppress("unused") private val lastStreamTrim: () -> VisitStreamTrimResult? = { null },
+    /** 마지막 스트림 정리(하루 한 번의 안전망) — 칸 `last_stream_trim_*` */
+    private val lastStreamTrim: () -> VisitStreamTrimResult? = { null },
 ) {
     private val log = LoggerFactory.getLogger("observe")
     @Volatile private var lastLoggedProblem: String? = null
@@ -71,6 +70,7 @@ class VisitHealth(
         }
         val dropped = collector.droppedCounts()
         val retention = runCatching(lastRetention).getOrNull()
+        val streamTrim = runCatching(lastStreamTrim).getOrNull()
         return mapOf(
             "status" to status,
             "last_loop_at" to (lastLoopAt?.toString() ?: ""),
@@ -88,6 +88,12 @@ class VisitHealth(
             "last_retention_at" to (retention?.ranAt?.toString() ?: ""),
             "last_retention_deleted" to (retention?.deleted ?: -1),
             "last_retention_failure" to (retention?.failure ?: ""),
+            "stream_deleted" to collector.streamDeleted,
+            "stream_delete_failed" to collector.streamDeleteFailed,
+            "stream_delete_pending" to collector.streamDeletePending.toLong(),
+            "last_stream_trim_at" to (streamTrim?.ranAt?.toString() ?: ""),
+            "last_stream_trimmed" to (streamTrim?.trimmed ?: -1L),
+            "last_stream_trim_failure" to (streamTrim?.failure ?: ""),
         )
     }
 

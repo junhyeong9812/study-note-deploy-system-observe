@@ -23,18 +23,31 @@ class VisitSchedule(
     private val retentionBatchSize: Int = 5_000,
     private val retentionTimeBudget: Duration = Duration.ofMinutes(5),
     private val clock: () -> Instant = Instant::now,                    // 예산을 잴 시계
-    /** 뼈대(V2b): 스트림의 안전망 — 기본은 수집기의 지우개 */
+    /** 스트림의 안전망 — 기본은 수집기의 지우개(설정 빈의 인자를 늘리지 않는다) */
     private val cleaner: VisitStreamCleaner? = collector.cleaner,
 ) {
-    /** 뼈대(V2b): 마지막 스트림 정리의 결과 — 뜬 뒤 아직 돌지 않았으면 null */
-    val lastStreamTrim: VisitStreamTrimResult? get() = null
+    /** 마지막 스트림 정리의 결과 — 뜬 뒤 아직 돌지 않았으면 null */
+    val lastStreamTrim: VisitStreamTrimResult? get() = streamTrimResult
+    @Volatile private var streamTrimResult: VisitStreamTrimResult? = null
 
     /**
-     * 뼈대(V2b): [now] 기준 90일보다 오래된 항목을 스트림에서 잘라 낸다(`cleaner.trimOlderThan(now − 90일)` — DB 삭제와 같은 기준 시각). [deleteOldVisits] 가
+     * [now] 기준 90일보다 오래된 항목을 스트림에서 잘라 낸다(`cleaner.trimOlderThan(now − 90일)` — DB 삭제와 같은 기준 시각). [deleteOldVisits] 가
      * DB 삭제와 **따로** 부른다(한쪽이 실패해도 다른 쪽은 돈다). 잘라 낸 수, 실패하면 null 과 [lastStreamTrim] 에 종류 이름 · ERROR 줄
-     * `visit stream trim failed: <종류>`, 성공하면 INFO 줄 `trimmed <n> visit stream entries older than 90 days`. 지우개가 없으면 null. 본문은 구현 워커가 채운다.
+     * `visit stream trim failed: <종류>`, 성공하면 INFO 줄 `trimmed <n> visit stream entries older than 90 days`. 지우개가 없으면 null.
      */
-    internal fun trimOldVisitStream(now: Instant): Long? = TODO("뼈대: 구현 워커가 채운다")
+    internal fun trimOldVisitStream(now: Instant): Long? {
+        val streamCleaner = cleaner ?: return null
+        return try {
+            val trimmed = streamCleaner.trimOlderThan(now.minus(VisitStore.RETENTION))
+            log.info("observe:observe:trimmed {} visit stream entries older than {} days", trimmed, VisitStore.RETENTION.toDays())
+            streamTrimResult = VisitStreamTrimResult(now, trimmed, null)
+            trimmed
+        } catch (error: Exception) {
+            log.error("observe:observe:visit stream trim failed: {}", error.javaClass.simpleName)   // 예외 글은 싣지 않는다
+            streamTrimResult = VisitStreamTrimResult(now, null, error.javaClass.simpleName)
+            null
+        }
+    }
     private val log = LoggerFactory.getLogger("observe")
     @Volatile private var running = true
     private var thread: Thread? = null
@@ -81,8 +94,15 @@ class VisitSchedule(
     /**
      * [now] 기준 [VisitStore.RETENTION] 보다 오래된 방문을 지운다 — 기준 시각의 경계를 테스트가 시계를 정해 확인할 수 있게 나눴다.
      * 지운 수를 돌려주고, 실패하면 null. 묶음은 하나씩 커밋되므로 도중에 실패해도 그때까지 지운 수를 [lastRetention] 과 ERROR 줄에 남긴다.
+     * 같은 기준 시각으로 스트림도 잘라 낸다([trimOldVisitStream]) — DB 삭제와 따로(한쪽이 실패해도 다른 쪽은 돈다).
      */
     internal fun deleteOldVisits(now: Instant): Int? {
+        val deleted = deleteOldVisitRows(now)
+        trimOldVisitStream(now)
+        return deleted
+    }
+
+    private fun deleteOldVisitRows(now: Instant): Int? {
         val cutoff = now.minus(VisitStore.RETENTION)
         val startedAt = clock()
         var deleted = 0

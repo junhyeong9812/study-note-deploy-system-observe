@@ -38,6 +38,7 @@ import org.springframework.scheduling.annotation.Scheduled
 import java.time.Instant
 import java.util.concurrent.CopyOnWriteArrayList
 import xyz.junproject.observe.threshold.SilentGate
+import xyz.junproject.observe.visit.RedisVisitStreamCleaner
 import xyz.junproject.observe.visit.VisitCollector
 import xyz.junproject.observe.visit.VisitHealth
 import xyz.junproject.observe.visit.VisitRetention
@@ -329,13 +330,14 @@ class ObserveConfiguration {
             sharedVisitStreamSource = it
         }
 
+    /** 방문 수집 — 저장하고 확인한 항목을 방문 스트림에서 지운다(V2b — 지우개는 방문 스트림에만. 하루 한 번의 안전망도 이 지우개를 쓴다) */
     @Bean
     fun visitCollector(
         redis: StringRedisTemplate,
         @Value("\${observe.visits.stream:visits}") stream: String,
         @Value("\${observe.visits.group:observe}") group: String,
         store: VisitStore,
-    ) = VisitCollector(visitStreamSource(redis, stream, group), store)
+    ) = VisitCollector(visitStreamSource(redis, stream, group), store, cleaner = RedisVisitStreamCleaner(redis, stream))
 
     /**
      * 방문 수집 스레드와 90일 삭제(`observe.visits.retention-cron`, 서울). 삭제를 끄는 값(`-`)은 받지 않는다 — 주소를 저장하면서 삭제를 끌 수 없다.
@@ -369,7 +371,7 @@ class ObserveConfiguration {
     ): VisitHealth {
         val source = visitStreamSource(redis, stream, group)
         return VisitHealth(collector, { source.unacknowledgedCount() }, { source.lag() }, { store.latestStoredAt() }, { schedule.lastRetention },
-            oldestStoredAt = { store.oldestStoredAt() })
+            oldestStoredAt = { store.oldestStoredAt() }, lastStreamTrim = { schedule.lastStreamTrim })
     }
 
     @Bean
