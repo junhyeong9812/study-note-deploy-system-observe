@@ -48,7 +48,21 @@ class VisitCollector(
      * 로그에는 `visit stream delete failed for <n> entries — will retry: <종류>` 만(예외 글 · ID 없음).
      */
     val cleaner: VisitStreamCleaner? = null,
+    /**
+     * 뼈대(V2b 리뷰 루프 1): 다시 지울 ID 를 기억하는 상한(기본 1만) — 지우기가 실패해 목록에 더하다 넘으면 **가장 오래된 것부터** 잊고
+     * [streamDeleteForgotten] 에 센다(잊은 항목은 하루 한 번의 안전망이 거둔다). 넘친 바퀴마다 WARN 한 줄(ID · 주소 없음):
+     * `observe:observe:visit stream delete pending list over <상한> — forgot the <그 바퀴에 잊은 수> oldest entries, the daily trim removes them`.
+     * 본문은 구현 워커가 채운다.
+     */
+    @Suppress("unused") private val deletePendingLimit: Int = 10_000,
+    /**
+     * 뼈대(V2b 리뷰 루프 1): 바퀴 처음의 다시 지우기를 한 번에 몇 개씩(기본 1천) — 오래된 것부터 묶음으로, 한 묶음이 실패하면 그 바퀴의 나머지 묶음은 하지 않는다.
+     * 성공한 묶음의 ID 만 목록에서 빠진다. 본문은 구현 워커가 채운다.
+     */
+    @Suppress("unused") private val deleteRetryBatchSize: Int = 1_000,
 ) {
+    /** 뼈대(V2b 리뷰 루프 1): 이 프로세스가 뜬 뒤 상한을 넘어 다시 지우기를 포기한(잊은) 항목 수 — 헬스 `visits.stream_delete_forgotten` */
+    @Volatile var streamDeleteForgotten: Long = 0; private set
     /** 이 프로세스가 뜬 뒤 스트림에서 지운 항목 수(Redis 가 지웠다고 돌려준 수) */
     @Volatile var streamDeleted: Long = 0; private set
     /** 이 프로세스가 뜬 뒤 지우기에 실패한 항목 수(실패한 시도마다 그 묶음의 수를 더한다) */

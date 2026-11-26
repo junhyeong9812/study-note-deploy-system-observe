@@ -237,6 +237,25 @@ class VisitStreamCleanupEngineTest {
     }
 
     @Test
+    fun `다시 지울 목록의 상한을 넘어 잊은 항목은 스트림에 남아 있다가 하루 정리가 자른다`() {
+        val ids = List(3) { send() }
+        val switchable = SwitchableCleaner().apply { failing = true }
+        val reader = source()
+        val collector = VisitCollector(reader, store, batchSize = 200, block = Duration.ofMillis(200), cleaner = switchable, deletePendingLimit = 1)
+        collector.runOnce()
+        assertEquals(ids.toSet(), storedIds())
+        assertEquals(2L, collector.streamDeleteForgotten)
+        switchable.failing = false
+        collector.runOnce()                                                                       // 기억한 하나(가장 새 것)만 다시 지운다
+        assertEquals(ids.take(2), streamIds(), "잊은 두 항목(가장 오래된 것)이 스트림에 남아 있어야 한다 — 안전망이 거둘 몫")
+        val schedule = VisitSchedule(collector, store)
+        assertEquals(2L, schedule.trimOldVisitStream(Instant.now().plus(Duration.ofDays(91))), "안전망이 잊은 항목을 자르지 않았다")
+        assertEquals(emptyList<String>(), streamIds())
+        assertEquals(ids.toSet(), storedIds(), "자른 것은 스트림의 사본뿐 — 표의 줄은 그대로")
+        assertFalse(logs.text().contains(ADDRESS_V4))
+    }
+
+    @Test
     fun `90일 넘게 저장되지 못한 미확인 항목도 정리가 잘라 내고 수집은 그것을 trimmed 로 세어 확인한다`() {
         val now = Instant.parse("2026-11-28T03:40:00Z")
         val cutoff = now.minus(Duration.ofDays(90)).toEpochMilli()
