@@ -40,7 +40,20 @@ class VisitCollector(
     private val block: Duration = Duration.ofSeconds(2),
     private val recheckUnacknowledgedEvery: Duration = Duration.ofMinutes(1),
     private val clock: () -> Instant = Instant::now,
+    /**
+     * 뼈대(V2b): 저장 · 확인을 마친 항목을 지우는 면 — 하루 한 번의 정리([VisitSchedule])도 이것을 쓴다. null 이면 지우지 않는다(지금 동작).
+     * 차례: 받아들인 묶음은 저장 → 확인 → 지움, 꼴이 틀려 버린 항목은 확인 → 지움. 저장에 실패한 묶음은 확인도 지우기도 하지 않는다.
+     * 지우기가 실패하면 바퀴는 실패가 아니다 — [streamDeleteFailed] 에 그 수를 더하고 ID 를 기억했다가 **다음 바퀴의 처음에** 다시 지운다(다시 저장하지 않는다).
+     * 로그에는 `visit stream delete failed for <n> entries — will retry: <종류>` 만(예외 글 · ID 없음). 본문은 구현 워커가 채운다.
+     */
+    val cleaner: VisitStreamCleaner? = null,
 ) {
+    /** 뼈대(V2b): 이 프로세스가 뜬 뒤 스트림에서 지운 항목 수(Redis 가 지웠다고 돌려준 수) */
+    @Volatile var streamDeleted: Long = 0; private set
+    /** 뼈대(V2b): 이 프로세스가 뜬 뒤 지우기에 실패한 항목 수(실패한 시도마다 그 묶음의 수를 더한다) */
+    @Volatile var streamDeleteFailed: Long = 0; private set
+    /** 뼈대(V2b): 지금 다시 지우기를 기다리는 항목 수 */
+    val streamDeletePending: Int get() = 0
     private val log = LoggerFactory.getLogger("observe")
     private var schemaReady = false
     private var groupReady = false

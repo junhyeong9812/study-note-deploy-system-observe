@@ -8,6 +8,7 @@ import org.junit.jupiter.api.TestInstance
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.boot.test.context.SpringBootTest
 import org.springframework.core.env.Environment
+import org.springframework.data.domain.Range
 import org.springframework.data.redis.core.StringRedisTemplate
 import org.springframework.jdbc.core.JdbcTemplate
 import org.springframework.test.annotation.DirtiesContext
@@ -220,6 +221,23 @@ class VisitHttpEngineTest {
         redis.delete(LOG_STREAM)
         redis.delete(METRIC_STREAM)
         administration.execute("DROP SCHEMA IF EXISTS $SCHEMA CASCADE")
+    }
+
+    @Test
+    fun `앱에서 방문 항목은 저장된 뒤 스트림에서 지워지고 같은 앱의 로그 스트림 항목은 남으며 스트림 정리가 배선돼 있다`() {
+        val streams = redis.opsForStream<String, String>()
+        val visitId = send(VisitRecords.fields(path = "/wiki/v2b-wiring"))
+        val logId = streams.add(LOG_STREAM, mapOf("level" to "info", "line" to "req-v2b-wiring:backend:still here"))!!.value
+        eventually(what = "방문 항목이 저장된 뒤 스트림에서 지워진다") {
+            streams.range(VISIT_STREAM, Range.closed(visitId, visitId))!!.isEmpty().takeIf { it && (visitHealth()["stream_deleted"] as Number).toLong() >= 1 }
+        }
+        eventually(what = "로그 항목이 저장된다") {
+            @Suppress("UNCHECKED_CAST")
+            ((envelope(call("GET", "/logs?request_id=req-v2b-wiring"))["data"] as Map<String, Any?>)["logs"] as List<Any?>).singleOrNull()
+        }
+        assertEquals(listOf(logId), streams.range(LOG_STREAM, Range.closed(logId, logId))!!.map { it.id.value }, "로그 스트림의 항목까지 지웠다")
+        assertNotNull(visitSchedule.trimOldVisitStream(Instant.now()), "하루 한 번의 정리에 스트림 지우개가 배선되지 않았다")
+        assertNotEquals("", visitHealth()["last_stream_trim_at"])
     }
 
     companion object {

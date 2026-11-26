@@ -66,6 +66,7 @@ class VisitHealthTest {
             "status", "last_loop_at", "last_stored_at", "stored_since_start", "unacknowledged", "lag", "failure",
             "dropped", "dropped_total", "query_stripped", "last_retention_at", "last_retention_deleted", "last_retention_failure",
             "already_stored", "oldest_stored_at", "store_result_unknown",
+            "stream_deleted", "stream_delete_failed", "stream_delete_pending", "last_stream_trim_at", "last_stream_trimmed", "last_stream_trim_failure",
         ), body.keys)
         assertEquals("ok", body["status"])
         assertEquals(now.toString(), body["last_stored_at"])

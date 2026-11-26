@@ -35,6 +35,11 @@ class VisitHealth(
     private val stallAfter: Duration = Duration.ofSeconds(60),
     private val startedAt: Instant = Instant.now(),
     private val readBudget: Duration = Duration.ofSeconds(2),
+    /**
+     * 뼈대(V2b): 마지막 스트림 정리 — 칸 `last_stream_trim_at` · `last_stream_trimmed`(-1) · `last_stream_trim_failure`("")와 수집기의
+     * `stream_deleted` · `stream_delete_failed` · `stream_delete_pending` 을 더한다(상태 판정은 그대로). 본문은 구현 워커가 채운다.
+     */
+    @Suppress("unused") private val lastStreamTrim: () -> VisitStreamTrimResult? = { null },
 ) {
     private val log = LoggerFactory.getLogger("observe")
     @Volatile private var lastLoggedProblem: String? = null
