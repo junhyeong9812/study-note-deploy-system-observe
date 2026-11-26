@@ -39,7 +39,8 @@ data class LogJudgeResult(val states: List<LogRuleState>, val events: List<Resou
  * 넘을 때 1회(서비스가 사는 서버가 자원 끊김으로 넘어 있으면 알리지 않고 넘음만 남긴다 — 서버가 돌아온 뒤에도 조용하면 그때 처음 알린다),
  * 넘어 있는 채로 마지막 알림에서 [remindEvery] 가 지나면 `(계속)` 다시 1회(서버가 끊긴 동안은 없음), 다시 받으면 해소 1회(알린 넘음만).
  * 보류([LogJudgeInput.judging] 가 false)면 앞 상태를 그대로 두고 알림을 만들지 않는다. 전체 한 줄은 서버 끊김과 무관하다.
- * 설정에서 빠진 서비스 · 꺼진 전체 한 줄의 상태는 버린다(해소도 알리지 않는다).
+ * 자기 설정에 없는 서비스 · 꺼진 전체 한 줄의 앞 상태는 손대지 않고 그대로 돌려준다(알리지 않는다 — 다른 자리의 설정일 수 있다.
+ * 다시 설정에 넣으면 그 앞 상태에서 이어 간다).
  */
 class LogSilentJudge(private val settings: LogAlertSettings, private val remindEvery: Duration = Duration.ofHours(1)) {
     fun judge(input: LogJudgeInput, previous: List<LogRuleState>): LogJudgeResult {
@@ -60,7 +61,15 @@ class LogSilentJudge(private val settings: LogAlertSettings, private val remindE
             step.state?.let { states += it }
             step.event?.let { events += it }
         }
+        // 자기 설정에 없는 앞 상태 — 그대로(저장소는 잠금 안에서 읽은 앞 상태를 지우고 다시 쓰므로 이렇게 실어야 남는다)
+        states += previous.filterNot { isWatched(it) }
         return LogJudgeResult(states, events)
+    }
+
+    /** 이 설정이 판정하는 줄인가(그 줄은 위에서 판정한 상태로 실린다) */
+    private fun isWatched(state: LogRuleState) = when (state.rule) {
+        LogRule.SILENT -> settings.services.any { it.service == state.service }
+        LogRule.SILENT_ALL -> settings.allThreshold != null && state.service == ALL_SERVICES
     }
 
     private class Step(val state: LogRuleState?, val event: ResourceAlert? = null)

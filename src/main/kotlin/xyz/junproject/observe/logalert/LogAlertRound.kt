@@ -1,7 +1,6 @@
 package xyz.junproject.observe.logalert
 
 import org.slf4j.LoggerFactory
-import xyz.junproject.observe.threshold.SilentGate
 import java.time.Duration
 import java.time.Instant
 
@@ -9,28 +8,23 @@ import java.time.Instant
 data class LogAlertRoundResult(val ranAt: Instant, val judged: Boolean, val eventsCreated: Int, val failure: String?)
 
 /**
- * 무수신 판정의 보류 — 이 프로세스가 뜬 직후 · 로그 수집이 따라잡기 전([warmUp] — 자원 끊김과 같은 [SilentGate]) ·
- * 로그 수집이 실패 중이거나 마지막 바퀴가 [stallAfter] 넘게(같으면 넘은 것) 오래됐거나 아직 한 바퀴도 끝내지 못한 동안에는 판정하지 않는다
- * (수집이 멈춘 동안의 공백은 로그가 없는 것이 아니다).
+ * 무수신 판정의 문 — 이 프로세스가 뜬 지([startedAt]) [warmUp] 이 지나고(같으면 지난 것) · 로그 수집이 실패 중이 아니고 · 마지막 바퀴가
+ * [stallAfter] 안이고(같으면 넘은 것) · 마지막으로 성공한 수집 바퀴가 따라잡은 바퀴([lastRoundCaughtUp] — 읽은 수가 한 바퀴의 상한보다 적었다)일 때만 판정한다.
+ * 수집이 다시 밀린 동안의 공백은 로그가 없는 것이 아니다 — 따라잡지 못한 채 오래 지나도 판정하지 않는다(자원 끊김의 `SilentGate` 와 달리
+ * 포기하지 않는다. 밀린 동안의 판정은 거짓 알림이다 — 영영 밀리면 헬스의 `log_alerts.judging` 이 false 로 보인다).
  */
 class LogJudgingGate(
-    private val warmUp: SilentGate,
+    private val startedAt: Instant,
+    private val warmUp: Duration,
     private val collectorFailure: () -> String?,
     private val lastLoopAt: () -> Instant?,
+    private val lastRoundCaughtUp: () -> Boolean,
     private val stallAfter: Duration = Duration.ofSeconds(60),
 ) {
-    /**
-     * §16: 뜬 지 [warmUp] · 수집이 실패 중이 아님 · 마지막 바퀴가 [stallAfter] 안 · 마지막으로 성공한 바퀴가 따라잡은 바퀴([lastRoundCaughtUp]).
-     * 뼈대(§16): 아직 [lastRoundCaughtUp] 을 보지 않고 뜬 지 [warmUp] 뒤면 따라잡은 것으로 본다
-     */
-    constructor(startedAt: Instant, warmUp: Duration, collectorFailure: () -> String?, lastLoopAt: () -> Instant?, lastRoundCaughtUp: () -> Boolean,
-                stallAfter: Duration = Duration.ofSeconds(60)) :
-        this(SilentGate(startedAt, { startedAt }, warmUp, warmUp), collectorFailure, lastLoopAt, stallAfter)
-
     fun active(now: Instant): Boolean {
-        if (!warmUp.active(now) || collectorFailure() != null) return false
+        if (Duration.between(startedAt, now) < warmUp || collectorFailure() != null) return false
         val loop = lastLoopAt() ?: return false
-        return Duration.between(loop, now) < stallAfter
+        return Duration.between(loop, now) < stallAfter && lastRoundCaughtUp()
     }
 }
 

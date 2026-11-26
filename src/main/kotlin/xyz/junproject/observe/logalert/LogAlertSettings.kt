@@ -1,5 +1,6 @@
 package xyz.junproject.observe.logalert
 
+import xyz.junproject.observe.log.LogLineParser
 import xyz.junproject.observe.threshold.LogRule
 import xyz.junproject.observe.threshold.visibleText
 import java.time.Duration
@@ -15,7 +16,7 @@ data class SettingsProblem(val entry: String, val reason: String)
  * [allThreshold] 는 전체 한 줄의 기준(없으면 그 줄은 감시하지 않는다), [problems] 는 받아들이지 않은 줄(줄의 차례대로).
  */
 data class LogAlertSettings(val services: List<WatchedService>, val allThreshold: Duration?, val problems: List<SettingsProblem>,
-                            /** §16: 받아들였지만 알려 둘 줄(사는 서버가 기대 서버 목록에 없음 등). 뼈대: 아직 채우지 않는다 */
+                            /** 받아들였지만 알려 둘 줄 — 사는 서버가 기대 서버 목록에 없다(`server_not_expected` — 그 서버의 끊김 억제가 듣지 않는다) */
                             val warnings: List<SettingsProblem> = emptyList()) {
     /** 감시하는 것이 하나라도 있는가 — 없으면 판정이 꺼진다 */
     val enabled: Boolean get() = services.isNotEmpty() || allThreshold != null
@@ -25,6 +26,7 @@ data class LogAlertSettings(val services: List<WatchedService>, val allThreshold
         services.map { "log alerts watching ${printable(it.service)}@${printable(it.server)} threshold ${it.threshold.toMinutes()} minutes" } +
             listOfNotNull(allThreshold?.let { "log alerts watching ${LogRule.SILENT_ALL.wireName} threshold ${it.toMinutes()} minutes" }) +
             problems.map { "log alerts not watching ${it.entry}: ${it.reason}" } +
+            warnings.map { "log alerts watching with warning ${it.entry}: ${it.reason}" } +
             listOfNotNull(if (enabled) null else "log alerts disabled — nothing to watch")
 
     companion object {
@@ -33,36 +35,42 @@ data class LogAlertSettings(val services: List<WatchedService>, val allThreshold
 
         /**
          * 설정의 글자를 읽는다 — 줄은 쉼표로(앞뒤 공백 · 빈 줄은 무시). 받아들이지 않은 줄은 그 줄만 빠지고 까닭 하나가 남는다
-         * (이름 → 서버 → 기준의 차례로 첫 까닭). 같은 서비스 이름이 두 번 나오면 그 이름의 줄은 모두 빠진다(상태의 열쇠가 서비스라서).
+         * (이름 → 서버 → 기준의 차례로 첫 까닭). 이름 · 서버 · 기준의 조각은 앞뒤 공백을 다듬는다. 이름은 수집이 받는 꼴([LogLineParser.SERVICE_NAME])이어야 한다.
+         * 같은 서비스 이름(다듬은 글자)이 두 번 나오면 그 이름의 줄은 모두 빠진다(상태의 열쇠가 서비스라서).
+         * [expectedServers](자원 판정의 기대 서버)가 비어 있지 않으면 거기 없는 서버의 줄은 받아들이되 [warnings] 에 남긴다.
          */
         fun parse(services: String, allThresholdMinutes: String, expectedServers: Set<String> = emptySet()): LogAlertSettings {
             val entries = services.split(',').map { it.trim() }.filter { it.isNotEmpty() }.map { Entry.of(it) }
             val nameCounts = entries.groupingBy { it.name }.eachCount()
             val watched = mutableListOf<WatchedService>()
             val problems = mutableListOf<SettingsProblem>()
+            val warnings = mutableListOf<SettingsProblem>()
             for (entry in entries) {
                 val reason = nameProblem(entry.name, nameCounts.getValue(entry.name))
                     ?: serverProblem(entry.server)
                     ?: thresholdProblem(entry.threshold)
-                if (reason == null) watched += WatchedService(entry.name, entry.server!!, Duration.ofMinutes(entry.threshold!!.trim().toLong()))
-                else problems += SettingsProblem(printable(entry.text), reason)
+                if (reason != null) { problems += SettingsProblem(printable(entry.text), reason); continue }
+                watched += WatchedService(entry.name, entry.server!!, Duration.ofMinutes(entry.threshold!!.trim().toLong()))
+                if (expectedServers.isNotEmpty() && entry.server !in expectedServers) {
+                    warnings += SettingsProblem(printable("${entry.name}@${entry.server}"), "server_not_expected")
+                }
             }
             val allText = allThresholdMinutes.trim()
             val allReason = if (allText.isEmpty()) null else thresholdProblem(allText)
             if (allReason != null) problems += SettingsProblem(printable("${LogRule.SILENT_ALL.wireName}=$allText"), allReason)
             val allThreshold = if (allText.isEmpty() || allReason != null) null else Duration.ofMinutes(allText.toLong())
-            return LogAlertSettings(watched, allThreshold, problems)
+            return LogAlertSettings(watched, allThreshold, problems, warnings)
         }
 
-        /** 한 줄 — `<이름>@<서버>=<기준>`. `@` 가 없으면 서버가 없고, `=` 가 없으면 기준이 없다 */
+        /** 한 줄 — `<이름>@<서버>=<기준>`(조각마다 앞뒤 공백을 다듬는다). `@` 가 없으면 서버가 없고, `=` 가 없으면 기준이 없다 */
         private class Entry(val text: String, val name: String, val server: String?, val threshold: String?) {
             companion object {
                 fun of(text: String): Entry {
                     val at = text.indexOf('@')
                     val beforeThreshold = text.substringBefore('=')
                     val threshold = if ('=' in text) text.substringAfter('=') else null
-                    return if (at < 0 || at > beforeThreshold.length) Entry(text, beforeThreshold, null, threshold)
-                    else Entry(text, beforeThreshold.substring(0, at), beforeThreshold.substring(at + 1), threshold)
+                    return if (at < 0 || at > beforeThreshold.length) Entry(text, beforeThreshold.trim(), null, threshold?.trim())
+                    else Entry(text, beforeThreshold.substring(0, at).trim(), beforeThreshold.substring(at + 1).trim(), threshold?.trim())
                 }
             }
         }
@@ -71,6 +79,7 @@ data class LogAlertSettings(val services: List<WatchedService>, val allThreshold
             name == LogSilentJudge.ALL_SERVICES -> "name_reserved"
             name.isEmpty() -> "name_empty"
             hasHiddenCharacters(name) -> "name_hidden_characters"
+            !LogLineParser.SERVICE_NAME.matches(name) -> "name_invalid"
             count > 1 -> "name_duplicated"
             else -> null
         }

@@ -306,9 +306,11 @@ class ObserveConfiguration {
     fun logAlertSettings(
         @Value("\${observe.log-alerts.services:}") services: String,
         @Value("\${observe.log-alerts.all-threshold-minutes:}") allThresholdMinutes: String,
-    ): LogAlertSettings = LogAlertSettings.parse(services, allThresholdMinutes).also { settings ->
+        @Value("\${observe.metrics.expected-servers:}") expectedServers: String,
+    ): LogAlertSettings = LogAlertSettings.parse(services, allThresholdMinutes,
+        expectedServers.split(',').map { it.trim() }.filter { it.isNotEmpty() }.toSet()).also { settings ->
         for (line in settings.startupLines()) {
-            if (line.contains("not watching")) log.warn("observe:observe:{}", line) else log.info("observe:observe:{}", line)
+            if (line.contains("not watching") || line.contains("with warning")) log.warn("observe:observe:{}", line) else log.info("observe:observe:{}", line)
         }
     }
 
@@ -321,16 +323,15 @@ class ObserveConfiguration {
     ) = LogAlertStore(thresholdJdbc(url, user, password))
 
     /**
-     * 로그 무수신 판정 — 판정은 이 프로세스가 뜬 지 warm-up(`observe.log-alerts.warm-up`, 기본 3분)이 지나고 로그 수집이 한 번 따라잡은 뒤부터
-     * (따라잡지 못해도 15분 뒤), 로그 수집이 실패 중이거나 멈춘 동안은 보류한다. 말이 안 되는 값이면 뜰 때 실패한다
+     * 로그 무수신 판정 — 판정은 이 프로세스가 뜬 지 warm-up(`observe.log-alerts.warm-up`, 기본 3분)이 지나고, 로그 수집의 마지막 성공 바퀴가
+     * 따라잡은 바퀴일 때만 한다(다시 밀린 동안 · 수집이 실패 중이거나 멈춘 동안은 보류 — 오래 밀려도 포기하지 않는다). 말이 안 되는 값이면 뜰 때 실패한다
      */
     @Bean
     fun logAlertRound(settings: LogAlertSettings, store: LogAlertStore, collector: LogCollector,
                       @Value("\${observe.log-alerts.warm-up:3m}") warmUpText: String): LogAlertRound {
         val warmUp = DurationStyle.detectAndParse(warmUpText.trim())
         require(!warmUp.isNegative && !warmUp.isZero) { "observe.log-alerts.warm-up 은 0 보다 길어야 한다" }
-        require(warmUp <= LOG_JUDGE_GIVE_UP_AFTER) { "observe.log-alerts.warm-up 은 15분보다 길 수 없다" }
-        val gate = LogJudgingGate(SilentGate(Instant.now(), { collector.caughtUpAt }, warmUp, LOG_JUDGE_GIVE_UP_AFTER), { collector.lastFailure }, { collector.lastLoopAt })
+        val gate = LogJudgingGate(Instant.now(), warmUp, { collector.lastFailure }, { collector.lastLoopAt }, { collector.lastRoundCaughtUp })
         return LogAlertRound(settings, store, store, LogSilentJudge(settings)) { gate.active(it) }
     }
 
@@ -343,10 +344,5 @@ class ObserveConfiguration {
         } catch (error: Exception) {
             log.error("observe:observe:log alert schema failed — will retry on first use: {}", error.javaClass.simpleName)
         }
-    }
-
-    private companion object {
-        /** 로그 수집이 따라잡지 못해도 뜬 지 이만큼 지나면 무수신을 판정한다(자원 끊김의 기본과 같다) */
-        val LOG_JUDGE_GIVE_UP_AFTER: Duration = Duration.ofMinutes(15)
     }
 }
