@@ -48,6 +48,8 @@ class LogCollector(
     // 인증 없는 헬스에 그대로 나가므로 예외 문구(접속 주소·SQL)는 담지 않는다 — 문구는 서버 로그에만.
     @Volatile var lastFailure: String? = null; private set
     @Volatile var storedTotal: Long = 0; private set
+    /** 뜬 뒤 처음으로 따라잡은 시각(새 항목을 읽었는데 하나도 없던 첫 바퀴) — 뼈대(03): 아직 채우지 않는다 */
+    @Volatile var caughtUpAt: Instant? = null; private set
 
     /** 한 바퀴. 처리한(저장하고 확인한) 항목 수를 돌려준다. 실패하면 예외 없이 0 을 돌려주고 이유를 남긴다. */
     fun runOnce(): Int {

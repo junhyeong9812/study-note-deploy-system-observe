@@ -21,6 +21,8 @@ import java.time.Instant
 import xyz.junproject.observe.threshold.DispatchOutcome
 import xyz.junproject.observe.threshold.ThresholdRound
 import xyz.junproject.observe.threshold.ThresholdRoundResult
+import xyz.junproject.observe.logalert.LogAlertRound
+import xyz.junproject.observe.logalert.LogAlertRoundResult
 
 /**
  * 도는 것들 — 수집 루프(전용 스레드), 하루 한 번 30일 지난 로그 삭제와 90일 지난 로그인 시도 기록 삭제.
@@ -40,6 +42,7 @@ class ObserveSchedule(
     private val metricCollector: MetricCollector? = null,
     private val metrics: MetricMaintenance? = null,
     private val thresholdRound: ThresholdRound? = null,
+    private val logAlertRound: LogAlertRound? = null,
 ) {
     private val log = LoggerFactory.getLogger("observe")
     @Volatile private var running = true
@@ -224,6 +227,9 @@ class ObserveSchedule(
 
     /** [now] 로 보내기 한 바퀴([ThresholdRound.dispatchOnce]) — 예외를 내지 않는다. [thresholdRound] 가 없으면 null */
     internal fun dispatchAlerts(now: Instant): DispatchOutcome? = thresholdRound?.dispatchOnce(now)
+
+    /** [now] 로 로그 무수신 판정 한 바퀴 — 뼈대(03): 아직 부르지 않는다 */
+    internal fun judgeLogAlerts(now: Instant): LogAlertRoundResult? = null
 
     companion object {
         val RETENTION: Duration = Duration.ofDays(30)

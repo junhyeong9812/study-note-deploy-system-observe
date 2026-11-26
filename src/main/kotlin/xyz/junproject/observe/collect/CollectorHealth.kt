@@ -2,6 +2,7 @@ package xyz.junproject.observe.collect
 
 import org.slf4j.LoggerFactory
 import xyz.junproject.observe.log.RetentionResult
+import xyz.junproject.observe.logalert.LogAlertRound
 import xyz.junproject.observe.metric.MetricHealth
 import java.sql.SQLException
 import java.time.Duration
@@ -36,6 +37,7 @@ class CollectorHealth(
     private val stallAfter: Duration = Duration.ofSeconds(60),
     private val startedAt: Instant = Instant.now(),
     private val metrics: MetricHealth? = null,                          // 지표 수집의 칸 — 본문에만, 판정에 넣지 않는다
+    private val logAlerts: LogAlertRound? = null,                       // 로그 무수신 판정의 칸 — 뼈대(03): 아직 싣지 않는다
 ) {
     data class Report(val healthy: Boolean, val body: Map<String, Any>)
 
