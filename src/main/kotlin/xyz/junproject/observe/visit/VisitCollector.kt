@@ -49,19 +49,19 @@ class VisitCollector(
      */
     val cleaner: VisitStreamCleaner? = null,
     /**
-     * 뼈대(V2b 리뷰 루프 1): 다시 지울 ID 를 기억하는 상한(기본 1만) — 지우기가 실패해 목록에 더하다 넘으면 **가장 오래된 것부터** 잊고
+     * 다시 지울 ID 를 기억하는 상한(기본 1만) — 지우기가 실패해 목록에 더하다 넘으면 **가장 오래된 것부터** 잊고
      * [streamDeleteForgotten] 에 센다(잊은 항목은 하루 한 번의 안전망이 거둔다). 넘친 바퀴마다 WARN 한 줄(ID · 주소 없음):
      * `observe:observe:visit stream delete pending list over <상한> — forgot the <그 바퀴에 잊은 수> oldest entries, the daily trim removes them`.
-     * 본문은 구현 워커가 채운다.
+     * 다시 지우기가 실패해 같은 ID 가 목록에 그대로 남는 것은 넘친 것으로 세지 않는다(새로 더한 것만 목록을 늘린다).
      */
-    @Suppress("unused") private val deletePendingLimit: Int = 10_000,
+    private val deletePendingLimit: Int = 10_000,
     /**
-     * 뼈대(V2b 리뷰 루프 1): 바퀴 처음의 다시 지우기를 한 번에 몇 개씩(기본 1천) — 오래된 것부터 묶음으로, 한 묶음이 실패하면 그 바퀴의 나머지 묶음은 하지 않는다.
-     * 성공한 묶음의 ID 만 목록에서 빠진다. 본문은 구현 워커가 채운다.
+     * 바퀴 처음의 다시 지우기를 한 번에 몇 개씩(기본 1천) — 오래된 것부터 묶음으로, 한 묶음이 실패하면 그 바퀴의 나머지 묶음은 하지 않는다.
+     * 성공한 묶음의 ID 만 목록에서 빠진다.
      */
-    @Suppress("unused") private val deleteRetryBatchSize: Int = 1_000,
+    private val deleteRetryBatchSize: Int = 1_000,
 ) {
-    /** 뼈대(V2b 리뷰 루프 1): 이 프로세스가 뜬 뒤 상한을 넘어 다시 지우기를 포기한(잊은) 항목 수 — 헬스 `visits.stream_delete_forgotten` */
+    /** 이 프로세스가 뜬 뒤 상한을 넘어 다시 지우기를 포기한(잊은) 항목 수 — 헬스 `visits.stream_delete_forgotten` */
     @Volatile var streamDeleteForgotten: Long = 0; private set
     /** 이 프로세스가 뜬 뒤 스트림에서 지운 항목 수(Redis 가 지웠다고 돌려준 수) */
     @Volatile var streamDeleted: Long = 0; private set
@@ -69,9 +69,11 @@ class VisitCollector(
     @Volatile var streamDeleteFailed: Long = 0; private set
     /** 지금 다시 지우기를 기다리는 항목 수 */
     val streamDeletePending: Int get() = pendingDeletes.size
-    // 단순화: 지우기에 실패한 ID 는 이 프로세스의 메모리에만 둔다 — 그 사이 프로세스가 다시 뜨면 잊고, 하루 한 번의 안전망(90일 자르기)이 거둔다.
-    //        Redis 가 오래 쓰기를 거절하면 그동안 확인한 수만큼 늘어난다(하루 방문 수천 건 규모 — 넘으면 상한을 두고 안전망에 맡긴다)
-    private val pendingDeletes: MutableSet<String> = Collections.synchronizedSet(LinkedHashSet())
+    // 단순화: 지우기에 실패한 ID 는 이 프로세스의 메모리에만, [deletePendingLimit](기본 1만 — ID 하나 수십 바이트라 1MB 안쪽)개까지 둔다. 넘거나
+    //        프로세스가 다시 뜨면 잊고, 하루 한 번의 안전망(90일 자르기)이 거둔다 — 그 항목의 원문은 그때까지 Redis 에 남는다(잊은 수는 헬스에)
+    private val pendingDeletes: MutableSet<String> = Collections.synchronizedSet(LinkedHashSet())   // 넣은 차례 = 오래된 차례
+    /** 이번 바퀴에 상한을 넘어 잊은 수 — 바퀴 끝에 한 줄로 */
+    private var forgottenThisRound = 0L
     private val log = LoggerFactory.getLogger("observe")
     private var schemaReady = false
     private var groupReady = false
@@ -99,6 +101,7 @@ class VisitCollector(
     /** 한 바퀴. 처리한(저장하거나 버리고 확인한) 항목 수를 돌려준다. 실패하면 예외 없이 0 을 돌려주고 이유를 남긴다. */
     fun runOnce(): Int {
         var step = "collect"
+        forgottenThisRound = 0
         return try {
             // 그룹을 먼저, 스키마는 DB 에 처음 닿았을 때 — 로그 · 지표 수집과 같은 순서와 까닭
             if (!groupReady) { source.ensureGroup(); groupReady = true }
@@ -114,6 +117,10 @@ class VisitCollector(
             lastFailureDetail = detail
             lastFailure = if (step == "schema") "schema $kind" else kind
             0
+        } finally {
+            // 넘친 바퀴마다 한 줄 — 저장이 실패해 바퀴가 예외로 끝나도 그 바퀴에 잊은 것이 있으면 남긴다(ID · 주소 없음)
+            if (forgottenThisRound > 0) log.warn("observe:observe:visit stream delete pending list over {} — forgot the {} oldest entries, the daily trim removes them",
+                deletePendingLimit, forgottenThisRound)
         }
     }
 
@@ -121,7 +128,7 @@ class VisitCollector(
         val now = clock()
         var handled = 0
         // 앞 바퀴에서 지우지 못한 항목을 먼저 — 같은 바퀴의 끝에서 다시 하면 한 번의 장애가 실패 수에 두 번 세어진다
-        if (pendingDeletes.isNotEmpty()) deleteFromStream(synchronized(pendingDeletes) { pendingDeletes.toList() })
+        retryPendingDeletes()
         val checkedAt = lastUnacknowledgedCheck
         if (checkedAt == null || !now.isBefore(checkedAt.plus(recheckUnacknowledgedEvery))) {
             while (true) {
@@ -184,8 +191,41 @@ class VisitCollector(
             pendingDeletes.removeAll(ids.toSet())
         } catch (error: Exception) {
             streamDeleteFailed += ids.size
-            pendingDeletes.addAll(ids)
+            remember(ids)
             log.warn("observe:observe:visit stream delete failed for {} entries — will retry: {}", ids.size, error.javaClass.simpleName)
+        }
+    }
+
+    /** 다시 지울 목록에 더한다 — [deletePendingLimit] 을 넘으면 넘은 만큼 가장 오래된 것부터 잊고 센다 */
+    private fun remember(ids: List<String>) {
+        synchronized(pendingDeletes) {
+            pendingDeletes.addAll(ids)
+            val over = pendingDeletes.size - deletePendingLimit
+            if (over <= 0) return
+            val oldest = pendingDeletes.iterator()
+            repeat(over) { oldest.next(); oldest.remove() }
+            streamDeleteForgotten += over
+            forgottenThisRound += over
+        }
+    }
+
+    /**
+     * 앞 바퀴에서 지우지 못한 항목을 바퀴의 처음에, 오래된 것부터 [deleteRetryBatchSize] 씩 다시 지운다(같은 바퀴의 끝에서 하면 한 번의 장애가 실패 수에 두 번 세어진다).
+     * 성공한 묶음만 목록에서 빠지고, 한 묶음이 실패하면 그 수만 [streamDeleteFailed] 에 더하고 이 바퀴의 나머지 묶음은 하지 않는다(목록은 그대로 — 넘침으로 세지 않는다).
+     */
+    private fun retryPendingDeletes() {
+        val cleaner = cleaner ?: return
+        while (true) {
+            val batch = synchronized(pendingDeletes) { pendingDeletes.take(deleteRetryBatchSize) }
+            if (batch.isEmpty()) return
+            try {
+                streamDeleted += cleaner.delete(batch)
+            } catch (error: Exception) {
+                streamDeleteFailed += batch.size
+                log.warn("observe:observe:visit stream delete failed for {} entries — will retry: {}", batch.size, error.javaClass.simpleName)
+                return
+            }
+            pendingDeletes.removeAll(batch.toSet())
         }
     }
 

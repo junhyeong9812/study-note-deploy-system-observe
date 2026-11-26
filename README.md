@@ -341,10 +341,14 @@ front ── XADD visits ──▶ Redis ──▶ 관측 서버(방문 전용 �
 
 - 꼴이 틀려 버린 항목도 확인한 뒤 지운다 — 주소가 든 원문이다.
 - **저장에 실패한 묶음은 확인도 지우기도 하지 않는다** — 다음 바퀴에 다시 받아 저장한 뒤에 지운다. 두 자리가 같은 소비자 그룹 · 같은 소비자 이름으로 돌아도, 한 자리가 읽어 가 저장하지 않은 항목은 다른 자리가 그것을 거둬 저장한 뒤에만 지운다.
-- 지우기가 실패해도 수집은 실패가 아니다(저장 · 확인은 끝났다): 그 수를 헬스의 `visits.stream_delete_failed` 에 더하고 ID 를 기억했다가 **다음 바퀴의 처음에** 다시 지운다(다시 저장하지 않는다). 서버 로그에는 `visit stream delete failed for <n> entries — will retry: <종류>` 만(주소 · 경로 · 예외 글 없음).
+- 지우기가 실패해도 수집은 실패가 아니다(저장 · 확인은 끝났다): 그 수를 헬스의 `visits.stream_delete_failed` 에 더하고 ID 를 기억했다가 **다음 바퀴의 처음에** 오래된 것부터 1천 개씩 다시 지운다(다시 저장하지 않는다 — 한 묶음이 실패하면 그 바퀴의 나머지 묶음은 다음 바퀴로). 서버 로그에는 `visit stream delete failed for <n> entries — will retry: <종류>` 만(주소 · 경로 · 예외 글 없음).
+- **다시 지울 목록의 상한**: 1만 개까지 기억한다. 넘으면 넘은 만큼 **가장 오래된 것부터** 잊고 그 수를 헬스의 `visits.stream_delete_forgotten` 에 센다 — 잊은 항목은 스트림에 남아 있다가 하루 한 번의 안전망(90일)이 거둔다. 넘친 바퀴마다 서버 로그 한 줄: `visit stream delete pending list over <상한> — forgot the <n> oldest entries, the daily trim removes them`.
 - 지우기는 **방문 스트림에만** 한다 — 로그 · 지표 스트림의 항목은 지금처럼 확인만 하고 지우지 않는다(함께 쓰는 읽기 코드는 그대로 두고 지우개를 따로 둔다).
 - **안전망**: 하루 한 번(90일 삭제와 같은 예약 · 같은 기준 시각 `지금 − 90일`) 스트림에서 ID 의 밀리초가 그보다 앞선 항목을 잘라 낸다(`XTRIM visits MINID <밀리초>` — 근사 `~` 가 아니라 정확히, 같은 밀리초는 남긴다 — DB 삭제의 경계와 같다). 저장하지 못한 채 90일을 넘긴 미확인 항목도 잘려 나가고, 수집은 그것을 `trimmed` 로 세어 확인한다. DB 삭제와 따로 돈다 — 한쪽이 실패해도 다른 쪽은 돈다. 결과는 서버 로그(`trimmed <n> visit stream entries older than 90 days` / `visit stream trim failed: <종류>`)와 헬스의 `last_stream_trim_*` 에. `MINID` 는 Redis 6.2 부터다.
-- **알려진 한계**: 지우기에 실패한 ID 는 이 프로세스의 메모리에만 기억한다 — 그 사이 프로세스가 다시 뜨면 잊고, 그 항목은 안전망(90일)이 거둔다. Redis 가 AOF · RDB 로 디스크에 남긴 사본은 지운 뒤에도 Redis 가 그 파일을 다시 쓸 때(AOF 다시 쓰기 · 다음 스냅숏)까지 디스크에 남는다.
+- **알려진 한계**:
+  - 지우기에 실패한 ID 는 이 프로세스의 메모리에만 기억한다 — 그 사이 프로세스가 다시 뜨면 잊고, 그 항목은 안전망(90일)이 거둔다.
+  - `XDEL` 과 정확한 `XTRIM` 은 항목을 스트림의 노드 안에서 "지워짐"으로 표시만 한다. **같은 노드에 남은 항목이 하나라도 있으면 지운 항목의 원문(주소)이 Redis 의 메모리와 그 뒤의 스냅숏 · AOF 다시 쓰기에 그대로 실린다** — 노드가 통째로 비어야 사라진다(노드의 기본 상한은 항목 100개 또는 4096바이트 — 방문 20~30건 안팎). 그래서 방문이 아주 적으면 마지막 노드에 남은 지운 원문이 90일을 넘을 수 있다.
+  - 서버 반영 때: 방문 스트림이 있는 Redis 에 디스크 저장(AOF)을 켜려면 `stream-node-max-entries` 를 작게 둔다(1 이면 지우는 즉시 사라진다 — 메모리 비용이 는다).
 
 ### 조회 `GET /visits/summary?days=`
 
@@ -374,7 +378,7 @@ front ── XADD visits ──▶ Redis ──▶ 관측 서버(방문 전용 �
 | `oldest_stored_at` | 가장 오래된 방문의 시각(표가 비거나 없으면 빈 문자열) |
 | `dropped` · `dropped_total` · `query_stripped` | 이 프로세스가 뜬 뒤 버린 항목 수(이유별 — 모든 이유가 0 부터) · 그 합 · 경로의 `?` · `#` · `;` 뒤를 잘라 내고 새로 저장한 수 |
 | `last_retention_at` · `last_retention_deleted` · `last_retention_failure` | 마지막 90일 삭제의 시각 · 지운 줄 수 · 실패 종류(안 돌았으면 빈 문자열 · -1). 도중에 실패해도 그때까지 지운 수가 남는다(묶음마다 커밋 — 첫 묶음에서 실패하면 0) |
-| `stream_deleted` · `stream_delete_failed` · `stream_delete_pending` | 이 프로세스가 뜬 뒤 스트림에서 지운 항목 수(Redis 가 지웠다고 돌려준 수) · 지우기에 실패한 항목 수(실패한 시도마다 더한다) · 지금 다시 지우기를 기다리는 항목 수. 상태 판정에는 넣지 않는다 |
+| `stream_deleted` · `stream_delete_failed` · `stream_delete_pending` · `stream_delete_forgotten` | 이 프로세스가 뜬 뒤 스트림에서 지운 항목 수(Redis 가 지웠다고 돌려준 수) · 지우기에 실패한 항목 수(실패한 시도마다 더한다) · 지금 다시 지우기를 기다리는 항목 수(1만까지) · 상한을 넘어 다시 지우기를 포기한(안전망에 맡긴) 수. 상태 판정에는 넣지 않는다 |
 | `last_stream_trim_at` · `last_stream_trimmed` · `last_stream_trim_failure` | 마지막 스트림 안전망(90일 자르기)의 시각 · 잘라 낸 수 · 실패 종류(안 돌았거나 실패면 빈 문자열 · -1) |
 
 ### 보관 · 설정
