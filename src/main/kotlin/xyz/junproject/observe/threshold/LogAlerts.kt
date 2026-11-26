@@ -10,6 +10,14 @@ enum class LogRule(override val wireName: String, override val kind: String) : A
 }
 
 /**
+ * 뼈대(⑪-6a): 로그 글자 규칙 — 설정한 (서비스 · 글자)가 든 로그 줄. kind `log_pattern`.
+ * 구현에서 [AlertRule.entries] 에 더한다(보내기가 모르는 규칙으로 건너뛰지 않게 — 섞인 판에서 옛 판은 모르는 줄로 남긴다).
+ */
+enum class LogPatternRule(override val wireName: String, override val kind: String) : AlertRule {
+    PATTERN("log_pattern", "log_pattern"),
+}
+
+/**
  * 로그 알림을 만든다 — 보낼 표에 자원 알림과 같은 꼴([ResourceAlert])로 든다. 넘음 warning · 해소 info, 고유 키 = `<key>@<판정 시각 epoch 밀리초>`.
  * 글에 드는 것은 서비스 · 서버 이름 · 마지막으로 받은 시각 · 기준뿐이다 — 로그의 글은 인자로 받지 않는다(글 · 주소가 실릴 수 없는 꼴).
  * 서비스 · 서버 이름은 발신 쪽 · 설정의 글자라 숨은 문자를 '?' 로 바꿔 싣는다([visibleText]). key 는 120자 이하([boundedBaseKey]).
@@ -38,6 +46,18 @@ object LogAlerts {
         return alert(LogRule.SILENT_ALL, "log-all:silent", ALL_SERVERS, null, resolved, now, title,
             "전체 스트림 · ${received(lastReceivedAt)} · 기준 ${minutes(threshold)}")
     }
+
+    /** 관측 서버가 받는 요청 ID 의 꼴 — 그 밖이면 사건에 싣지 않는다 */
+    val REQUEST_ID = Regex("^[A-Za-z0-9_.-]{1,80}$")
+
+    /**
+     * 뼈대(⑪-6a): 글자 규칙 하나의 사건 — 고유 키 `log_pattern:<이름>@<now 밀리초>`, key `log_pattern:<이름>`, kind `log_pattern`, 세기 = 규칙의 세기, 서버 `*`,
+     * 규칙 [LogPatternRule.PATTERN], 대상 이름 = 규칙 이름, 만든 시각 [now].
+     * title `로그 글자 규칙 <이름> — <서비스>`(200자 안), detail `<count>줄 맞음 · 첫 줄 요청 ID <ID> · 시각 <ISO>` — 요청 ID 가 [REQUEST_ID] 밖이거나 없으면 `없음`,
+     * 시각이 없으면 `모름`. 로그의 내용도 규칙의 글자도 싣지 않는다. 본문은 구현 워커가 채운다.
+     */
+    fun pattern(pattern: xyz.junproject.observe.logalert.LogPattern, count: Long, firstRequestId: String?, firstAt: Instant?, now: Instant): ResourceAlert =
+        TODO("뼈대: 구현 워커가 채운다")
 
     private const val ALL_SERVERS = "*"
     private const val HASH_MARK = "~"

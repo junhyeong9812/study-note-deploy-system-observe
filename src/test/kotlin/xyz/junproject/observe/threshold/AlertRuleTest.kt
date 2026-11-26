@@ -11,9 +11,9 @@ import org.junit.jupiter.api.assertThrows
  */
 class AlertRuleTest {
     @Test
-    fun `이 판이 아는 규칙은 자원 규칙 여섯과 로그 규칙 둘이고 규칙 글자는 서로 다르다`() {
-        assertEquals(ResourceRule.entries + LogRule.entries, AlertRule.entries)
-        assertEquals(listOf("disk_warning", "disk_critical", "memory", "cpu", "restarts", "silent", "log_silent", "log_silent_all"),
+    fun `이 판이 아는 규칙은 자원 규칙 여섯과 로그 규칙 둘과 글자 규칙 하나이고 규칙 글자는 서로 다르다`() {
+        assertEquals(ResourceRule.entries + LogRule.entries + LogPatternRule.entries, AlertRule.entries)
+        assertEquals(listOf("disk_warning", "disk_critical", "memory", "cpu", "restarts", "silent", "log_silent", "log_silent_all", "log_pattern"),
             AlertRule.entries.map { it.wireName })
         assertEquals(AlertRule.entries.size, AlertRule.entries.map { it.wireName }.toSet().size, "규칙 글자가 겹친다")
     }

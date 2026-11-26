@@ -33,7 +33,8 @@ interface LogReceipts {
  * 그 트랜잭션의 조회(판정이 그 안에서 읽는 마지막 로그 포함)는 [readTimeout] 에서 끊긴다 — 상한은 그 트랜잭션에만 걸려(`set_config(…, true)`) 연결에 남지 않는다.
  * 마지막 로그는 로그 표의 `stream_ms`(Redis 가 받은 시각)에서 서비스 색인으로 읽는다.
  */
-class LogAlertStore(private val jdbc: JdbcTemplate, private val readTimeout: Duration = Duration.ofSeconds(2)) : LogRuleStateStore, LogReceipts {
+class LogAlertStore(private val jdbc: JdbcTemplate, private val readTimeout: Duration = Duration.ofSeconds(2)) : LogRuleStateStore, LogReceipts,
+    LogPatternStateStore, LogPatternLines {
     private val dataSource = requireNotNull(jdbc.dataSource) { "JdbcTemplate 에 DataSource 가 없다" }
     private val transaction = TransactionTemplate(DataSourceTransactionManager(dataSource))
     private val outbox = ThresholdStore(jdbc)
@@ -88,6 +89,15 @@ class LogAlertStore(private val jdbc: JdbcTemplate, private val readTimeout: Dur
             RoundOutcome(true, outbox.insertAlerts(result.events))
         }
     }
+
+    /**
+     * 뼈대(⑪-6a): 글자 규칙 판정 한 바퀴 — 무수신과 **다른** 권고 잠금을 기다리지 않고 시도해 얻은 자리만, 한 트랜잭션에서 상태 표(이름은 구현이 정한다 — `log_` 로 시작) ·
+     * 보낼 표([ThresholdStore.insertAlerts])를 쓴다. 표는 [createSchema] 가 함께 만든다. 본문은 구현 워커가 채운다
+     */
+    override fun judgePatternRound(now: Instant, judge: (previous: List<LogPatternState>) -> LogPatternJudgeResult): RoundOutcome = TODO("뼈대: 구현 워커가 채운다")
+
+    /** 뼈대(⑪-6a): 로그 표에서 이 서비스의 줄 가운데 `stream_ms` 가 `(after, until]` 이고 내용에 [text] 가 글자 그대로 든 줄(대소문자 구분 · 정규식 · LIKE 아님) — 본문은 구현 워커가 채운다 */
+    override fun matches(service: String, text: String, after: Instant, until: Instant): LogPatternMatches = TODO("뼈대: 구현 워커가 채운다")
 
     /** 서비스마다 마지막으로 받은 로그의 시각 — 이름이 정확히 같은 줄에서(서비스 색인의 첫 줄), 없으면 null */
     override fun lastReceived(services: Collection<String>): Map<String, Instant?> = services.associateWith { service ->

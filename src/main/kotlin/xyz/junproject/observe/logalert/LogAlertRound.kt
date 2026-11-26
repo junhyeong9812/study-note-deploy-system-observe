@@ -38,6 +38,11 @@ class LogAlertRound(
     private val store: LogRuleStateStore,
     private val receipts: LogReceipts,
     private val judge: LogSilentJudge,
+    /**
+     * 뼈대(⑪-6a): 글자 규칙 — 있으면 [judgeOnce] 가 무수신 판정과 **따로** 돌리고(무수신이 꺼져도 · 실패해도 돌고, 글자 규칙의 실패가 무수신을 막지 않는다)
+     * [health] 에 [LogPatternRound.health] 의 칸을 더한다(없으면 기존 칸 그대로). 지금은 쓰지 않는다 — 구현 워커가 잇는다
+     */
+    @Suppress("unused") private val patterns: LogPatternRound? = null,
     private val judging: (Instant) -> Boolean,
 ) {
     @Volatile var lastResult: LogAlertRoundResult? = null; private set
