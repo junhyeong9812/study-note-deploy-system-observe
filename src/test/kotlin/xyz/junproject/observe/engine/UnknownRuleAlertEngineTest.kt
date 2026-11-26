@@ -55,7 +55,7 @@ import kotlin.math.roundToLong
  * 같은 묶음의 아는 줄이 굶지 않는다(모르는 줄은 대상마다의 머리를 고르기 전에 SQL 에서 걸러진다) · 건수 세기가 실패해도 아는 줄은
  * 실제 표에서 전부 보내지고 지워진다(헬스는 "세지 못함" — null) · 건수 세기는 보내기 잠금을 쥐지 않는다(세는 동안 다른 연결이 보내기 잠금을 얻는다) ·
  * 건수 세기의 조회는 시간 상한(기본 2초, `ThresholdStore(countTimeout = …)`)에서 끊긴다 · 판정 한 바퀴가 모르는 줄을 지우지 않는다.
- * 모르는 규칙 글자: 다음 판의 `log_silent` · `log_silent_all`, 엉뚱한 글자, 빈 글자, 대소문자만 다른 글자(`MEMORY` — 글자는 그대로 맞춰 본다).
+ * 모르는 규칙 글자: 이 판이 아직 모르는 다음 규칙의 글자(`log_errors` · `log_errors_all` — `log_silent` · `log_silent_all` 은 02b 부터 아는 글자다), 엉뚱한 글자, 빈 글자, 대소문자만 다른 글자(`MEMORY` — 글자는 그대로 맞춰 본다).
  * 모르는 줄은 새 판이 쓸 꼴을 흉내 내 SQL 로 직접 넣는다. 표는 전용 스키마(`unknown_rule`).
  */
 @Tag("engine")
@@ -73,7 +73,7 @@ class UnknownRuleAlertEngineTest {
     private val metricStore = MetricStore(jdbc, jdbc, jdbc)
     private val now = Instant.parse("2026-11-25T03:00:00Z")
     private val sequence = AtomicInteger()
-    private val unknownRules = listOf("log_silent", "log_silent_all", "zzz-엉뚱한-글자", "", "MEMORY")
+    private val unknownRules = listOf("log_errors", "log_errors_all", "zzz-엉뚱한-글자", "", "MEMORY")
 
     private val appender = ListAppender<ILoggingEvent>().also { it.start(); (LoggerFactory.getLogger("observe") as Logger).addAppender(it) }
 
@@ -111,7 +111,7 @@ class UnknownRuleAlertEngineTest {
         jdbc.update(
             """INSERT INTO resource_alert_outbox (event_id, alert_key, kind, severity, title, detail, server, rule, target_name, created_ms)
                VALUES (?,?,?,?,?,?,?,?,?,?)""",
-            eventId, "log:$server:$rule:${targetName ?: ""}", "log_silent", "warning", "$server $targetName 로그 끊김", "자세히", server, rule, targetName,
+            eventId, "log:$server:$rule:${targetName ?: ""}", "log_errors", "warning", "$server $targetName 로그 끊김", "자세히", server, rule, targetName,
             createdAt.toEpochMilli(),
         )
     }
@@ -200,7 +200,7 @@ class UnknownRuleAlertEngineTest {
 
     @Test
     fun `건너뛴 모르는 줄의 수가 규칙 글자마다 보낼 표의 건수에 드러나고 보내기 뒤에도 그대로다`() {
-        val counts = mapOf("log_silent" to 3L, "log_silent_all" to 1L, "" to 1L, "zzz-엉뚱한-글자" to 2L)
+        val counts = mapOf("log_errors" to 3L, "log_errors_all" to 1L, "" to 1L, "zzz-엉뚱한-글자" to 2L)
         var offset = 0L
         for ((rule, count) in counts) repeat(count.toInt()) { insertUnknown("unknown-$rule-$it", rule, at(offset++), targetName = "svc-$it") }
         enqueueKnown(listOf(known("memory-1", "ci-agent-158", at(100)), known("cpu-1", "ci-agent-164", at(110), ResourceRule.CPU)))
@@ -238,8 +238,8 @@ class UnknownRuleAlertEngineTest {
         assertTrue(before.containsKey("skipped_unknown_rule_alerts"), "헬스에 skipped_unknown_rule_alerts 칸이 없다: $before")
         assertNull(before["skipped_unknown_rule_alerts"], "아직 세지 않았는데 수가 나왔다")
 
-        repeat(4) { insertUnknown("silent-$it", "log_silent", at(it.toLong()), targetName = "svc-$it") }
-        repeat(2) { insertUnknown("silent-all-$it", "log_silent_all", at(10L + it), targetName = null) }
+        repeat(4) { insertUnknown("silent-$it", "log_errors", at(it.toLong()), targetName = "svc-$it") }
+        repeat(2) { insertUnknown("silent-all-$it", "log_errors_all", at(10L + it), targetName = null) }
         insertUnknown("odd-0", "zzz-엉뚱한-글자", at(20))
         enqueueKnown(listOf(known("memory-1", "ci-agent-158", at(30))))
         round.dispatchOnce(now.plusSeconds(1))
@@ -255,7 +255,7 @@ class UnknownRuleAlertEngineTest {
         val warnings = unknownRuleWarnings()
         assertEquals(2, warnings.size, "보내기 한 바퀴에 WARN 한 줄이 아니다: ${appender.list.map { "${it.level} ${it.formattedMessage}" }}")
         for (warning in warnings) {
-            for (part in listOf("log_silent=4", "log_silent_all=2", "zzz-엉뚱한-글자=1", "total 7")) {
+            for (part in listOf("log_errors=4", "log_errors_all=2", "zzz-엉뚱한-글자=1", "total 7")) {
                 assertTrue(warning.formattedMessage.contains(part), "WARN 에 '$part' 가 없다: ${warning.formattedMessage}")
             }
         }
@@ -268,11 +268,11 @@ class UnknownRuleAlertEngineTest {
         // 한 대상에 2000건, 500 대상에 2건씩 — 모두 아는 줄보다 오래됐다
         jdbc.update(
             """INSERT INTO resource_alert_outbox (event_id, alert_key, kind, severity, title, detail, server, rule, target_name, created_ms)
-               SELECT 'bulk-one-' || n, 'log:ci-agent-158:log_silent:backend', 'log_silent', 'warning', 't', 'd', 'ci-agent-158', 'log_silent', 'backend', ? + n
+               SELECT 'bulk-one-' || n, 'log:ci-agent-158:log_errors:backend', 'log_errors', 'warning', 't', 'd', 'ci-agent-158', 'log_errors', 'backend', ? + n
                FROM generate_series(1, 2000) AS n""", now.toEpochMilli())
         jdbc.update(
             """INSERT INTO resource_alert_outbox (event_id, alert_key, kind, severity, title, detail, server, rule, target_name, created_ms)
-               SELECT 'bulk-many-' || n, 'log:ci-agent-164:log_silent:svc-' || (n % 500), 'log_silent', 'warning', 't', 'd', 'ci-agent-164', 'log_silent',
+               SELECT 'bulk-many-' || n, 'log:ci-agent-164:log_errors:svc-' || (n % 500), 'log_errors', 'warning', 't', 'd', 'ci-agent-164', 'log_errors',
                       'svc-' || (n % 500), ? + n
                FROM generate_series(1, 1000) AS n""", now.toEpochMilli())
         val knownAlerts = (1..12).map { known("known-$it", "server-$it", at(10_000L + it)) }
@@ -281,14 +281,14 @@ class UnknownRuleAlertEngineTest {
         val outcome = AlertDispatcher(store, sender).dispatch(now.plusSeconds(20))
         assertEquals(knownAlerts.map { it.eventId }, sender.sent, "모르는 줄 뒤에서 아는 줄이 굶었다")
         assertEquals(listOf(true, 12, 0, 0), listOf(outcome.lockAcquired, outcome.delivered, outcome.retrying, outcome.rejected))
-        assertEquals(AlertCounts(3000, 0, mapOf("log_silent" to 3000L)), store.alertCounts())
+        assertEquals(AlertCounts(3000, 0, mapOf("log_errors" to 3000L)), store.alertCounts())
         assertEquals(3000, unknownRows().size)
     }
 
     @Test
     fun `모르는 줄은 한 바퀴의 건수와 대상의 차례를 먹지 않는다`() {
         // 모르는 대상 다섯의 머리가 아는 대상들보다 오래됐다 — 차례에 끼면 묶음 크기 3 을 먼저 먹는다
-        (1..5).forEach { insertUnknown("unknown-$it", "log_silent", at(it.toLong()), server = "server-$it", targetName = "svc-$it") }
+        (1..5).forEach { insertUnknown("unknown-$it", "log_errors", at(it.toLong()), server = "server-$it", targetName = "svc-$it") }
         enqueueKnown(listOf(known("a-1", "server-a", at(100)), known("b-1", "server-b", at(110)), known("c-1", "server-c", at(120))))
         val sender = RecordingSender()
         assertEquals(3, AlertDispatcher(store, sender, batchSize = 3, clock = { now.plusSeconds(1) }).dispatch(now.plusSeconds(1)).delivered)
@@ -309,7 +309,7 @@ class UnknownRuleAlertEngineTest {
         // 아는 디스크 규칙의 묶음 이름과 같은 글자 — 대상(서버 · 묶음 · 대상 이름)이 아는 디스크 줄과 같아진다
         jdbc.update(
             """INSERT INTO resource_alert_outbox (event_id, alert_key, kind, severity, title, detail, server, rule, target_name, created_ms)
-               SELECT 'disk-named-' || n, 'log:ci-agent-158:disk', 'log_silent', 'warning', 't', 'd', 'ci-agent-158', 'disk', NULL, ? + n
+               SELECT 'disk-named-' || n, 'log:ci-agent-158:disk', 'log_errors', 'warning', 't', 'd', 'ci-agent-158', 'disk', NULL, ? + n
                FROM generate_series(1, 120) AS n""", now.toEpochMilli())
         enqueueKnown(listOf(known("disk-warning-1", "ci-agent-158", at(10_000), ResourceRule.DISK_WARNING)))
 
@@ -425,7 +425,7 @@ class UnknownRuleAlertEngineTest {
 
     @Test
     fun `건수 세기의 조회는 주입한 시간 상한에서 끊겨 그 바퀴는 세지 못함으로 끝난다`() {
-        insertUnknown("unknown-0", "log_silent", at(0))
+        insertUnknown("unknown-0", "log_errors", at(0))
         enqueueKnown(listOf(known("memory-1", "ci-agent-158", at(10))))
         val (elapsed, round) = dispatchWithCountingStuck(ThresholdStore(jdbc, countTimeout = Duration.ofSeconds(1)))
         assertTrue(elapsed >= Duration.ofMillis(800), "세기가 상한보다 일찍 끝났다 — 잠금을 기다리지 않았다(${elapsed.toMillis()}ms)")
@@ -435,7 +435,7 @@ class UnknownRuleAlertEngineTest {
 
     @Test
     fun `건수 세기의 조회는 기본 2초 상한에서 끊긴다`() {
-        insertUnknown("unknown-0", "log_silent", at(0))
+        insertUnknown("unknown-0", "log_errors", at(0))
         enqueueKnown(listOf(known("memory-1", "ci-agent-158", at(10))))
         val (elapsed, round) = dispatchWithCountingStuck(ThresholdStore(jdbc))
         assertTrue(elapsed >= Duration.ofMillis(1_500), "기본 상한이 2초보다 짧다(${elapsed.toMillis()}ms)")
@@ -459,13 +459,13 @@ class UnknownRuleAlertEngineTest {
 
     @Test
     fun `건수 세기가 끝난 뒤 그 풀의 어느 연결에도 세기의 시간 상한이 남지 않는다`() {
-        insertUnknown("unknown-0", "log_silent", at(0))
+        insertUnknown("unknown-0", "log_errors", at(0))
         enqueueKnown(listOf(known("memory-1", "ci-agent-158", at(10))))
         pool(countPoolSize).use { countPool ->
             val counting = ThresholdStore(JdbcTemplate(countPool), countTimeout = Duration.ofSeconds(1)).also { it.prepareSchema() }
             val before = statementTimeoutsOfEveryConnection(countPool)
             assertEquals(countPoolSize, before.size)
-            repeat(countPoolSize * 2) { assertEquals(AlertCounts(2, 0, mapOf("log_silent" to 1L)), counting.alertCounts()) }
+            repeat(countPoolSize * 2) { assertEquals(AlertCounts(2, 0, mapOf("log_errors" to 1L)), counting.alertCounts()) }
             assertEquals(before, statementTimeoutsOfEveryConnection(countPool), "세기의 시간 상한이 풀의 연결에 남았다(같은 풀의 다른 문장도 끊긴다)")
             // 남은 상한이 실제로 다른 문장을 끊지 않는다 — 상한(1초)보다 오래 걸리는 문장이 같은 풀에서 끝난다
             assertDoesNotThrow { JdbcTemplate(countPool).execute("SELECT pg_sleep(1.5)") }
@@ -474,7 +474,7 @@ class UnknownRuleAlertEngineTest {
 
     @Test
     fun `건수 세기가 시간 상한에서 끊긴 뒤에도 그 풀의 어느 연결에도 세기의 시간 상한이 남지 않는다`() {
-        insertUnknown("unknown-0", "log_silent", at(0))
+        insertUnknown("unknown-0", "log_errors", at(0))
         pool(countPoolSize).use { countPool ->
             val counting = ThresholdStore(JdbcTemplate(countPool), countTimeout = Duration.ofSeconds(1)).also { it.prepareSchema() }
             val before = statementTimeoutsOfEveryConnection(countPool)
