@@ -26,6 +26,7 @@ import java.util.concurrent.Executors
  * 밀린 건수(lag)와 30일 삭제·로그인 시도 90일 삭제 결과는 본문에만 낸다 — 밀림은 장애가 아니라 진행 상황이고, 삭제 실패는 수집과 무관하다.
  * 실패 사유는 예외 종류 이름만 낸다(헬스는 인증이 없다). 문구는 서버 로그에만.
  * [metrics] 가 있으면 본문에 `metrics` 객체([MetricHealth.report])를 더한다 — 지표 쪽이 어떻게 실패해도 위 `status` 와 HTTP 상태는 바뀌지 않는다.
+ * [logAlerts] 가 있으면 본문에 `log_alerts` 객체([LogAlertRound.health])를 더한다 — 로그 무수신 판정의 실패도 `status` 와 HTTP 상태를 바꾸지 않는다.
  */
 class CollectorHealth(
     private val collector: LogCollector,
@@ -37,7 +38,7 @@ class CollectorHealth(
     private val stallAfter: Duration = Duration.ofSeconds(60),
     private val startedAt: Instant = Instant.now(),
     private val metrics: MetricHealth? = null,                          // 지표 수집의 칸 — 본문에만, 판정에 넣지 않는다
-    private val logAlerts: LogAlertRound? = null,                       // 로그 무수신 판정의 칸 — 뼈대(03): 아직 싣지 않는다
+    private val logAlerts: LogAlertRound? = null,                       // 로그 무수신 판정의 칸(`log_alerts`) — 본문에만, 판정에 넣지 않는다
 ) {
     data class Report(val healthy: Boolean, val body: Map<String, Any>)
 
@@ -85,7 +86,11 @@ class CollectorHealth(
             log.error("observe:observe:metric health failed: {}: {}", cause.javaClass.simpleName, cause.message?.take(200))
             mapOf("status" to "failing", "failure" to "health ${cause.javaClass.simpleName}")
         })
-        return Report(status == "ok", withMetrics)
+        // 로그 무수신 판정의 칸 — 바퀴가 남긴 값만 읽는다(DB 를 읽지 않는다). 판정의 어떤 실패도 위 status 와 HTTP 상태에 닿지 않는다
+        val withLogAlerts = logAlerts?.let { round ->
+            withMetrics + ("log_alerts" to runCatching { round.health(now) }.getOrElse { mapOf("last_failure" to "health ${it.javaClass.simpleName}") })
+        } ?: withMetrics
+        return Report(status == "ok", withLogAlerts)
     }
 
     private fun isTableMissing(error: Throwable) =

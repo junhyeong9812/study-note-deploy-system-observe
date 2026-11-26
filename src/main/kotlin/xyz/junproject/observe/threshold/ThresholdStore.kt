@@ -198,20 +198,26 @@ class ThresholdStore(
                 statement.setNullable(8, state.lastValue, Types.DOUBLE)
             }
             failpoint("states_written")
-            val inserted = if (result.events.isEmpty()) 0 else jdbc.batchUpdate(
-                """INSERT INTO resource_alert_outbox (event_id, alert_key, kind, severity, title, detail, server, rule, target_name, created_ms)
-                   VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT (event_id) DO NOTHING""",
-                result.events, result.events.size,
-            ) { statement, alert ->
-                statement.setString(1, alert.eventId); statement.setString(2, alert.key); statement.setString(3, alert.kind)
-                statement.setString(4, alert.severity.wireName); statement.setString(5, alert.title); statement.setString(6, alert.detail)
-                statement.setString(7, alert.server); statement.setString(8, alert.rule.wireName); statement.setNullable(9, alert.targetName, Types.VARCHAR)
-                statement.setLong(10, alert.createdAt.toEpochMilli())
-            }.flatMap { it.asList() }.count { it > 0 || it == java.sql.Statement.SUCCESS_NO_INFO }
+            val inserted = insertAlerts(result.events)
             failpoint("events_written")
             RoundOutcome(true, inserted)
         }!!
     }
+
+    /**
+     * 보낼 알림을 보낼 표에 넣는다 — 같은 [ResourceAlert.eventId] 는 한 건만 남는다(같은 판정의 되풀이). 넣은 건수를 돌려준다.
+     * 부르는 쪽의 트랜잭션 안에서 돈다(판정 한 바퀴의 상태와 함께 커밋 · 되돌림 — 자원 판정과 로그 무수신 판정이 같이 쓴다)
+     */
+    internal fun insertAlerts(events: List<ResourceAlert>): Int = if (events.isEmpty()) 0 else jdbc.batchUpdate(
+        """INSERT INTO resource_alert_outbox (event_id, alert_key, kind, severity, title, detail, server, rule, target_name, created_ms)
+           VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT (event_id) DO NOTHING""",
+        events, events.size,
+    ) { statement, alert ->
+        statement.setString(1, alert.eventId); statement.setString(2, alert.key); statement.setString(3, alert.kind)
+        statement.setString(4, alert.severity.wireName); statement.setString(5, alert.title); statement.setString(6, alert.detail)
+        statement.setString(7, alert.server); statement.setString(8, alert.rule.wireName); statement.setNullable(9, alert.targetName, Types.VARCHAR)
+        statement.setLong(10, alert.createdAt.toEpochMilli())
+    }.flatMap { it.asList() }.count { it > 0 || it == java.sql.Statement.SUCCESS_NO_INFO }
 
     override fun pendingAlerts(limit: Int): List<QueuedAlert> {
         ensureSchema()

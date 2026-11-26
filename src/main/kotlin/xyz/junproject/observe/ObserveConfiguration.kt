@@ -37,6 +37,11 @@ import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler
 import java.time.Instant
 import java.util.concurrent.CopyOnWriteArrayList
 import xyz.junproject.observe.threshold.SilentGate
+import xyz.junproject.observe.logalert.LogAlertRound
+import xyz.junproject.observe.logalert.LogAlertSettings
+import xyz.junproject.observe.logalert.LogAlertStore
+import xyz.junproject.observe.logalert.LogJudgingGate
+import xyz.junproject.observe.logalert.LogSilentJudge
 
 /** 조립 — 연결 정보는 환경변수에서. DB 비밀번호 같은 값은 로그에 내지 않는다. */
 @Configuration
@@ -288,7 +293,60 @@ class ObserveConfiguration {
     fun logCollector(source: RedisLogStreamSource, store: LogStore) = LogCollector(source, store)
 
     @Bean
-    fun collectorHealth(collector: LogCollector, source: RedisLogStreamSource, store: LogStore, schedule: ObserveSchedule, metricHealth: MetricHealth) =
+    fun collectorHealth(collector: LogCollector, source: RedisLogStreamSource, store: LogStore, schedule: ObserveSchedule, metricHealth: MetricHealth,
+                        logAlertRound: LogAlertRound) =
         CollectorHealth(collector, { source.unacknowledgedCount() }, { source.lag() }, { store.latestStoredAt() }, { schedule.lastRetention },
-            lastAuthRetention = { schedule.lastAuthRetention }, metrics = metricHealth)
+            lastAuthRetention = { schedule.lastAuthRetention }, metrics = metricHealth, logAlerts = logAlertRound)
+
+    /**
+     * 로그 무수신 감시의 설정(`LOG_ALERT_SERVICES` · `LOG_ALERT_ALL_THRESHOLD_MINUTES`) — 감시하는 것 · 받아들이지 않은 줄(다듬은 글자와 까닭)을 기동 로그에.
+     * 둘 다 비면 판정이 꺼진다
+     */
+    @Bean
+    fun logAlertSettings(
+        @Value("\${observe.log-alerts.services:}") services: String,
+        @Value("\${observe.log-alerts.all-threshold-minutes:}") allThresholdMinutes: String,
+    ): LogAlertSettings = LogAlertSettings.parse(services, allThresholdMinutes).also { settings ->
+        for (line in settings.startupLines()) {
+            if (line.contains("not watching")) log.warn("observe:observe:{}", line) else log.info("observe:observe:{}", line)
+        }
+    }
+
+    /** 로그 무수신 판정의 상태 표 — 판정 · 알림 풀([thresholdJdbc])을 함께 쓴다(새 풀을 만들지 않는다) */
+    @Bean
+    fun logAlertStore(
+        @Value("\${observe.db.url}") url: String,
+        @Value("\${observe.db.user}") user: String,
+        @Value("\${observe.db.password}") password: String,
+    ) = LogAlertStore(thresholdJdbc(url, user, password))
+
+    /**
+     * 로그 무수신 판정 — 판정은 이 프로세스가 뜬 지 warm-up(`observe.log-alerts.warm-up`, 기본 3분)이 지나고 로그 수집이 한 번 따라잡은 뒤부터
+     * (따라잡지 못해도 15분 뒤), 로그 수집이 실패 중이거나 멈춘 동안은 보류한다. 말이 안 되는 값이면 뜰 때 실패한다
+     */
+    @Bean
+    fun logAlertRound(settings: LogAlertSettings, store: LogAlertStore, collector: LogCollector,
+                      @Value("\${observe.log-alerts.warm-up:3m}") warmUpText: String): LogAlertRound {
+        val warmUp = DurationStyle.detectAndParse(warmUpText.trim())
+        require(!warmUp.isNegative && !warmUp.isZero) { "observe.log-alerts.warm-up 은 0 보다 길어야 한다" }
+        require(warmUp <= LOG_JUDGE_GIVE_UP_AFTER) { "observe.log-alerts.warm-up 은 15분보다 길 수 없다" }
+        val gate = LogJudgingGate(SilentGate(Instant.now(), { collector.caughtUpAt }, warmUp, LOG_JUDGE_GIVE_UP_AFTER), { collector.lastFailure }, { collector.lastLoopAt })
+        return LogAlertRound(settings, store, store, LogSilentJudge(settings)) { gate.active(it) }
+    }
+
+    /** 뜬 직후 로그 무수신 판정의 표를 미리 만든다(감시가 켜져 있을 때만 · 최선 노력 — 실패해도 첫 바퀴가 다시 만든다) */
+    @EventListener(ApplicationReadyEvent::class)
+    fun prepareLogAlertSchema(event: ApplicationReadyEvent) {
+        if (!event.applicationContext.getBean(LogAlertSettings::class.java).enabled) return
+        try {
+            event.applicationContext.getBean(LogAlertStore::class.java).prepareSchema()
+        } catch (error: Exception) {
+            log.error("observe:observe:log alert schema failed — will retry on first use: {}", error.javaClass.simpleName)
+        }
+    }
+
+    private companion object {
+        /** 로그 수집이 따라잡지 못해도 뜬 지 이만큼 지나면 무수신을 판정한다(자원 끊김의 기본과 같다) */
+        val LOG_JUDGE_GIVE_UP_AFTER: Duration = Duration.ofMinutes(15)
+    }
 }

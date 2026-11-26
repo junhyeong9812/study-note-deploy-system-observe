@@ -228,8 +228,14 @@ class ObserveSchedule(
     /** [now] 로 보내기 한 바퀴([ThresholdRound.dispatchOnce]) — 예외를 내지 않는다. [thresholdRound] 가 없으면 null */
     internal fun dispatchAlerts(now: Instant): DispatchOutcome? = thresholdRound?.dispatchOnce(now)
 
-    /** [now] 로 로그 무수신 판정 한 바퀴 — 뼈대(03): 아직 부르지 않는다 */
-    internal fun judgeLogAlerts(now: Instant): LogAlertRoundResult? = null
+    /** 로그 무수신 판정 — 자원 판정과 같은 주기(`observe.metrics.judge-interval-ms`), 지금 시각으로 [judgeLogAlerts] */
+    @Scheduled(fixedDelayString = "\${observe.metrics.judge-interval-ms:30000}")
+    fun judgeLogAlerts() {
+        judgeLogAlerts(Instant.now())
+    }
+
+    /** [now] 로 로그 무수신 판정 한 바퀴([LogAlertRound.judgeOnce]) — 예외를 내지 않는다. [logAlertRound] 가 없으면 null */
+    internal fun judgeLogAlerts(now: Instant): LogAlertRoundResult? = logAlertRound?.judgeOnce(now)
 
     companion object {
         val RETENTION: Duration = Duration.ofDays(30)
