@@ -90,7 +90,8 @@ interface LogPatternStateStore {
 /**
  * 글자 규칙의 판정 — 규칙마다 따로: 이번에 볼 줄은 시각이 `(max(앞에서 본 곳, now − [freshness]), now − [settle]]`(받은 때보다 [freshness] 넘게 오래된 줄 —
  * 다시 뜬 뒤의 밀린 묶음 — 은 보지 않는다). 맞은 줄은 쌓아 두고, 마지막 알림에서 [window] 가 지났으면(같으면 지난 것 · 알린 적 없으면 바로) 쌓인 것을 한 건으로 알린다 —
- * 맞춤이 그친 뒤에도 창이 지나면 다음 판정이 쌓인 수를 낸다. 자기 설정에 없는 앞 상태는 그대로 돌려준다
+ * 맞춤이 그친 뒤에도 창이 지나면 다음 판정이 쌓인 수를 낸다. 앞에서 본 곳이 `now − [freshness]` 보다 엄격히 앞인 상태의 쌓인 수 · 첫 줄은 버린다(마지막 알림은 남긴다).
+ * 자기 설정에 없는 앞 상태는 그대로 돌려준다
  */
 class LogPatternJudge(
     private val settings: LogPatternSettings,
@@ -107,9 +108,12 @@ class LogPatternJudge(
             val before = byName[pattern.name]
             val after = listOfNotNull(before?.checkedUntil, now.minus(freshness)).max()
             val found = if (after.isBefore(until)) lines.matches(pattern.service, pattern.text, after, until) else LogPatternMatches(0, null, null)
-            val count = (before?.pendingCount ?: 0) + found.count
-            val firstRequestId = if ((before?.pendingCount ?: 0) > 0) before?.pendingFirstRequestId else found.firstRequestId
-            val firstAt = if ((before?.pendingCount ?: 0) > 0) before?.pendingFirstAt else found.firstAt
+            // 앞에서 본 곳이 freshness 보다 엄격히 오래되면(판정이 멈췄거나 규칙을 뺐다 다시 넣음) 그 쌓인 수와 첫 줄은 버린다 — 오래된 맞춤으로 알리지 않게.
+            // 마지막 알림은 남긴다(10분 창의 간격)
+            val carriedCount = before?.takeUnless { it.checkedUntil.isBefore(now.minus(freshness)) }?.pendingCount ?: 0
+            val count = carriedCount + found.count
+            val firstRequestId = if (carriedCount > 0) before?.pendingFirstRequestId else found.firstRequestId
+            val firstAt = if (carriedCount > 0) before?.pendingFirstAt else found.firstAt
             val checkedUntil = maxOf(after, until)
             val lastNotified = before?.lastNotifiedAt
             if (count > 0 && (lastNotified == null || Duration.between(lastNotified, now) >= window)) {
