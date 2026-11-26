@@ -153,15 +153,19 @@ internal const val RESOLVED_SUFFIX = ":resolved"
 /** 알림 서버가 key 를 자르는 길이 */
 private const val MAX_ALERT_KEY = 120
 
+/** 글의 UTF-8 SHA-256 앞 12자(소문자 16진) — key 를 가르는 꼬리 */
+internal fun shortHash(text: String): String =
+    MessageDigest.getInstance("SHA-256").digest(text.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }.take(12)
+
 /**
  * 넘음 key 를 뒤에 [RESOLVED_SUFFIX] 가 붙어도 120자를 넘지 않게 — 길면 앞부분과 전체의 해시로 줄인다(같은 [full] 은 늘 같은 key,
- * 다른 [full] 은 해시가 갈라 다른 key)
+ * 다른 [full] 은 해시가 갈라 다른 key). 앞부분을 자르는 길은 [prefix](기본은 UTF-16 단위의 `take` — 자원 알림의 key 는 이 꼴 그대로)
  */
-internal fun boundedBaseKey(full: String): String {
+internal fun boundedBaseKey(full: String, prefix: (String, Int) -> String = { text, length -> text.take(length) }): String {
     val maxBaseKey = MAX_ALERT_KEY - RESOLVED_SUFFIX.length
     if (full.length <= maxBaseKey) return full
-    val digest = MessageDigest.getInstance("SHA-256").digest(full.toByteArray()).joinToString("") { "%02x".format(it) }.take(12)
-    return full.take(maxBaseKey - digest.length - 1) + "~" + digest
+    val digest = shortHash(full)
+    return prefix(full, maxBaseKey - digest.length - 1) + "~" + digest
 }
 
 /**
