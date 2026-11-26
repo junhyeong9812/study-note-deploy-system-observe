@@ -21,7 +21,8 @@ import java.time.Instant
  * | 넘음(알리지 않음) | 받음 | — | 없음(알린 적 없는 넘음은 해소를 알리지 않는다) | 넘지 않음 |
  * | 아무것 | 보류(판정하지 않음) | — | 없음(새로 울리지도 · 해소하지도 · 다시 알리지도 않는다) | 앞 상태 그대로 |
  *
- * 전체 한 줄은 서버 끊김과 무관하다. 설정에서 빠진 서비스 · 전체 한 줄을 끄면 그 상태는 사라진다. 다시 알림의 글: title 앞에 `(계속) `, detail 뒤에 `\n처음 넘은 시각: <since>`.
+ * 전체 한 줄은 서버 끊김과 무관하다. 자기 설정에 없는 서비스 · 꺼진 전체 한 줄의 상태는 손대지 않고 그대로 돌려준다(다른 자리의 설정일 수 있다 — §16-2) —
+ * 다시 설정에 넣으면 그 앞 상태에서 이어 간다. 다시 알림의 글: title 앞에 `(계속) `, detail 뒤에 `\n처음 넘은 시각: <since>`.
  * 넘음 · 해소의 몸은 [LogAlerts] 그대로(고유 키 = key@판정 시각).
  */
 class LogSilentJudgeTest {
@@ -147,11 +148,31 @@ class LogSilentJudgeTest {
     }
 
     @Test
-    fun `설정에서 빠진 서비스와 꺼진 전체 한 줄의 상태는 사라지고 서비스 · 규칙마다 상태는 하나다`() {
+    fun `자기 설정에 없는 서비스와 꺼진 전체 한 줄의 상태는 손대지 않고 그대로 돌려주며 알리지 않는다`() {
         val onlyBackend = LogSilentJudge(LogAlertSettings(listOf(WatchedService("backend", "ci-agent-158", backendThreshold)), null, emptyList()))
-        val previous = listOf(quiet("backend"), firing("gone"), LogRuleState(LogSilentJudge.ALL_SERVICES, LogRule.SILENT_ALL, true, now, now, null))
+        val gone = firing("gone", notified = now.minus(Duration.ofHours(5)))
+        val all = LogRuleState(LogSilentJudge.ALL_SERVICES, LogRule.SILENT_ALL, true, now.minus(Duration.ofHours(2)), now.minus(Duration.ofHours(2)), null)
+        val previous = listOf(quiet("backend"), gone, all)
         val result = onlyBackend.judge(LogJudgeInput(now, mapOf("backend" to now), now, true, emptySet()), previous)
-        assertEquals(listOf("backend" to LogRule.SILENT), result.states.map { it.service to it.rule })
-        assertEquals(emptyList<Any>(), result.events, "빠진 서비스 · 꺼진 줄의 해소를 알렸다")
+        assertEquals(emptyList<Any>(), result.events, "설정에 없는 서비스 · 꺼진 줄을 알렸다(다시 알림 · 해소)")
+        assertTrue(result.states.contains(gone), "설정에 없는 서비스의 상태를 지웠거나 바꿨다: ${result.states}")
+        assertTrue(result.states.contains(all), "꺼진 전체 한 줄의 상태를 지웠거나 바꿨다: ${result.states}")
+        assertEquals(3, result.states.size, "서비스 · 규칙마다 상태가 하나가 아니다: ${result.states}")
+        assertEquals(1, result.states.count { it.service == "backend" })
+    }
+
+    @Test
+    fun `다시 설정에 넣은 서비스는 앞 상태에서 이어 가 받고 있으면 해소 한 번 · 여전히 조용하면 다시 알림의 규칙대로다`() {
+        val announced = firing("backend", since = now.minus(Duration.ofHours(3)), notified = now.minus(Duration.ofHours(2)))
+        val back = now.minusSeconds(10)
+        val resolved = judge.judge(input(backend = back), listOf(announced))
+        assertEquals(listOf(LogAlerts.silent("backend", "ci-agent-158", back, backendThreshold, now, resolved = true)), resolved.events)
+
+        val stillQuiet = judge.judge(input(backend = null), listOf(announced))
+        val base = LogAlerts.silent("backend", "ci-agent-158", null, backendThreshold, now, resolved = false)
+        assertEquals(listOf(base.copy(title = "(계속) ${base.title}", detail = "${base.detail}\n처음 넘은 시각: ${announced.since}")), stillQuiet.events,
+            "앞 상태(알린 넘음 · 2시간 전)에서 이어 가지 않았다")
+        val recent = firing("backend", since = now.minus(Duration.ofHours(3)), notified = now.minusSeconds(600))
+        assertEquals(emptyList<Any>(), judge.judge(input(backend = null), listOf(recent)).events, "앞 상태의 알림 시각을 무시하고 다시 알렸다")
     }
 }

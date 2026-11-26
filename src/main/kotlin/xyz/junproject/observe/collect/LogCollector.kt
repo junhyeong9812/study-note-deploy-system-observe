@@ -50,6 +50,8 @@ class LogCollector(
     @Volatile var storedTotal: Long = 0; private set
     /** 뜬 뒤 처음으로 따라잡은 시각(새 항목을 읽었는데 하나도 없던 첫 바퀴가 끝난 시각) — 그 뒤로 바뀌지 않는다(로그 무수신 판정의 시작 조건) */
     @Volatile var caughtUpAt: Instant? = null; private set
+    /** 마지막으로 성공한 바퀴가 따라잡은 바퀴였는가(새로 읽은 수가 한 바퀴의 상한보다 적었다 — 빈 읽기 포함). 뼈대(§16): 아직 채우지 않는다 */
+    @Volatile var lastRoundCaughtUp: Boolean = false; private set
 
     /** 한 바퀴. 처리한(저장하고 확인한) 항목 수를 돌려준다. 실패하면 예외 없이 0 을 돌려주고 이유를 남긴다. */
     fun runOnce(): Int {

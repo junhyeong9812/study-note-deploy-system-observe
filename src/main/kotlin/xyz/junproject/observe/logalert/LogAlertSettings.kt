@@ -14,7 +14,9 @@ data class SettingsProblem(val entry: String, val reason: String)
  * 로그 무수신 감시의 설정(⑨ 03) — `LOG_ALERT_SERVICES`(`<서비스>@<사는 서버>=<기준(분)>` 을 쉼표로) · `LOG_ALERT_ALL_THRESHOLD_MINUTES`.
  * [allThreshold] 는 전체 한 줄의 기준(없으면 그 줄은 감시하지 않는다), [problems] 는 받아들이지 않은 줄(줄의 차례대로).
  */
-data class LogAlertSettings(val services: List<WatchedService>, val allThreshold: Duration?, val problems: List<SettingsProblem>) {
+data class LogAlertSettings(val services: List<WatchedService>, val allThreshold: Duration?, val problems: List<SettingsProblem>,
+                            /** §16: 받아들였지만 알려 둘 줄(사는 서버가 기대 서버 목록에 없음 등). 뼈대: 아직 채우지 않는다 */
+                            val warnings: List<SettingsProblem> = emptyList()) {
     /** 감시하는 것이 하나라도 있는가 — 없으면 판정이 꺼진다 */
     val enabled: Boolean get() = services.isNotEmpty() || allThreshold != null
 
@@ -33,7 +35,7 @@ data class LogAlertSettings(val services: List<WatchedService>, val allThreshold
          * 설정의 글자를 읽는다 — 줄은 쉼표로(앞뒤 공백 · 빈 줄은 무시). 받아들이지 않은 줄은 그 줄만 빠지고 까닭 하나가 남는다
          * (이름 → 서버 → 기준의 차례로 첫 까닭). 같은 서비스 이름이 두 번 나오면 그 이름의 줄은 모두 빠진다(상태의 열쇠가 서비스라서).
          */
-        fun parse(services: String, allThresholdMinutes: String): LogAlertSettings {
+        fun parse(services: String, allThresholdMinutes: String, expectedServers: Set<String> = emptySet()): LogAlertSettings {
             val entries = services.split(',').map { it.trim() }.filter { it.isNotEmpty() }.map { Entry.of(it) }
             val nameCounts = entries.groupingBy { it.name }.eachCount()
             val watched = mutableListOf<WatchedService>()

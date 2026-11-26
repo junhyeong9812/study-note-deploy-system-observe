@@ -182,6 +182,27 @@ class LogAlertStoreEngineTest {
     }
 
     @Test
+    fun `설정이 다른 두 자리가 번갈아 판정해도 서로의 상태를 지우지 않아 한 서비스의 넘음 알림은 한 번이다`() {
+        prepareLogTable()
+        val both = LogAlertSettings(listOf(WatchedService("svc", "ci-agent-158", Duration.ofMinutes(30)), WatchedService("other", "ci-agent-158", Duration.ofMinutes(30))),
+            null, emptyList())
+        val onlyOther = LogAlertSettings(listOf(WatchedService("other", "ci-agent-158", Duration.ofMinutes(30))), null, emptyList())
+        val slotA = LogAlertStore(JdbcTemplate(pool(2)))
+        val slotB = LogAlertStore(JdbcTemplate(pool(2)))
+        val roundA = LogAlertRound(both, slotA, slotA, LogSilentJudge(both)) { true }
+        val roundB = LogAlertRound(onlyOther, slotB, slotB, LogSilentJudge(onlyOther)) { true }
+        repeat(6) { step ->
+            val round = if (step % 2 == 0) roundA else roundB
+            val result = round.judgeOnce(now.plusSeconds(30L * step))
+            assertNull(result.failure, "${step + 1}번째 바퀴가 실패했다")
+        }
+        val keys = outboxKeys()
+        assertEquals(1, keys.count { it == "log:svc:silent" }, "다른 자리가 svc 의 상태를 지워 넘음을 다시 알렸다: $keys")
+        assertEquals(1, keys.count { it == "log:other:silent" }, keys.toString())
+        assertTrue(store.states().single { it.service == "svc" }.firing, "설정에 없는 자리가 svc 의 상태를 지웠다")
+    }
+
+    @Test
     fun `자원 판정이 판정 잠금을 쥐고 있어도 로그 판정은 기다리지 않고 돈다`() {
         val inside = CountDownLatch(1)
         val release = CountDownLatch(1)

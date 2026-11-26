@@ -91,9 +91,12 @@ class LogAlertHttpEngineTest {
     }
 
     @Test
-    fun `거절한 줄과 감시하지 않는 줄이 기동 로그에 드러난다`(output: CapturedOutput) {
+    fun `거절한 줄과 감시하지 않는 줄과 기대 서버가 아닌 서버의 경고가 기동 로그에 드러난다`(output: CapturedOutput) {
         assertTrue(output.all.contains("name_reserved"), "별표 이름의 거절이 기동 로그에 없다")
         assertTrue(output.all.contains("threshold_over_6h"), "6시간을 넘는 기준이 기동 로그에 없다")
+        assertTrue(output.all.lines().any { it.contains("ghost@ci-agent-158") && it.contains("server_not_expected") },
+            "기대 서버 목록(ci-agent-164)에 없는 서버의 경고가 기동 로그에 없다")
+        assertFalse(output.all.lines().any { it.contains("backend@ci-agent-164") && it.contains("server_not_expected") }, "기대 서버를 경고했다")
     }
 
     @Test

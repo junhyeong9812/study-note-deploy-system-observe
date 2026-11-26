@@ -19,6 +19,14 @@ class LogJudgingGate(
     private val lastLoopAt: () -> Instant?,
     private val stallAfter: Duration = Duration.ofSeconds(60),
 ) {
+    /**
+     * §16: 뜬 지 [warmUp] · 수집이 실패 중이 아님 · 마지막 바퀴가 [stallAfter] 안 · 마지막으로 성공한 바퀴가 따라잡은 바퀴([lastRoundCaughtUp]).
+     * 뼈대(§16): 아직 [lastRoundCaughtUp] 을 보지 않고 뜬 지 [warmUp] 뒤면 따라잡은 것으로 본다
+     */
+    constructor(startedAt: Instant, warmUp: Duration, collectorFailure: () -> String?, lastLoopAt: () -> Instant?, lastRoundCaughtUp: () -> Boolean,
+                stallAfter: Duration = Duration.ofSeconds(60)) :
+        this(SilentGate(startedAt, { startedAt }, warmUp, warmUp), collectorFailure, lastLoopAt, stallAfter)
+
     fun active(now: Instant): Boolean {
         if (!warmUp.active(now) || collectorFailure() != null) return false
         val loop = lastLoopAt() ?: return false

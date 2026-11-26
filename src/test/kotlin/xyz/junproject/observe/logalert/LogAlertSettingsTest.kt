@@ -10,6 +10,9 @@ import java.time.Duration
  * U+2028/2029 · 서식 문자) · 짝 없는 서로게이트를 담거나 두 번 나오면(서버가 달라도 — 그 이름의 줄 모두) 그 줄만 거절한다. 서버가 없거나 같은 꼴로 이상해도 그 줄만 거절.
  * 받아들이지 않은 줄마다 까닭의 낱말 하나: `name_reserved` · `name_empty` · `name_hidden_characters` · `name_duplicated` · `server_missing` · `server_invalid` ·
  * `no_threshold` · `threshold_not_number` · `threshold_not_positive` · `threshold_over_6h` (이름 → 서버 → 기준의 차례로 첫 까닭).
+ * §16-3: 이름 · 서버 · 기준의 조각은 앞뒤 공백을 다듬는다. 이름이 수집이 받는 꼴(`[a-z0-9-]{1,40}`)이 아니면 `name_invalid` — 이름의 까닭 차례는
+ * `name_reserved` → `name_empty` → `name_hidden_characters` → `name_invalid` → `name_duplicated`. 사는 서버가 기대 서버 목록에 없으면 받아들이되
+ * [LogAlertSettings.warnings] 에 (`<서비스>@<서버>`, `server_not_expected`) 한 줄 · 기동 로그에도 — 목록이 비어 있으면 대조하지 않는다.
  * 전체 한 줄의 기준도 같은 규칙(비면 그 줄은 감시하지 않는다 — 까닭 없음). 기동 로그의 줄([LogAlertSettings.startupLines])에 감시하는 것 · 받아들이지 않은 것(다듬은 글자와 까닭) ·
  * 아무것도 감시하지 않으면 `disabled` 가 드러난다.
  */
@@ -109,5 +112,45 @@ class LogAlertSettingsTest {
         assertTrue(lines.any { it.contains("front@ci-agent-9=400") && it.contains("threshold_over_6h") }, "감시하지 않는 줄이 드러나지 않았다: $lines")
         assertTrue(lines.any { it.contains("log_silent_all") && it.contains("45") }, "전체 한 줄의 기준이 드러나지 않았다: $lines")
         assertFalse(lines.any { it.contains("disabled") })
+    }
+
+    // ── §16-3: 다듬기 · 수집이 받는 꼴 · 기대 서버 ─────────
+
+    @Test
+    fun `이름 · 서버 · 기준의 조각은 앞뒤 공백을 다듬어 읽는다`() {
+        val settings = parse("backend @ ci-agent-158 = 30 ,  front@ ci-agent-9 =45")
+        assertEquals(listOf(WatchedService("backend", "ci-agent-158", Duration.ofMinutes(30)), WatchedService("front", "ci-agent-9", Duration.ofMinutes(45))),
+            settings.services)
+        assertEquals(emptyList<SettingsProblem>(), settings.problems)
+        assertEquals(listOf(SettingsProblem("backend@s=30", "name_duplicated"), SettingsProblem("backend @ t = 30", "name_duplicated")),
+            parse("backend@s=30, backend @ t = 30").problems, "다듬은 이름으로 중복을 보지 않았다")
+    }
+
+    @Test
+    fun `이름이 수집이 받는 꼴이 아니면 name_invalid 로 그 줄만 거절하고 40자까지는 받는다`() {
+        val invalid = listOf("Backend", "back end", "a".repeat(41), "back_end", "백엔드", "back.end")
+        val settings = parse((invalid.map { "$it@ci-agent-158=30" } + "${"a".repeat(40)}@ci-agent-158=30" + "ci-cd-2@ci-agent-9=30").joinToString(","))
+        assertEquals(listOf("a".repeat(40), "ci-cd-2"), settings.services.map { it.service })
+        assertEquals(invalid.map { "name_invalid" }, settings.problems.map { it.reason })
+    }
+
+    @Test
+    fun `이름의 까닭은 예약 · 빈 글자 · 숨은 문자 · 꼴 · 중복의 차례로 하나다`() {
+        val settings = parse("*@s=30, @s=30, A\nB@s=30, Backend@s=30, Backend@t=30, ok@s=30, ok@t=30")
+        assertEquals(listOf("name_reserved", "name_empty", "name_hidden_characters", "name_invalid", "name_invalid", "name_duplicated", "name_duplicated"),
+            settings.problems.map { it.reason })
+    }
+
+    @Test
+    fun `사는 서버가 기대 서버 목록에 없으면 받아들이되 경고 한 줄이 남고 목록이 비면 대조하지 않는다`() {
+        val expected = setOf("ci-agent-158", "ci-agent-164")
+        val settings = LogAlertSettings.parse("backend@ci-agent-158=30,front@ci-agent-9=45", "", expected)
+        assertEquals(listOf("backend", "front"), settings.services.map { it.service }, "기대 서버 목록에 없는 서버의 서비스를 거절했다")
+        assertEquals(emptyList<SettingsProblem>(), settings.problems)
+        assertEquals(listOf(SettingsProblem("front@ci-agent-9", "server_not_expected")), settings.warnings)
+        val lines = settings.startupLines()
+        assertTrue(lines.any { it.contains("front@ci-agent-9") && it.contains("server_not_expected") }, "기동 로그에 경고가 없다: $lines")
+        assertEquals(emptyList<SettingsProblem>(), LogAlertSettings.parse("backend@ci-agent-158=30,front@ci-agent-9=45", "", emptySet()).warnings,
+            "기대 서버 목록이 비었는데 대조했다")
     }
 }
