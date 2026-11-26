@@ -15,7 +15,7 @@ sealed interface AlertRule {
 
     companion object {
         /** 이 판이 아는 규칙 전부 */
-        val entries: List<AlertRule> get() = ResourceRule.entries + LogRule.entries
+        val entries: List<AlertRule> get() = ResourceRule.entries + LogRule.entries + LogPatternRule.entries
 
         /** 규칙 글자 → 규칙 — 글자가 정확히 같아야 한다(대소문자 · 공백도). 모르는 글자는 [IllegalStateException] */
         fun fromWireName(wireName: String): AlertRule =

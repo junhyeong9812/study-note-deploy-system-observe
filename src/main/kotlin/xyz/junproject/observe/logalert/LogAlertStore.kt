@@ -41,7 +41,7 @@ class LogAlertStore(private val jdbc: JdbcTemplate, private val readTimeout: Dur
     @Volatile private var schemaReady = false
     private val creatingSchema = Any()
 
-    /** 상태 표와 보낼 표를 만든다(있으면 그대로). 실패는 예외 */
+    /** 상태 표(무수신 `log_rule_state` · 글자 규칙 `log_pattern_state`)와 보낼 표를 만든다(있으면 그대로). 실패는 예외 */
     fun createSchema() {
         outbox.createSchema()
         jdbc.execute(
@@ -53,6 +53,15 @@ class LogAlertStore(private val jdbc: JdbcTemplate, private val readTimeout: Dur
                  last_notified_ms bigint,
                  last_received_ms bigint,
                  PRIMARY KEY (service, rule))"""
+        )
+        jdbc.execute(
+            """CREATE TABLE IF NOT EXISTS log_pattern_state (
+                 name                     text   PRIMARY KEY,
+                 checked_until_ms         bigint NOT NULL,
+                 last_notified_ms         bigint,
+                 pending_count            bigint NOT NULL,
+                 pending_first_request_id text,
+                 pending_first_ms         bigint)"""
         )
         schemaReady = true
     }
@@ -91,13 +100,47 @@ class LogAlertStore(private val jdbc: JdbcTemplate, private val readTimeout: Dur
     }
 
     /**
-     * 뼈대(⑪-6a): 글자 규칙 판정 한 바퀴 — 무수신과 **다른** 권고 잠금을 기다리지 않고 시도해 얻은 자리만, 한 트랜잭션에서 상태 표(이름은 구현이 정한다 — `log_` 로 시작) ·
-     * 보낼 표([ThresholdStore.insertAlerts])를 쓴다. 표는 [createSchema] 가 함께 만든다. 본문은 구현 워커가 채운다
+     * 글자 규칙 판정 한 바퀴 — 무수신과 **다른** 권고 잠금([LOG_PATTERN_LOCK])을 기다리지 않고 시도해 얻은 자리만, 한 트랜잭션에서 앞 상태(`log_pattern_state`)를 읽어
+     * 판정하고(판정이 그 안에서 로그 표를 읽는다 — [readTimeout] 에서 끊긴다) 상태 전부와 알림([ThresholdStore.insertAlerts])을 기록한다.
+     * 판정은 자기 설정에 없는 앞 상태도 그대로 돌려주므로 다른 자리의 상태를 지우지 않는다
      */
-    override fun judgePatternRound(now: Instant, judge: (previous: List<LogPatternState>) -> LogPatternJudgeResult): RoundOutcome = TODO("뼈대: 구현 워커가 채운다")
+    override fun judgePatternRound(now: Instant, judge: (previous: List<LogPatternState>) -> LogPatternJudgeResult): RoundOutcome {
+        ensureSchema()
+        return limited {
+            val locked = jdbc.queryForObject("SELECT pg_try_advisory_xact_lock(?)", Boolean::class.java, LOG_PATTERN_LOCK)!!
+            if (!locked) return@limited RoundOutcome(false, 0)
+            val previous = jdbc.query("SELECT * FROM log_pattern_state ORDER BY name", { row, _ -> row.toPatternState() })
+            val result = judge(previous)
+            jdbc.update("DELETE FROM log_pattern_state")
+            if (result.states.isNotEmpty()) jdbc.batchUpdate(
+                """INSERT INTO log_pattern_state (name, checked_until_ms, last_notified_ms, pending_count, pending_first_request_id, pending_first_ms)
+                   VALUES (?,?,?,?,?,?)""",
+                result.states, result.states.size,
+            ) { statement, state ->
+                statement.setString(1, state.name); statement.setLong(2, state.checkedUntil.toEpochMilli())
+                statement.setObject(3, state.lastNotifiedAt?.toEpochMilli(), Types.BIGINT); statement.setLong(4, state.pendingCount)
+                statement.setObject(5, state.pendingFirstRequestId, Types.VARCHAR); statement.setObject(6, state.pendingFirstAt?.toEpochMilli(), Types.BIGINT)
+            }
+            RoundOutcome(true, outbox.insertAlerts(result.events))
+        }
+    }
 
-    /** 뼈대(⑪-6a): 로그 표에서 이 서비스의 줄 가운데 `stream_ms` 가 `(after, until]` 이고 내용에 [text] 가 글자 그대로 든 줄(대소문자 구분 · 정규식 · LIKE 아님) — 본문은 구현 워커가 채운다 */
-    override fun matches(service: String, text: String, after: Instant, until: Instant): LogPatternMatches = TODO("뼈대: 구현 워커가 채운다")
+    /**
+     * 로그 표에서 이 서비스의 줄 가운데 `stream_ms` 가 `(after, until]` 이고 내용에 [text] 가 글자 그대로 든 줄 — `strpos`(대소문자 구분 · 정규식 · LIKE 아님 —
+     * `%` `_` 도 글자 그대로). 서비스 색인(`service, stream_ms`)으로 기간을 좁힌 뒤 견준다. 질의 둘: 수 · (맞은 줄이 있으면) 스트림 차례로 첫 줄
+     */
+    override fun matches(service: String, text: String, after: Instant, until: Instant): LogPatternMatches {
+        val range = arrayOf<Any>(service, after.toEpochMilli(), until.toEpochMilli(), text)
+        val count = jdbc.queryForObject(
+            "SELECT count(*) FROM log_entry WHERE service = ? AND stream_ms > ? AND stream_ms <= ? AND strpos(message, ?) > 0", Long::class.java, *range)!!
+        if (count == 0L) return LogPatternMatches(0, null, null)
+        val first = jdbc.query(
+            """SELECT request_id, stream_ms FROM log_entry WHERE service = ? AND stream_ms > ? AND stream_ms <= ? AND strpos(message, ?) > 0
+               ORDER BY stream_ms, stream_seq LIMIT 1""",
+            { row, _ -> row.getString("request_id") to Instant.ofEpochMilli(row.getLong("stream_ms")) }, *range,
+        ).firstOrNull()
+        return LogPatternMatches(count, first?.first, first?.second)
+    }
 
     /** 서비스마다 마지막으로 받은 로그의 시각 — 이름이 정확히 같은 줄에서(서비스 색인의 첫 줄), 없으면 null */
     override fun lastReceived(services: Collection<String>): Map<String, Instant?> = services.associateWith { service ->
@@ -132,9 +175,16 @@ class LogAlertStore(private val jdbc: JdbcTemplate, private val readTimeout: Dur
     private companion object {
         /** 권고 잠금의 번호 — 로그 무수신 판정만 쓴다(자원 판정 · 보내기의 잠금과 다르다) */
         const val LOG_JUDGE_LOCK = 7_310_420_003L
+        /** 권고 잠금의 번호 — 로그 글자 규칙 판정만 쓴다(무수신 판정의 잠금과 달라 서로 기다리지 않는다) */
+        const val LOG_PATTERN_LOCK = 7_310_420_004L
         const val UNDEFINED_TABLE = "42P01"   // PostgreSQL: relation does not exist
 
         fun ResultSet.nullableInstant(column: String): Instant? = getLong(column).takeUnless { wasNull() }?.let(Instant::ofEpochMilli)
+
+        fun ResultSet.toPatternState() = LogPatternState(
+            name = getString("name"), checkedUntil = Instant.ofEpochMilli(getLong("checked_until_ms")), lastNotifiedAt = nullableInstant("last_notified_ms"),
+            pendingCount = getLong("pending_count"), pendingFirstRequestId = getString("pending_first_request_id"), pendingFirstAt = nullableInstant("pending_first_ms"),
+        )
 
         fun ResultSet.toState() = LogRuleState(
             service = getString("service"),

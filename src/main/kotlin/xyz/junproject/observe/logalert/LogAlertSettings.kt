@@ -102,10 +102,10 @@ data class LogAlertSettings(val services: List<WatchedService>, val allThreshold
         }
 
         /** 숨은 문자([visibleText] 가 바꾸는 것)나 짝 없는 서로게이트가 들었는가 */
-        private fun hasHiddenCharacters(text: String) = printable(text) != text
+        internal fun hasHiddenCharacters(text: String) = printable(text) != text
 
         /** 로그에 실을 글자 — 숨은 문자와 짝 없는 서로게이트를 '?' 로 */
-        private fun printable(text: String): String = buildString {
+        internal fun printable(text: String): String = buildString {
             visibleText(text).codePoints().forEach { codePoint ->
                 if (Character.getType(codePoint) == Character.SURROGATE.toInt()) append('?') else appendCodePoint(codePoint)
             }

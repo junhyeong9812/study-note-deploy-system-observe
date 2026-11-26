@@ -35,6 +35,7 @@ observe:
   log-alerts:                                      # 로그 무수신 알림 — 둘 다 비면 판정이 꺼진다. 판정 주기는 metrics.judge-interval-ms
     services: ${LOG_ALERT_SERVICES:}                # <서비스>@<사는 서버>=<기준(분)> 을 쉼표로 — 기준은 1~360분
     all-threshold-minutes: ${LOG_ALERT_ALL_THRESHOLD_MINUTES:}   # 전체 스트림 한 줄의 기준(분) — 비면 감시하지 않는다
+    patterns: ${LOG_ALERT_PATTERNS:}                # 로그 글자 규칙 — <이름>|<서비스>|<세기>|<글자> 를 ; 로(README "로그 글자 규칙"). 비면 꺼짐
     warm-up: ${LOG_ALERT_WARM_UP:3m}                # 판정은 뜬 지 이만큼 지나고 로그 수집의 마지막 바퀴가 따라잡은 바퀴일 때만(밀린 동안은 보류 — 포기하지 않는다)
   alert:                                           # 알림 서버 POST /events — 비우면 보내지 않고 못 보낸 알림으로 남는다
     events-url: ${ALERT_EVENTS_URL:}
