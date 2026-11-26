@@ -123,18 +123,22 @@ class ThresholdRound(
     private companion object {
         const val LOGGED_RULES = 10
         const val LOGGED_RULE_LENGTH = 64
-        const val LINE_SEPARATOR = 0x2028
-        const val PARAGRAPH_SEPARATOR = 0x2029
 
-        /**
-         * 로그에 찍는 규칙 글자 — 줄바꿈 등으로 가짜 로그 줄을 만들거나 글자를 숨길 수 없게 제어 문자 · 줄 · 문단 구분 문자(U+2028 · U+2029) ·
-         * 서식 문자(Cf)를 '?' 로, 길이를 [LOGGED_RULE_LENGTH] 코드포인트까지(서로게이트 쌍을 쪼개지 않는다)
-         */
-        fun printableRule(rule: String): String = buildString {
-            rule.codePoints().limit(LOGGED_RULE_LENGTH.toLong()).forEach { codePoint ->
-                if (Character.isISOControl(codePoint) || codePoint == LINE_SEPARATOR || codePoint == PARAGRAPH_SEPARATOR ||
-                    Character.getType(codePoint) == Character.FORMAT.toInt()) append('?') else appendCodePoint(codePoint)
-            }
-        }
+        /** 로그에 찍는 규칙 글자 — 숨은 문자를 '?' 로([visibleText]), 길이를 [LOGGED_RULE_LENGTH] 코드포인트까지 */
+        fun printableRule(rule: String): String = visibleText(rule, LOGGED_RULE_LENGTH)
+    }
+}
+
+private const val LINE_SEPARATOR = 0x2028
+private const val PARAGRAPH_SEPARATOR = 0x2029
+
+/**
+ * 다른 판 · 설정 · 발신 쪽이 정한 글자를 로그나 알림의 글에 실을 때 — 줄바꿈 등으로 가짜 줄을 만들거나 글자를 숨길 수 없게 제어 문자 ·
+ * 줄 · 문단 구분 문자(U+2028 · U+2029) · 서식 문자(Cf)를 하나씩 '?' 로, 길이를 [maxCodePoints] 코드포인트까지(서로게이트 쌍을 쪼개지 않는다)
+ */
+internal fun visibleText(text: String, maxCodePoints: Int = Int.MAX_VALUE): String = buildString {
+    text.codePoints().limit(maxCodePoints.toLong()).forEach { codePoint ->
+        if (Character.isISOControl(codePoint) || codePoint == LINE_SEPARATOR || codePoint == PARAGRAPH_SEPARATOR ||
+            Character.getType(codePoint) == Character.FORMAT.toInt()) append('?') else appendCodePoint(codePoint)
     }
 }

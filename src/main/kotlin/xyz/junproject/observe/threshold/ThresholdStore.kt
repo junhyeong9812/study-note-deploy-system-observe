@@ -216,7 +216,7 @@ class ThresholdStore(
     override fun pendingAlerts(limit: Int): List<QueuedAlert> {
         ensureSchema()
         return jdbc.query(
-            "SELECT * FROM resource_alert_outbox WHERE rejected_ms IS NULL AND rule IN $KNOWN_RULES ORDER BY created_ms, id LIMIT ?",
+            "SELECT * FROM resource_alert_outbox WHERE rejected_ms IS NULL AND $KNOWN_LINE ORDER BY created_ms, id LIMIT ?",
             { row, _ -> QueuedAlert(row.getLong("id"), row.toAlert(), row.getInt("attempts"), row.getString("last_failure")) },
             limit,
         )
@@ -233,7 +233,7 @@ class ThresholdStore(
             """SELECT * FROM (
                  SELECT outbox.*, $RULE_GROUP AS rule_group,
                         row_number() OVER (PARTITION BY server, $RULE_GROUP, coalesce(target_name, '') ORDER BY created_ms, id) AS position
-                 FROM resource_alert_outbox outbox WHERE rejected_ms IS NULL AND rule IN $KNOWN_RULES) ranked
+                 FROM resource_alert_outbox outbox WHERE rejected_ms IS NULL AND $KNOWN_LINE) ranked
                WHERE position <= ? ORDER BY created_ms, id""",
             { row, _ -> QueuedAlert(row.getLong("id"), row.toAlert(), row.getInt("attempts"), row.getString("last_failure")) },
             perTarget,
@@ -296,7 +296,7 @@ class ThresholdStore(
     }
 
     /**
-     * 건수를 한 문장으로 센다(못 보낸 · 거절된 수와 모르는 규칙의 줄이 같은 때의 값). 아는 규칙은 SQL 에서 가른다([KNOWN_RULES]).
+     * 건수를 한 문장으로 센다(못 보낸 · 거절된 수와 모르는 규칙의 줄이 같은 때의 값). 아는 줄은 SQL 에서 가른다([KNOWN_LINE]) — 모르는 줄은 규칙 글자별로 센다.
      * 조회는 [countTimeout] 에서 끊긴다 — 그 상한은 이 트랜잭션에만 걸려(`set_config(…, true)` = `SET LOCAL`) 커밋 · 되돌림과 함께 사라진다
      */
     override fun alertCounts(): AlertCounts {
@@ -304,7 +304,7 @@ class ThresholdStore(
         return transaction.execute {
             jdbc.queryForObject("SELECT set_config('statement_timeout', ?, true)", String::class.java, countTimeout.toMillis().toString())
             val groups = jdbc.query(
-                """SELECT CASE WHEN rule IN $KNOWN_RULES THEN NULL ELSE rule END AS unknown_rule,
+                """SELECT CASE WHEN $KNOWN_LINE THEN NULL ELSE rule END AS unknown_rule,
                           count(*) FILTER (WHERE rejected_ms IS NULL) AS undelivered, count(*) FILTER (WHERE rejected_ms IS NOT NULL) AS rejected
                    FROM resource_alert_outbox GROUP BY 1""",
                 { row, _ -> Triple(row.getString("unknown_rule"), row.getLong("undelivered"), row.getLong("rejected")) },
@@ -339,11 +339,13 @@ class ThresholdStore(
         const val MAX_REASON = 200
         const val UNDEFINED_TABLE = "42P01"   // PostgreSQL: relation does not exist
         /**
-         * 이 판이 아는 규칙 글자(SQL 의 목록) — [ResourceRule] 에서 만든다(규칙이 늘면 따라온다). 글자가 정확히 같아야 아는 규칙이다.
-         * 이 목록에 없는 글자의 줄(섞인 판에서 새 판이 쓴 줄)은 보내기가 읽지도 표시하지도 지우지도 않는다 — 그 규칙을 아는 판이 보낸다.
+         * 이 판이 아는 줄(SQL 의 조건) — 규칙 글자가 [AlertRule.entries] 에 들고 등급 글자가 [AlertSeverity] 셋 가운데 하나(글자가 정확히 같아야 한다).
+         * 규칙이 늘면 따라온다. 이 조건에 들지 않는 줄(섞인 판에서 새 판이 쓴 줄 · 등급 글자를 모르는 줄)은 보내기가 읽지도 표시하지도 지우지도 않고
+         * 건수 세기가 규칙 글자별로 센다 — 읽는 두 SQL([pendingAlerts] · [pendingByTarget])과 세는 SQL([alertCounts])이 이 한 조건을 쓴다.
          * 글자는 고정값이다(입력이 아니다)
          */
-        val KNOWN_RULES = ResourceRule.entries.joinToString(", ", "(", ")") { "'${it.wireName}'" }
+        val KNOWN_LINE = "rule IN ${AlertRule.entries.joinToString(", ", "(", ")") { "'${it.wireName}'" }} " +
+            "AND severity IN ${AlertSeverity.entries.joinToString(", ", "(", ")") { "'${it.wireName}'" }}"
         /** 규칙의 묶음(SQL) — [AlertTarget.groupOf] 와 같은 규칙. 글자는 고정값이다(입력이 아니다) */
         val RULE_GROUP = "CASE WHEN rule IN ('${ResourceRule.DISK_WARNING.wireName}', '${ResourceRule.DISK_CRITICAL.wireName}') THEN '${AlertTarget.DISK_GROUP}' ELSE rule END"
 
@@ -352,18 +354,19 @@ class ThresholdStore(
 
         fun ResultSet.nullableInstant(column: String): Instant? = getLong(column).takeUnless { wasNull() }?.let(Instant::ofEpochMilli)
 
-        fun rule(wireName: String) = ResourceRule.entries.firstOrNull { it.wireName == wireName } ?: throw IllegalStateException("알 수 없는 규칙: $wireName")
+        /** 판정 상태의 규칙 — 이 상태 표는 자원 규칙만 담는다(로그 규칙의 상태는 따로) */
+        fun resourceRule(wireName: String) = ResourceRule.entries.firstOrNull { it.wireName == wireName } ?: throw IllegalStateException("알 수 없는 규칙: $wireName")
 
         fun ResultSet.toRuleState() = RuleState(
-            server = getString("server"), rule = rule(getString("rule")), target = getString("target"), targetName = getString("target_name"),
+            server = getString("server"), rule = resourceRule(getString("rule")), target = getString("target"), targetName = getString("target_name"),
             firing = getBoolean("firing"), since = nullableInstant("since_ms"), lastNotifiedAt = nullableInstant("last_notified_ms"),
             lastValue = getDouble("last_value").takeUnless { wasNull() },
         )
 
         fun ResultSet.toAlert() = ResourceAlert(
             eventId = getString("event_id"), key = getString("alert_key"), kind = getString("kind"),
-            severity = AlertSeverity.entries.firstOrNull { it.wireName == getString("severity") } ?: throw IllegalStateException("알 수 없는 severity"),
-            title = getString("title"), detail = getString("detail"), server = getString("server"), rule = rule(getString("rule")),
+            severity = AlertSeverity.fromWireName(getString("severity")),
+            title = getString("title"), detail = getString("detail"), server = getString("server"), rule = AlertRule.fromWireName(getString("rule")),
             targetName = getString("target_name"), createdAt = Instant.ofEpochMilli(getLong("created_ms")),
         )
     }
