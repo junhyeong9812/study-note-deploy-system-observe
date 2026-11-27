@@ -30,6 +30,7 @@ interface AlertSender {
 /**
  * 알림 서버 `POST /events` — 머리글 `X-Alert-Secret`, `Content-Type: application/json`, 본문 [ResourceAlert.eventBody].
  * 보낼 때마다 새 추적 ID 를 머리글 `X-Request-Id` 로 싣는다(통신 규약 §1.2 — 들어온 요청 없이 시작되는 호출. 16진수 소문자 32자 — nginx 의 `$request_id` 와 같은 꼴).
+ * 머리글 `X-Caller-Service: observe` 를 하나 싣는다(통신 규약 §2.2 — 값은 코드의 상수. 설정 · 들어온 요청의 머리글에서 읽지 않는다).
  * [eventsUrl] 은 `/events` 까지 적은 주소(설정 `observe.alert.events-url` · `ALERT_EVENTS_URL` — ci-cd 와 같은 이름),
  * [secret] 은 `observe.alert.secret` · `ALERT_SECRET`, 기한은 연결과 응답 전체에 `observe.alert.timeout-ms` · `ALERT_TIMEOUT_MS`(기본 3초).
  * 주소가 비어 있으면 보내지 않고 `Retry("not_configured")` — 알림이 남아 헬스의 못 보낸 수로 보인다.
@@ -49,6 +50,7 @@ class HttpAlertSender(
             val request = HttpRequest.newBuilder(URI(eventsUrl.trim())).timeout(timeout)
                 .header("Content-Type", "application/json").header("X-Alert-Secret", secret)
                 .header("X-Request-Id", UUID.randomUUID().toString().replace("-", ""))      // 보낼 때마다 새 값 — 같은 알림을 다시 보낼 때도
+                .header(CALLER_SERVICE_HEADER, CALLER_SERVICE)                               // 자기 규약 이름 — 받는 쪽 nginx 가 접속 기록의 caller 로 적는다
                 .POST(HttpRequest.BodyPublishers.ofString(json.writeValueAsString(alert.eventBody()))).build()
             // 연결 · 응답 전체를 기한 하나로 — 응답 머리 뒤에 본문이 늦어도 기한에서 끊는다
             val pending = client.sendAsync(request, HttpResponse.BodyHandlers.discarding())
@@ -78,6 +80,9 @@ class HttpAlertSender(
 
     private companion object {
         const val NOT_CONFIGURED = "not_configured"
+        const val CALLER_SERVICE_HEADER = "X-Caller-Service"
+        /** 관측 서버의 규약 이름(통신 규약 §2.1) — 코드의 상수 */
+        const val CALLER_SERVICE = "observe"
         val RETRYABLE_CLIENT_ERRORS = setOf(401, 403, 429)
     }
 }
