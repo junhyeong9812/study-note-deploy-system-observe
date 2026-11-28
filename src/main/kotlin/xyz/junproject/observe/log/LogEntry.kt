@@ -35,7 +35,9 @@ data class LogEntry(
  */
 object LogLineParser {
     const val UNKNOWN_SERVICE = "unknown"
-    private val shape = Regex("""^([A-Za-z0-9_.-]{1,80}):([a-z0-9-]{1,40}):(.*)$""", RegexOption.DOT_MATCHES_ALL)
+    /** 서비스 이름의 꼴 — 이 꼴이 아닌 줄은 서비스 [UNKNOWN_SERVICE] 로 남는다(로그 무수신 감시의 설정도 이 꼴의 이름만 받는다) */
+    val SERVICE_NAME = Regex("[a-z0-9-]{1,40}")
+    private val shape = Regex("""^([A-Za-z0-9_.-]{1,80}):(${SERVICE_NAME.pattern}):(.*)$""", RegexOption.DOT_MATCHES_ALL)
     private val knownLevels = setOf("debug", "info", "warning", "error")
 
     fun parse(id: StreamId, rawLevel: String?, rawLine: String?): LogEntry {
