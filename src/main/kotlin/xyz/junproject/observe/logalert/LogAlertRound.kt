@@ -38,6 +38,11 @@ class LogAlertRound(
     private val store: LogRuleStateStore,
     private val receipts: LogReceipts,
     private val judge: LogSilentJudge,
+    /**
+     * 글자 규칙(⑪-6a) — 있으면 [judgeOnce] 가 무수신 판정과 **따로** 돌리고(무수신이 꺼져도 · 실패해도 돌고, 글자 규칙의 실패가 무수신을 막지 않는다)
+     * [health] 에 [LogPatternRound.health] 의 칸을 더한다(없으면 기존 칸 그대로)
+     */
+    private val patterns: LogPatternRound? = null,
     private val judging: (Instant) -> Boolean,
 ) {
     @Volatile var lastResult: LogAlertRoundResult? = null; private set
@@ -45,7 +50,14 @@ class LogAlertRound(
 
     private val log = LoggerFactory.getLogger("observe")
 
+    /** 무수신 판정 한 바퀴와 글자 규칙 한 바퀴 — 둘은 따로(글자 규칙은 예외를 내지 않는다). 돌려주는 것은 무수신의 결과 */
     fun judgeOnce(now: Instant): LogAlertRoundResult {
+        val result = judgeSilent(now)
+        patterns?.judgeOnce(now)
+        return result
+    }
+
+    private fun judgeSilent(now: Instant): LogAlertRoundResult {
         if (!settings.enabled) return LogAlertRoundResult(now, false, 0, null).also { lastResult = it }
         val result = try {
             val judgingNow = judging(now)
@@ -65,7 +77,10 @@ class LogAlertRound(
         return result.also { lastResult = it }
     }
 
-    /** `log_alerts` 칸 — `{enabled, watched_services, watch_all, judging, last_judged_at, last_failure}`(시각 · 실패가 없으면 빈 글자). DB 를 읽지 않는다 */
+    /**
+     * `log_alerts` 칸 — `{enabled, watched_services, watch_all, judging, last_judged_at, last_failure}`(시각 · 실패가 없으면 빈 글자)에 글자 규칙의 칸
+     * ([LogPatternRound.health])을 더한다. DB 를 읽지 않는다
+     */
     fun health(now: Instant): Map<String, Any?> = mapOf(
         "enabled" to settings.enabled,
         "watched_services" to settings.services.size,
@@ -73,5 +88,5 @@ class LogAlertRound(
         "judging" to runCatching { judging(now) }.getOrDefault(false),
         "last_judged_at" to (lastJudgedAt?.toString() ?: ""),
         "last_failure" to (lastResult?.failure ?: ""),
-    )
+    ) + (patterns?.health() ?: emptyMap())
 }

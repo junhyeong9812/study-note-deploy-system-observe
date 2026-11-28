@@ -1,5 +1,6 @@
 package xyz.junproject.observe.threshold
 
+import xyz.junproject.observe.logalert.LogPattern
 import java.time.Duration
 import java.time.Instant
 
@@ -7,6 +8,14 @@ import java.time.Instant
 enum class LogRule(override val wireName: String, override val kind: String) : AlertRule {
     SILENT("log_silent", "log_silent"),
     SILENT_ALL("log_silent_all", "log_silent"),
+}
+
+/**
+ * 로그 글자 규칙(⑪-6a) — 설정한 (서비스 · 글자)가 든 로그 줄. kind `log_pattern`.
+ * [AlertRule.entries] 에 든다(보내기가 모르는 규칙으로 건너뛰지 않게 — 섞인 판에서 옛 판은 모르는 줄로 남긴다).
+ */
+enum class LogPatternRule(override val wireName: String, override val kind: String) : AlertRule {
+    PATTERN("log_pattern", "log_pattern"),
 }
 
 /**
@@ -37,6 +46,24 @@ object LogAlerts {
         val title = if (resolved) "전체 로그 다시 들어옴" else "전체 로그 끊김 — ${minutes(threshold)} 넘게 안 들어옴"
         return alert(LogRule.SILENT_ALL, "log-all:silent", ALL_SERVERS, null, resolved, now, title,
             "전체 스트림 · ${received(lastReceivedAt)} · 기준 ${minutes(threshold)}")
+    }
+
+    /** 관측 서버가 받는 요청 ID 의 꼴 — 그 밖이면 사건에 싣지 않는다 */
+    val REQUEST_ID = Regex("^[A-Za-z0-9_.-]{1,80}$")
+
+    /**
+     * 글자 규칙 하나의 사건 — 고유 키 `log_pattern:<이름>@<now 밀리초>`, key `log_pattern:<이름>`, kind `log_pattern`, 세기 = 규칙의 세기, 서버 `*`,
+     * 규칙 [LogPatternRule.PATTERN], 대상 이름 = 규칙 이름, 만든 시각 [now].
+     * title `로그 글자 규칙 <이름> — <서비스>`(200자 안), detail `<count>줄 맞음 · 첫 줄 요청 ID <ID> · 시각 <ISO>` — 요청 ID 가 [REQUEST_ID] 밖이거나 없으면 `없음`,
+     * 시각이 없으면 `모름`. 로그의 내용도 규칙의 글자도 싣지 않는다(규칙의 글자는 로그 내용의 일부와 같은 글자다).
+     */
+    fun pattern(pattern: LogPattern, count: Long, firstRequestId: String?, firstAt: Instant?, now: Instant): ResourceAlert {
+        val key = boundedBaseKey("${LogPatternRule.PATTERN.wireName}:${pattern.name}", ::withinLength)
+        val requestId = firstRequestId?.takeIf { REQUEST_ID.matches(it) } ?: "없음"
+        return ResourceAlert("$key@${now.toEpochMilli()}", key, LogPatternRule.PATTERN.kind, pattern.severity,
+            withinLength("로그 글자 규칙 ${pattern.name} — ${visibleText(pattern.service)}", ResourceAlert.MAX_TITLE),
+            withinLength("${count}줄 맞음 · 첫 줄 요청 ID $requestId · 시각 ${firstAt ?: "모름"}", ResourceAlert.MAX_DETAIL),
+            ALL_SERVERS, LogPatternRule.PATTERN, pattern.name, now)
     }
 
     private const val ALL_SERVERS = "*"
