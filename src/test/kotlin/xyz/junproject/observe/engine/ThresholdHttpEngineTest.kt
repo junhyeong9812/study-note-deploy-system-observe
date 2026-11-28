@@ -45,9 +45,10 @@ class ThresholdHttpEngineTest {
     private val json = JsonMapper.builder().build()
     private val base get() = "http://127.0.0.1:${environment.getProperty("local.server.port")}"
 
-    private fun call(path: String, secret: String? = SECRET): HttpResponse<String> {
+    private fun call(path: String, secret: String? = SECRET, callerService: String? = null): HttpResponse<String> {
         val builder = HttpRequest.newBuilder(URI("$base$path")).timeout(Duration.ofSeconds(10)).GET()
         if (secret != null) builder.header("X-Observe-Secret", secret)
+        if (callerService != null) builder.header("X-Caller-Service", callerService)
         return http.send(builder.build(), HttpResponse.BodyHandlers.ofString())
     }
 
@@ -84,6 +85,20 @@ class ThresholdHttpEngineTest {
     private fun sendFiveMinutesOfHighMemory() {
         val newest = Instant.now().minusSeconds(1)
         (9 downTo 0).forEach { sendMetric(newest.minusSeconds(30L * it), 60) }
+    }
+
+    @Test
+    fun `알림 서버로 가는 모든 호출은 처음에 받지 못해 다시 보낸 것까지 X-Caller-Service observe 하나를 싣는다`() {
+        // 들어온 요청이 다른 이름을 실어도(어드민의 조회) 나가는 호출은 자기 이름이다
+        assertEquals(200, call("/metrics/latest", callerService = "admin").statusCode(), "준비: 조회")
+        eventually("메모리 알림을 다시 보내 받게 된다") {
+            received.firstOrNull { it.key == "resource:ci-agent-158:memory" && it.status == 202 }
+        }
+        val memoryCalls = received.filter { it.key == "resource:ci-agent-158:memory" }
+        assertTrue(memoryCalls.size >= 3, "준비: 받지 못한 두 번과 다시 보낸 호출이 없다 ${memoryCalls.map { it.status }}")
+        received.forEach { request ->
+            assertEquals(listOf("observe"), request.callers, "${request.key} (응답 ${request.status}): X-Caller-Service 가 정확히 하나의 observe 가 아니다")
+        }
     }
 
     @Test
@@ -167,7 +182,7 @@ class ThresholdHttpEngineTest {
         administration.execute("DROP SCHEMA IF EXISTS $SCHEMA CASCADE")
     }
 
-    private class Received(val key: String?, val secret: String?, val body: String, val status: Int)
+    private class Received(val key: String?, val secret: String?, val body: String, val status: Int, val callers: List<String>)
 
     companion object {
         private const val SCHEMA = "threshold_http"
@@ -187,7 +202,7 @@ class ThresholdHttpEngineTest {
                 @Suppress("UNCHECKED_CAST")
                 val key = runCatching { (json.readValue(text, Map::class.java) as Map<String, Any?>)["key"] as String? }.getOrNull()
                 val status = if (key == "resource:ci-agent-158:memory" && memoryAttempts.incrementAndGet() <= 2) 503 else 202
-                received += Received(key, exchange.requestHeaders.getFirst("X-Alert-Secret"), text, status)
+                received += Received(key, exchange.requestHeaders.getFirst("X-Alert-Secret"), text, status, exchange.requestHeaders["X-Caller-Service"].orEmpty())
                 val answer = """{"success":true,"data":{"sent":true,"key":"$key"}}""".toByteArray()
                 exchange.sendResponseHeaders(status, answer.size.toLong())
                 exchange.responseBody.use { it.write(answer) }

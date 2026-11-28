@@ -43,6 +43,11 @@ tasks.named<Test>("test") {
 	useJUnitPlatform { excludeTags("engine") }
 }
 
+// 호출자 이름(X-Caller-Service)은 코드의 상수 — 설정에서 읽으면 테스트가 알아채게 단위 · 엔진 테스트 모두에 다른 값을 둔다
+tasks.withType<Test>().configureEach {
+	environment("SERVER_NAME", "front")
+}
+
 // 실제 PostgreSQL·Redis 가 있어야 도는 테스트 — scripts/engine-test.sh 가 컨테이너를 띄우고 부른다
 tasks.register<Test>("engineTest") {
 	description = "실제 PostgreSQL·Redis 에 대고 도는 테스트"
