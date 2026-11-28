@@ -77,6 +77,7 @@ front · backend · llm · 배포 시스템 ── XADD logs ──▶ Redis(bac
 | `last_retention_at` · `last_retention_deleted` · `last_retention_failure` | 마지막 30일 삭제의 실행 시각 · 지운 건수 · 실패 종류(뜬 뒤 아직 안 돌았으면 빈 문자열 · -1 · 빈 문자열, 실패면 건수 -1). 판정에는 넣지 않는다 |
 | `last_auth_retention_at` · `last_auth_retention_deleted` · `last_auth_retention_failure` | 마지막 로그인 시도 기록 삭제(보관 기간, 기본 90일)의 같은 세 칸. 판정에는 넣지 않는다 |
 | `log_alerts` | 로그 무수신 판정의 칸(아래 "로그 무수신 알림") — 판정의 어떤 실패도 `status` 와 HTTP 상태를 바꾸지 않는다 |
+| `components` | 의존마다의 칸 — 열쇠는 `redis` · `postgres` 둘. 칸마다 `{status, took_ms, detail?}`: `status` 는 `UP` · `DOWN`, `took_ms` 는 위의 확인 하나(Redis 는 미확인 건수 · DB 는 가장 최근 행의 시각)에 걸린 시간(정수 ms — 헬스 한 번에 확인을 더 부르지 않는다). 예외로 끝난 확인은 `DOWN` · `took_ms` 는 `null`(칸은 있다) · `detail` 은 예외의 종류 이름(문구 · 주소는 싣지 않는다). 표가 아직 없다는 DB 의 답은 닿은 것이라 `UP`. 위의 `status` 가 무엇이든 늘 있고 판정 · HTTP 상태에는 넣지 않는다. 밀린 건수(`lag`)의 확인은 여기 들지 않는다 |
 
 ## 로그인 시도와 잠금
 

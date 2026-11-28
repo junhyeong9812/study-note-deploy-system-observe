@@ -26,6 +26,9 @@ import java.util.concurrent.Executors
  * - `stalled`(503): 그 밖 — 바퀴가 [stallAfter] 넘게 끝나지 않는다(첫 바퀴 전 포함).
  * 밀린 건수(lag)와 30일 삭제·로그인 시도 90일 삭제 결과는 본문에만 낸다 — 밀림은 장애가 아니라 진행 상황이고, 삭제 실패는 수집과 무관하다.
  * 실패 사유는 예외 종류 이름만 낸다(헬스는 인증이 없다). 문구는 서버 로그에만.
+ * `components`: 의존마다 `{status: "UP"|"DOWN", took_ms, detail?}` — `redis`(미확인 건수의 확인) · `postgres`(가장 최근 행의 시각의 확인). 위 두 확인을 한 번씩 재어 낸다
+ * (더 부르지 않는다 · 밀린 건수는 넣지 않는다). `took_ms` 는 그 확인 하나의 시간(단조 시계 · 정수 ms 내림), 예외로 끝난 확인은 DOWN · `took_ms` null · `detail` 은 예외 종류 이름만.
+ * 표가 없다는 답(42P01)은 닿은 것이라 UP. 판정 · HTTP 상태에는 넣지 않는다(칸을 더한 것이다).
  * [metrics] 가 있으면 본문에 `metrics` 객체([MetricHealth.report])를, [traffic] 이 있으면 `traffic` 객체([TrafficHealth.report])를 더한다 —
  * 그쪽이 어떻게 실패해도 위 `status` 와 HTTP 상태는 바뀌지 않는다(만들다 실패하면 `{status:"failing", failure:"health <종류>"}`).
  * [visits] 가 있으면 `visits` 객체([VisitHealth.report])를 같은 규칙으로 더한다 — 그 칸이 실패하면 서버 로그에도 종류 이름만 남긴다(방문 쪽 예외의 글에는 주소가 실릴 수 있다).
@@ -57,9 +60,10 @@ class CollectorHealth(
         val trafficReport = traffic?.let { trafficHealth -> CompletableFuture.supplyAsync({ trafficHealth.report(now) }, SECTION_READER) }
         val lastLoopAt = collector.lastLoopAt
         val failure = collector.lastFailure
-        val pending = runCatching(unacknowledged)
+        val (pending, redisTookMs) = timed(unacknowledged)
         // 표가 없으면 DB 에는 닿았고 저장된 행이 없는 것과 같다 — 마지막 저장 시각은 비우고 판정은 수집 바퀴의 결과에 맡긴다
-        val stored = runCatching(latestStoredAt).recoverCatching { if (isTableMissing(it)) null else throw it }
+        val (storedRaw, postgresTookMs) = timed(latestStoredAt)
+        val stored = storedRaw.recoverCatching { if (isTableMissing(it)) null else throw it }
         val behind = runCatching(lag)
         val problems = listOfNotNull(pending.exceptionOrNull()?.let { "redis" to it }, stored.exceptionOrNull()?.let { "database" to it })
         logProblems(problems)
@@ -86,6 +90,8 @@ class CollectorHealth(
             "last_auth_retention_at" to (authRetention?.ranAt?.toString() ?: ""),
             "last_auth_retention_deleted" to (authRetention?.deleted ?: -1),
             "last_auth_retention_failure" to (authRetention?.failure ?: ""),
+            // 표 없음을 되살린 뒤의 결과로 — 그 앞의 결과로 만들면 표 없음이 DOWN 이 된다
+            "components" to mapOf("redis" to component(pending, redisTookMs), "postgres" to component(stored, postgresTookMs)),
         )
         // 지표 · 방문 · 통신 칸은 판정이 끝난 뒤에 덧붙인다 — 그쪽의 어떤 실패도 위 status 와 HTTP 상태에 닿지 않게(만들다 실패해도 칸에만 남긴다)
         val sections = listOfNotNull(metricReport?.let { "metrics" to it }, visitReport?.let { "visits" to it }, trafficReport?.let { "traffic" to it })
@@ -109,6 +115,18 @@ class CollectorHealth(
     }
 
     private fun isTableMissing(error: Throwable) = HealthReads.isTableMissing(error)
+
+    /** 확인 하나를 부르고 그 시간을 잰다(단조 시계 · 정수 ms 내림) */
+    private fun <T> timed(check: () -> T): Pair<Result<T>, Long> {
+        val started = System.nanoTime()
+        val result = runCatching(check)
+        return result to (System.nanoTime() - started) / 1_000_000
+    }
+
+    /** 의존 칸 하나 — 값을 돌려준 확인은 UP 과 그 시간, 예외로 끝난 확인은 DOWN · 시간 null · 예외 종류 이름(문구는 싣지 않는다) */
+    private fun component(result: Result<*>, tookMs: Long): Map<String, Any?> = result.exceptionOrNull()
+        ?.let { mapOf("status" to "DOWN", "took_ms" to null, "detail" to it.javaClass.simpleName) }
+        ?: mapOf("status" to "UP", "took_ms" to tookMs)
 
     /** 닿지 못한 이유의 전체 문구는 서버 로그에만 — 같은 이유를 헬스 요청마다 되풀이해 남기지 않는다 */
     private fun logProblems(problems: List<Pair<String, Throwable>>) {

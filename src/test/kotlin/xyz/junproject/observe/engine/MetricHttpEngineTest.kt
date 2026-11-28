@@ -210,6 +210,23 @@ class MetricHttpEngineTest {
         }
     }
 
+    @Test
+    @Suppress("UNCHECKED_CAST")
+    fun `헬스의 의존 칸은 실제 Redis 와 DB 에 닿으면 redis 와 postgres 둘 다 UP 이고 took_ms 는 JSON 정수다`() {
+        val body = eventually(what = "헬스가 200 ok") {
+            call("GET", "/health", secret = null).takeIf { it.statusCode() == 200 }?.let { envelope(it) }
+        }
+        val components = body["components"] as? Map<String, Map<String, Any?>> ?: fail("components 칸이 객체가 아니다: $body")
+        assertEquals(setOf("redis", "postgres"), components.keys, "$body")
+        for ((name, component) in components) {
+            assertEquals(setOf("status", "took_ms"), component.keys, "$name: $component")
+            assertEquals("UP", component["status"], name)
+            val tookMs = component["took_ms"]
+            assertTrue(tookMs is Int || tookMs is Long, "$name 의 took_ms 가 JSON 정수가 아니다: $tookMs (${tookMs?.javaClass})")
+            assertTrue((tookMs as Number).toLong() >= 0, "$name: $tookMs")
+        }
+    }
+
     @AfterAll
     fun cleanUp() {
         redis.delete(METRIC_STREAM)
