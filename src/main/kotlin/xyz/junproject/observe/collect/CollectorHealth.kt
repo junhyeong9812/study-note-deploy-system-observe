@@ -2,8 +2,10 @@ package xyz.junproject.observe.collect
 
 import org.slf4j.LoggerFactory
 import xyz.junproject.observe.log.RetentionResult
+import xyz.junproject.observe.logalert.LogAlertRound
 import xyz.junproject.observe.metric.MetricHealth
 import xyz.junproject.observe.traffic.TrafficHealth
+import xyz.junproject.observe.visit.VisitHealth
 import java.time.Duration
 import java.time.Instant
 import java.util.concurrent.CompletableFuture
@@ -29,6 +31,8 @@ import java.util.concurrent.Executors
  * 표가 없다는 답(42P01)은 닿은 것이라 UP. 판정 · HTTP 상태에는 넣지 않는다(칸을 더한 것이다).
  * [metrics] 가 있으면 본문에 `metrics` 객체([MetricHealth.report])를, [traffic] 이 있으면 `traffic` 객체([TrafficHealth.report])를 더한다 —
  * 그쪽이 어떻게 실패해도 위 `status` 와 HTTP 상태는 바뀌지 않는다(만들다 실패하면 `{status:"failing", failure:"health <종류>"}`).
+ * [visits] 가 있으면 `visits` 객체([VisitHealth.report])를 같은 규칙으로 더한다 — 그 칸이 실패하면 서버 로그에도 종류 이름만 남긴다(방문 쪽 예외의 글에는 주소가 실릴 수 있다).
+ * [logAlerts] 가 있으면 본문에 `log_alerts` 객체([LogAlertRound.health])를 더한다 — 로그 무수신 판정의 실패도 `status` 와 HTTP 상태를 바꾸지 않는다.
  */
 class CollectorHealth(
     private val collector: LogCollector,
@@ -40,6 +44,8 @@ class CollectorHealth(
     private val stallAfter: Duration = Duration.ofSeconds(60),
     private val startedAt: Instant = Instant.now(),
     private val metrics: MetricHealth? = null,                          // 지표 수집의 칸 — 본문에만, 판정에 넣지 않는다
+    private val visits: VisitHealth? = null,                            // 방문 수집의 칸 — 본문에만, 판정에 넣지 않는다
+    private val logAlerts: LogAlertRound? = null,                       // 로그 무수신 판정의 칸(`log_alerts`) — 본문에만, 판정에 넣지 않는다
     private val traffic: TrafficHealth? = null,                         // 통신 수집의 칸 — 본문에만, 판정에 넣지 않는다
 ) {
     data class Report(val healthy: Boolean, val body: Map<String, Any>)
@@ -50,6 +56,7 @@ class CollectorHealth(
     fun report(now: Instant): Report {
         // 지표 칸은 로그 쪽 읽기와 동시에 시작한다(§16) — 헬스 전체는 둘의 합이 아니라 긴 쪽(지표 칸은 그 안에서 최대 2초)
         val metricReport = metrics?.let { metricHealth -> CompletableFuture.supplyAsync({ metricHealth.report(now) }, SECTION_READER) }
+        val visitReport = visits?.let { visitHealth -> CompletableFuture.supplyAsync({ visitHealth.report(now) }, SECTION_READER) }   // 방문 칸도 같이(그 안에서 최대 2초)
         val trafficReport = traffic?.let { trafficHealth -> CompletableFuture.supplyAsync({ trafficHealth.report(now) }, SECTION_READER) }
         val lastLoopAt = collector.lastLoopAt
         val failure = collector.lastFailure
@@ -86,17 +93,25 @@ class CollectorHealth(
             // 표 없음을 되살린 뒤의 결과로 — 그 앞의 결과로 만들면 표 없음이 DOWN 이 된다
             "components" to mapOf("redis" to component(pending, redisTookMs), "postgres" to component(stored, postgresTookMs)),
         )
-        // 지표 · 통신 칸은 판정이 끝난 뒤에 덧붙인다 — 그쪽의 어떤 실패도 위 status 와 HTTP 상태에 닿지 않게(만들다 실패해도 칸에만 남긴다)
-        val sections = listOfNotNull(metricReport?.let { "metrics" to it }, trafficReport?.let { "traffic" to it }).associate { (name, report) ->
-            name to runCatching { report.get() }.getOrElse {
-                val cause = (it as? ExecutionException)?.cause ?: it
-                // 지표 칸은 기존 글 그대로(종류와 문구 200자), 통신 칸은 종류만 — 통신 쪽 문구에는 항목의 경로가 실릴 수 있다
-                if (name == "metrics") log.error("observe:observe:metric health failed: {}: {}", cause.javaClass.simpleName, cause.message?.take(200))
-                else log.error("observe:observe:traffic health failed: {}", cause.javaClass.simpleName)
-                mapOf("status" to "failing", "failure" to "health ${cause.javaClass.simpleName}")
+        // 지표 · 방문 · 통신 칸은 판정이 끝난 뒤에 덧붙인다 — 그쪽의 어떤 실패도 위 status 와 HTTP 상태에 닿지 않게(만들다 실패해도 칸에만 남긴다)
+        val sections = listOfNotNull(metricReport?.let { "metrics" to it }, visitReport?.let { "visits" to it }, trafficReport?.let { "traffic" to it })
+            .associate { (name, report) ->
+                name to runCatching { report.get() }.getOrElse {
+                    val cause = (it as? ExecutionException)?.cause ?: it
+                    // 지표 칸은 기존 글 그대로(종류와 문구 200자), 방문 · 통신 칸은 종류만 — 방문 쪽 문구에는 주소가, 통신 쪽 문구에는 항목의 경로가 실릴 수 있다
+                    when (name) {
+                        "metrics" -> log.error("observe:observe:metric health failed: {}: {}", cause.javaClass.simpleName, cause.message?.take(200))
+                        "visits" -> log.error("observe:observe:visit health failed: {}", cause.javaClass.simpleName)
+                        else -> log.error("observe:observe:traffic health failed: {}", cause.javaClass.simpleName)
+                    }
+                    mapOf("status" to "failing", "failure" to "health ${cause.javaClass.simpleName}")
+                }
             }
-        }
-        return Report(status == "ok", body + sections)
+        // 로그 무수신 판정의 칸 — 바퀴가 남긴 값만 읽는다(DB 를 읽지 않는다). 판정의 어떤 실패도 위 status 와 HTTP 상태에 닿지 않는다
+        val logAlertSection = logAlerts?.let { round ->
+            mapOf("log_alerts" to runCatching { round.health(now) }.getOrElse { mapOf("last_failure" to "health ${it.javaClass.simpleName}") })
+        } ?: emptyMap()
+        return Report(status == "ok", body + sections + logAlertSection)
     }
 
     private fun isTableMissing(error: Throwable) = HealthReads.isTableMissing(error)
@@ -121,7 +136,7 @@ class CollectorHealth(
     }
 
     companion object {
-        /** 지표 · 통신 칸을 읽는 가상 스레드 — 그 읽기는 각 칸이 스스로 2초에서 끊는다 */
+        /** 지표 · 방문 · 통신 칸을 읽는 가상 스레드 — 그 읽기는 각 칸이 스스로 2초에서 끊는다 */
         private val SECTION_READER = Executors.newVirtualThreadPerTaskExecutor()
     }
 }
