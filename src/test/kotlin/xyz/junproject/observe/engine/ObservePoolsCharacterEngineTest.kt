@@ -27,7 +27,7 @@ class ObservePoolsCharacterEngineTest {
     @Autowired private lateinit var configuration: ObserveConfiguration
 
     @Test
-    fun `앱이 만드는 연결 풀은 지금의 이름 열둘과 크기 그대로다 — 합 24`() {
+    fun `앱이 만드는 연결 풀은 지금의 이름 열여섯과 크기 그대로다 — 합 30`() {
         val field = ObserveConfiguration::class.java.getDeclaredField("pools").apply { isAccessible = true }
         @Suppress("UNCHECKED_CAST")
         val pools = (field.get(configuration) as List<HikariDataSource>).associate { it.poolName to it.maximumPoolSize }
@@ -36,8 +36,9 @@ class ObservePoolsCharacterEngineTest {
             "observe-metric-ingest" to 2, "observe-metric-health" to 1, "observe-metric-health-detail" to 1,
             "observe-metric-query" to 2, "observe-threshold" to 5,
             "observe-visit-ingest" to 1, "observe-visit-query" to 1, "observe-visit-health" to 1,
+            "observe-traffic-ingest" to 2, "observe-traffic-query" to 2, "observe-traffic-health" to 1, "observe-traffic-health-detail" to 1,
         ), pools, "연결 풀의 이름 · 크기가 바뀌었다(자리당 연결 수)")
-        assertEquals(24, pools.values.sum())
+        assertEquals(30, pools.values.sum())
     }
 
     @AfterAll fun cleanUp() = administration.execute("DROP SCHEMA IF EXISTS $SCHEMA CASCADE")

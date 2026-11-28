@@ -23,6 +23,12 @@ import xyz.junproject.observe.threshold.ThresholdRound
 import xyz.junproject.observe.threshold.ThresholdRoundResult
 import xyz.junproject.observe.logalert.LogAlertRound
 import xyz.junproject.observe.logalert.LogAlertRoundResult
+import xyz.junproject.observe.traffic.TrafficCollector
+import xyz.junproject.observe.traffic.TrafficDeletion
+import xyz.junproject.observe.traffic.TrafficMaintenance
+import xyz.junproject.observe.traffic.TrafficRetentionResult
+import xyz.junproject.observe.traffic.TrafficRollupResult
+import xyz.junproject.observe.traffic.TrafficStore
 
 /**
  * 도는 것들 — 수집 루프(전용 스레드), 하루 한 번 30일 지난 로그 삭제와 90일 지난 로그인 시도 기록 삭제.
@@ -32,6 +38,10 @@ import xyz.junproject.observe.logalert.LogAlertRoundResult
  * 수집 바퀴를 돈다 — 지표 쪽의 어떤 실패도 로그 수집을 멈추지 않는다. [metrics] 가 있으면
  * 5분 평균을 [rollUpMetrics] 가 `@Scheduled(fixedDelayString = "\${observe.metrics.rollup-interval-ms:60000}")` 로 돌고,
  * 7일·30일 삭제는 [deleteOldLogs] 예약 실행에서 로그·로그인 시도 삭제와 **서로 따로** 돈다(한쪽이 실패해도 다른 쪽은 돈다).
+ *
+ * 통신: [trafficCollector] 가 있으면 또 다른 전용 스레드(`observe-traffic-collector`)로 수집 바퀴를 돈다. [traffic] 이 있으면 5분 묶음을
+ * [rollUpTraffic](`observe.traffic.rollup-interval-ms`)이, 보관 삭제를 [deleteOldTraffic](로그 삭제와 같은 시각 · 따로의 예약)이 돈다 —
+ * 통신 표가 막혀 그쪽 예약이 기다려도 로그 · 지표의 예약은 기다리지 않는다.
  */
 @Component
 class ObserveSchedule(
@@ -43,11 +53,14 @@ class ObserveSchedule(
     private val metrics: MetricMaintenance? = null,
     private val thresholdRound: ThresholdRound? = null,
     private val logAlertRound: LogAlertRound? = null,
+    private val trafficCollector: TrafficCollector? = null,
+    private val traffic: TrafficMaintenance? = null,
 ) {
     private val log = LoggerFactory.getLogger("observe")
     @Volatile private var running = true
     private lateinit var thread: Thread
     private var metricThread: Thread? = null
+    private var trafficThread: Thread? = null
 
     /** 마지막 30일 삭제의 결과(헬스 본문용) — 뜬 뒤 아직 한 번도 돌지 않았으면 null. 삭제가 조용히 실패해 쌓이는 것을 보이게 한다. */
     val lastRetention: RetentionResult? get() = retention
@@ -69,6 +82,14 @@ class ObserveSchedule(
     val lastMetricRollupSuccessAt: Instant? get() = metricRollupSuccessAt
     @Volatile private var metricRollupSuccessAt: Instant? = null
 
+    /** 마지막 통신 5분 묶음 바퀴의 결과 · 마지막 성공 시각 · 마지막 통신 삭제의 결과(헬스 본문용) — 뜬 뒤 아직 돌지 않았으면 null */
+    val lastTrafficRollup: TrafficRollupResult? get() = trafficRollup
+    @Volatile private var trafficRollup: TrafficRollupResult? = null
+    val lastTrafficRollupSuccessAt: Instant? get() = trafficRollupSuccessAt
+    @Volatile private var trafficRollupSuccessAt: Instant? = null
+    val lastTrafficRetention: TrafficRetentionResult? get() = trafficRetention
+    @Volatile private var trafficRetention: TrafficRetentionResult? = null
+
     @PostConstruct
     fun start() {
         thread = Thread({
@@ -85,41 +106,46 @@ class ObserveSchedule(
                 }
             }
         }, "observe-collector").apply { isDaemon = true; start() }
-        metricThread = metricCollector?.let { startMetricCollector(it) }
+        metricThread = metricCollector?.let { startSideCollector("metric", { it.runOnce() }, { it.lastFailure != null }) }
+        trafficThread = trafficCollector?.let { startSideCollector("traffic", { it.runOnce() }, { it.lastFailure != null }) }
     }
 
     /**
-     * 지표 수집 스레드 — 로그 수집 스레드와 따로 돌아 한쪽의 예외·Error 가 다른 쪽을 멈추지 않는다.
+     * 지표 · 통신 수집 스레드(`observe-<kind>-collector`) — 로그 수집 스레드와, 서로와 따로 돌아 한쪽의 예외·Error 가 다른 쪽을 멈추지 않는다.
      * 예외는 로그 수집과 같이 다시 시도한다. Error(메모리 부족 · 구현 누락의 NotImplementedError 등)는 이 스레드만 끝내고
-     * 서버 로그에 남긴다 — 그 뒤 헬스의 `metrics.status` 가 `stalled` 로 보인다(로그 수집의 판정은 그대로).
+     * 서버 로그에 남긴다 — 그 뒤 헬스의 그 칸의 `status` 가 `stalled` 로 보인다(로그 수집의 판정은 그대로).
+     * 통신 쪽은 예외 문구를 싣지 않는다(드라이버 문구에 항목의 값이 실릴 수 있다) — 종류 이름만.
      */
-    private fun startMetricCollector(metricCollector: MetricCollector) = Thread({
+    private fun startSideCollector(kind: String, runOnce: () -> Int, failed: () -> Boolean) = Thread({
+        fun describe(error: Throwable) = if (kind == "metric") "${error.javaClass.simpleName}: ${error.message?.take(200)}" else error.javaClass.simpleName
         try {
             while (running) {
                 try {
-                    val handled = metricCollector.runOnce()
-                    if (metricCollector.lastFailure != null) Thread.sleep(FAILURE_PAUSE_MS)
+                    val handled = runOnce()
+                    if (failed()) Thread.sleep(FAILURE_PAUSE_MS)
                     else if (handled == 0) Thread.sleep(IDLE_PAUSE_MS)
                 } catch (_: InterruptedException) {
                     break
                 } catch (error: Exception) {
-                    log.error("observe:observe:metric collector loop error — will retry: {}: {}", error.javaClass.simpleName, error.message?.take(200))
+                    log.error("observe:observe:{} collector loop error — will retry: {}", kind, describe(error))
                     try { Thread.sleep(FAILURE_PAUSE_MS) } catch (_: InterruptedException) { break }
                 }
             }
         } catch (error: Error) {
-            log.error("observe:observe:metric collector stopped: {}: {}", error.javaClass.simpleName, error.message?.take(200))
+            log.error("observe:observe:{} collector stopped: {}", kind, describe(error))
             throw error
         }
-    }, "observe-metric-collector").apply { isDaemon = true; start() }
+    }, "observe-$kind-collector").apply { isDaemon = true; start() }
 
     @PreDestroy
     fun stop() {
         running = false
         thread.interrupt()
         metricThread?.interrupt()
+        trafficThread?.interrupt()
         thread.join(5_000)
         metricThread?.join(5_000)
+        trafficThread?.join(5_000)
     }
 
     /** 두 삭제는 서로 따로 — 한쪽이 실패해도(예외를 삼키고 결과에 남긴다) 다른 쪽은 돈다 */
@@ -203,6 +229,55 @@ class ObserveSchedule(
             .onFailure {
                 log.error("observe:observe:metric retention failed: {}: {}", it.javaClass.simpleName, it.message?.take(200))
                 metricRetention = MetricRetentionResult(now, null, it.javaClass.simpleName)
+            }
+            .getOrNull()
+    }
+
+    /** 예약이 부르는 통신 5분 묶음 — 지금 시각으로 [rollUpTraffic] */
+    @Scheduled(fixedDelayString = "\${observe.traffic.rollup-interval-ms:60000}")
+    fun rollUpTraffic() {
+        rollUpTraffic(Instant.now())
+    }
+
+    /** [now] 로 통신 5분 묶음 한 바퀴 — 결과 규칙은 [rollUpMetrics] 와 같다. [traffic] 이 없으면 null */
+    internal fun rollUpTraffic(now: Instant): Int? {
+        val maintenance = traffic ?: return null
+        return runCatching { maintenance.rollUpBuckets(now) }
+            .onSuccess {
+                if (it.computed > 0) log.info("observe:observe:rolled up {} traffic buckets", it.computed)
+                if (it.failed == 0) {
+                    trafficRollup = TrafficRollupResult(now, it.computed, null)
+                    trafficRollupSuccessAt = now
+                } else {
+                    trafficRollup = TrafficRollupResult(now, it.computed, "${it.failed} buckets failed: ${it.firstFailure ?: "unknown"}", failedBuckets = it.failed)
+                }
+            }
+            .onFailure {
+                log.error("observe:observe:traffic rollup failed: {}", it.javaClass.simpleName)
+                trafficRollup = TrafficRollupResult(now, null, it.javaClass.simpleName)
+            }
+            .getOrNull()?.computed
+    }
+
+    /** 통신 보관 삭제 — 로그 삭제와 같은 시각, 따로의 예약 */
+    @Scheduled(cron = "\${observe.retention-cron:0 40 3 * * *}", zone = "Asia/Seoul")
+    fun deleteOldTraffic() {
+        deleteOldTraffic(Instant.now())
+    }
+
+    /** [now] 기준 통신 삭제([TrafficMaintenance.deleteExpired]) — 실패는 예외를 삼키고 [lastTrafficRetention] 에 종류 이름. [traffic] 이 없으면 null */
+    internal fun deleteOldTraffic(now: Instant): TrafficDeletion? {
+        val maintenance = traffic ?: return null
+        return runCatching { maintenance.deleteExpired(now) }
+            .onSuccess {
+                log.info("observe:observe:deleted {} traffic entries, {} segments, {} requests older than {} days and {} rollups older than {} days",
+                    it.entriesDeleted, it.segmentsDeleted, it.requestsDeleted, TrafficStore.RAW_RETENTION.toDays(), it.rollupDeleted,
+                    TrafficStore.ROLLUP_RETENTION.toDays())
+                trafficRetention = TrafficRetentionResult(now, it, null)
+            }
+            .onFailure {
+                log.error("observe:observe:traffic retention failed: {}", it.javaClass.simpleName)
+                trafficRetention = TrafficRetentionResult(now, null, it.javaClass.simpleName)
             }
             .getOrNull()
     }

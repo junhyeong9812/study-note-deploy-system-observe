@@ -1,6 +1,6 @@
 # study-note-deploy-system-observe
 
-관측 서버 — 네 서비스(front · backend · llm · 배포 시스템)가 Redis 스트림 `logs` 로 보내는 요청 단위 로그를 받아 30일 동안 보관하고, 조회 API 로 찾아보게 한다. 어드민의 로그인 시도를 기록하고 잠금을 판정한다(아래 "로그인 시도와 잠금"). 서버 셋의 자원 지표를 받아 보관하고 조회하게 한다(아래 "자원 지표"). 사이트의 방문을 받아 90일 보관하고 요약을 낸다(아래 "방문"). Kotlin · Spring Boot · PostgreSQL.
+관측 서버 — 네 서비스(front · backend · llm · 배포 시스템)가 Redis 스트림 `logs` 로 보내는 요청 단위 로그를 받아 30일 동안 보관하고, 조회 API 로 찾아보게 한다. 어드민의 로그인 시도를 기록하고 잠금을 판정한다(아래 "로그인 시도와 잠금"). 서버 셋의 자원 지표를 받아 보관하고 조회하게 한다(아래 "자원 지표"). 사이트의 방문을 받아 90일 보관하고 요약을 낸다(아래 "방문"). 서비스 사이의 통신 수치와 요청 구간을 받아 통신 지도 · 요청 추적에 내준다(아래 "통신 수집"). Kotlin · Spring Boot · PostgreSQL.
 
 ```
 front · backend · llm · 배포 시스템 ── XADD logs ──▶ Redis(backend 서버의 것, 상한 약 1만 건)
@@ -256,7 +256,7 @@ ci-cd agent(서버마다, 30초) ── XADD metrics ──▶ Redis ──▶ �
 - **알리는 때**: 넘을 때 1회, 해소될 때 1회(`info` — 디스크 위험에서 경고로 내려올 때만 `warning`), 넘어 있는 채로 마지막 알림에서 1시간이 지나면 같은 key 로 다시 1회(처음 넘은 시각은 그대로). `:resolved` 는 내려가거나 정상으로 돌아올 때만 간다.
 - **판정 상태는 PostgreSQL 에**(`resource_rule_state`) — 관측 서버가 재시작하거나 자리를 바꿔도 같은 알림을 다시 만들지 않고 해소를 놓치지 않는다. 상태 변경과 보낼 알림(`resource_alert_outbox` — 알림마다 고유 키)은 **한 트랜잭션**에 기록한다.
 - **한 자리만 판정 · 한 자리만 보낸다**: 판정과 보내기는 각각 PostgreSQL 의 권고 잠금(기다리지 않고 시도)을 얻은 자리만 돈다. 표 잠금이 아니라서 지표 저장 · 조회 · 5분 평균 · 로그와 서로 막지 않는다. 보내기 잠금은 보내는 한 바퀴 동안(최대 30초) 쥔다 — 그동안 막히는 것은 다른 자리의 보내기뿐이다.
-- **보내기는 판정과 따로 돈다**(`ALERT_DISPATCH_INTERVAL_MS`): 예약 실행기는 스레드가 넷이라 알림 서버가 느려도 30초 판정 · 5분 평균 · 삭제는 밀리지 않는다. 판정 잠금을 얻은 자리만 표본을 읽는다.
+- **보내기는 판정과 따로 돈다**(`ALERT_DISPATCH_INTERVAL_MS`): 예약 실행기는 스레드가 여섯이라 알림 서버가 느려도 30초 판정 · 5분 평균 · 삭제는 밀리지 않는다. 판정 잠금을 얻은 자리만 표본을 읽는다.
 - **보내기의 결과**: 2xx = 전달(표에서 지운다). 5xx · 429 · 401 · 403 · 연결 실패 · 기한 초과 · 주소 없음(`not_configured`) = 남겨 두고 다음 바퀴에 다시(헬스의 `undelivered_alerts`; 401 · 403 은 비밀값을 고치면 풀린다). 그 밖의 4xx = 거절 — 다시 보내지 않고 `rejected_alerts` 로 센다. 실패 사유는 HTTP 코드나 예외 종류 이름만 남긴다(주소 · 비밀값은 로그 · 헬스에 나오지 않는다).
 - **보내기는 대상을 돌아가며 한 건씩**: 보낼 알림은 대상(서버 · 규칙의 묶음 · 컨테이너 — **디스크 경고와 위험은 한 묶음**이라 도착 순서가 바뀌지 않는다)마다 줄을 선다. 한 바퀴는 차례대로 대상마다 머리 한 건씩을 보내고, 한 바퀴를 다 돌면 처음 대상으로 돌아가 다음 건을 보낸다 — 한 대상에 알림이 아무리 많이 밀려 있어도 다른 대상이 그 뒤에서 기다리지 않는다. 같은 대상 안의 순서는 그대로다. "다시 시도"가 난 대상은 그 바퀴에서 빠진다 — 한 대상이 아무리 오래 · 많이 실패해도 다른 대상의 머리는 매 바퀴 읽힌다. 대상의 차례는 **가장 오래 시도하지 않은 대상부터**(한 번도 시도하지 않은 대상이 맨 앞, 방금 시도한 대상은 맨 뒤 — 시간이 모자라 차례가 오지 않은 대상은 다음 바퀴에 먼저 간다 — 대상마다 마지막 시도 시각을 `resource_alert_target` 에 남긴다. 알림 줄이 지워져도 남는다). 지금까지 쓴 시간에 한 건의 기한(`ALERT_TIMEOUT_MS`, 3초)을 더해 30초를 넘게 되면 새로 보내지 않는다 — 바퀴 전체가 30초를 넘지 않는다. 한 바퀴에 최대 50건.
 - **모르는 규칙 글자 · 등급 글자의 줄은 건너뛰고 센다**: 보낼 표에 이 판이 모르는 규칙 글자(`rule` — 위 표와 로그 규칙의 글자와 정확히 같지 않은 것, 대소문자만 다른 글자 · 빈 글자 포함)나 모르는 등급 글자(`severity` — `info` · `warning` · `critical` 이 아닌 것)의 줄이 있으면 보내지도 표시하지도 지우지도 않고 건너뛴다 — 판을 갈아 끼우는 동안 새 판이 쓴 줄을 옛 판이 읽어도 보내기가 멈추지 않게. 그 줄은 한 바퀴의 50건 · 30초 · 대상의 차례를 먹지 않고, 남아 있다가 그 규칙을 아는 판이 처음 보내는 줄처럼 보낸다. 건너뛴 수는 보내기 바퀴가 끝날 때 보내기 잠금을 놓은 뒤에 한 번 센 건수(보낼 표의 건수 세기 하나 — 시간 상한 2초)로 세고, 그 한 결과가 헬스의 `skipped_unknown_rule_alerts`(규칙 글자별 수의 합)와 경고 로그 한 줄(`alerts skipped unknown rule lines … log_errors=4, … · total 7` — 등급 글자를 모르는 줄도 그 줄의 규칙 글자로 센다 — 잠금을 얻지 못한 바퀴도 센다. 규칙 글자는 제어 문자 · 줄 · 문단 구분 문자 · 서식 문자를 `?` 로 바꾸고 글자마다 64 코드포인트까지, 규칙 글자 순으로 앞의 10가지만 찍고 나머지는 ` (+N more)`, `total` 은 전부의 합)에 함께 드러난다. 세지 못하면 그 바퀴의 보내기는 그대로이고, 헬스는 `null`, 경고 로그는 한 줄(`alerts could not count unknown rule lines: <예외 종류>`)이다. 판정 바퀴의 세기는 헬스만 바꾼다.
@@ -335,7 +335,7 @@ ci-cd agent(서버마다, 30초) ── XADD metrics ──▶ Redis ──▶ �
 - 5분 평균에서 읽는 점은 첫 점이 `from` 보다 최대 5분 앞설 수 있다(구간을 통째로 한 점으로 내므로).
 - 큰 간격으로 묶을 때 5분 평균은 구간의 **시작 시각**이 든 칸에 통째로 들어간다(간격이 5분의 배수가 아니면 칸 경계에 걸친 구간이 한쪽에 몰린다).
 - `dropped` 는 이 프로세스가 뜬 뒤의 값이다.
-- **DB 연결**: 자리 하나가 PostgreSQL 연결을 최대 24개 연다(로그 7 · 로그인 시도 3 · 지표 6 · 판정 · 알림 5 · 방문 3). 무중단 배포로 두 자리가 겹치면 48 — 서버 PostgreSQL 의 연결 한도(기본 100)를 배포 때 확인한다.
+- **DB 연결**: 자리 하나가 PostgreSQL 연결을 최대 30개 연다(로그 7 · 로그인 시도 3 · 지표 6 · 판정 · 알림 5 · 방문 3 · 통신 6). 무중단 배포로 두 자리가 겹치면 60 — 서버 PostgreSQL 의 연결 한도(기본 100)를 배포 때 확인한다.
 - 두 자리가 빈 DB 에서 동시에 처음 뜨면 표 만들기가 겹쳐 한쪽의 첫 수집 바퀴가 실패할 수 있다(첫 배포 한 번뿐 — 다음 바퀴에 회복한다).
 - 오래 끊긴 서버는 자동으로 빠지지 않는다 — 아래 "서버를 없애거나 이름을 바꿀 때".
 
@@ -445,6 +445,98 @@ front ── XADD visits ──▶ Redis ──▶ 관측 서버(방문 전용 �
 | `VISITS_RETENTION_BATCH_SIZE` | `5000` | 90일 삭제의 한 문장이 지우는 줄 수의 상한(1 이상) |
 | `VISITS_RETENTION_TIME_BUDGET` | `5m` | 90일 삭제 한 번의 시간 예산(0 보다 길게) — 넘기면 멈추고 다음 실행이 잇는다 |
 
+## 통신 수집
+
+서버마다 도는 ci-cd agent 가 그 서버의 nginx · ci-cd 컨테이너의 접속 기록을 읽어, 읽은 범위 하나를 항목 하나로 Redis 스트림 `traffic` 에 넣는다(로그 · 지표와 같은 Redis, 따로의 스트림 — 통신 규약 4절). 관측 서버가 그것을 받아 구간 묶음(30초 칸의 수 · 상태 · 응답 시간 분포)과 요청별 줄을 저장하고, 어드민의 통신 지도 · 요청 추적에 내준다.
+
+```
+ci-cd agent(서버마다, 30초쯤) ── XADD traffic ──▶ Redis ──▶ 관측 서버(통신 전용 수집 스레드) ──▶ PostgreSQL
+                                                                 └─ GET /traffic/map · /traffic/series · /traffic/requests ◀── 어드민
+```
+
+### 받는 스트림 항목
+
+칸: `kind`(`traffic`) · `v`(`1`) · `server`(agent 의 `SERVER_NAME`) · `generation`(16진수 소문자 16자) · `seq`(세대마다 1 부터) · `at`(agent 가 그 범위를 다 읽은 때, epoch 밀리초) · `body`(JSON, 32KB 이하 — `sources` · `missing` · `segments` · `requests` · `requests_dropped` · `dependencies`, 꼴은 통신 규약 4.2 · 4.3).
+
+- **저장한 뒤에만 확인(ack)한다** — 항목마다 저장하고 확인한다. 저장이 실패하면 그 항목과 뒤의 항목은 확인하지 않는다(다음 바퀴에 다시 받는다).
+- **한 항목 = 한 트랜잭션**: 첫 문장이 받은 열쇠 `(server, generation, seq)` 의 `INSERT … ON CONFLICT DO NOTHING` 이다. 넣은 행이 0 이면 이미 받은 순번이라 통째로 버리고 헬스의 `duplicates` 에 센다. 열쇠 · 칸 · 요청별 줄 · 순번 요약이 함께 들어가거나 함께 실패한다.
+- **칸마다의 앞섬 · 오래됨**: 구간 묶음(`bucket_start_ms`)과 요청별 줄(`end_ms`)이 받은 시각보다 2분 넘게 앞서거나 6일 넘게 뒤면 그 칸 · 줄만 버리고 센다(`cells_dropped`). 순번은 그래도 "받음"이다. 정확히 2분 · 6일은 받는다.
+- **`at` 은 세기만 한다**: 2분 넘게 앞서거나 6일 넘게 뒤인 항목의 수를 `at_ahead` · `at_too_old` 에 센다(시계가 틀린 agent 의 신호). 항목은 버리지 않는다.
+- **그 줄만 버리는 경우**: 요청별 줄의 경로가 아래 가운데 하나면 그 줄만 버리고 `requests_rejected` 로 센다. 항목과 구간 묶음은 그대로 저장한다.
+  - 날것 `?` 또는 인코딩된 물음표 `%3F` · `%3f`(그 뒤의 검색어가 경로로 7일 남지 않게).
+  - `%3A` · `%2E` · `%5B` · `%5D`(대소문자 모두)를 푼 뒤의 주소 꼴: IPv4(점으로 이은 수 넷 — 앞뒤가 숫자가 아님) · 완전한 IPv6(16진 1~4자 묶음 여덟) · 겹콜론 꼴(`::` 의 바로 앞이나 뒤에 16진 묶음 — `fe80::1` · `::1` · `a::b`) · 대괄호 안에 콜론이 든 꼴(`[2001:db8::1]` · `[1:2]`).
+  - 받는 것의 예: `/time/12:30:00` · `/a:b:c` · `/hex/dead:beef:cafe` · `/wiki/C++::std` · `/wiki/[draft]` · `/release/1.2.3`.
+  - **받아들인 한계**: IPv4 꼴은 판 번호(`/release/1.2.3.4`)도 버린다 — 판 번호와 주소를 가를 수 없다. 버린 수는 `requests_rejected` 로 드러난다. 16진 글자(1~4자)로만 된 낱말이 `::` 에 바로 붙은 경로(`/x/cafe::bar` 의 `cafe::`)도 주소 꼴로 본다.
+- **세는 수의 상한**: 항목 안의 세는 수 — 구간 묶음의 `count` · 상태(`status`)의 각 값 · 분포(`buckets`)의 각 값, 항목의 `requests_dropped` — 는 모두 10억까지다(상태는 값마다 먼저 거른 뒤 합을 `count` 와 견준다). 넘으면 항목 전체를 `invalid_body` 로 버리고 세어 확인한다 — 넘치는 수 하나가 5분 묶음 · 지도 · 요약의 합을 오류로 만들어 그 구간의 묶음 · 삭제 · 조회를 막지 않게. 시각 · 걸린 시간 · 바이트 · `max_ms` 에는 상한이 없다.
+- **버리는 항목** — 이유를 세고(헬스의 `traffic.dropped`) 서버 로그에 스트림 ID 와 이유만 남긴 뒤 확인한다: `invalid_id` · `trimmed` · `missing_field` · `unsupported_version` · `invalid_server` · `invalid_generation` · `invalid_seq` · `invalid_at` · `body_too_large` · `body_not_json` · `invalid_body`. 모르는 칸은 무시한다(저장하지 않는다). `kind` 가 `traffic` 이 아니면 건너뛰어 확인한다(`skipped_other_kind`).
+- 로그 · 헬스에는 항목의 내용(경로 · 요청 ID)과 예외 문구를 싣지 않는다 — 예외 종류 이름만. 통신의 연결 풀 넷은 드라이버 설정 `logServerErrorDetail=false` 로 열어 드라이버 예외 글에도 행의 값이 실리지 않는다.
+- 통신 수집은 로그 · 지표 수집과 **다른 스레드**(`observe-traffic-collector`)와 다른 연결 풀로 돈다 — 통신 쪽이 막히거나 실패해도 로그 · 지표 수집과 헬스의 판정은 그대로다.
+
+### 순번의 틈 · 읽기 진도
+
+- 서버 · 세대마다 순번 요약(`traffic_generation`)을 둔다: 처음 본 순번 · 가장 큰 순번 · 받은 수 · 틈 없이 이어진 끝과 그 `at`.
+- **처음 본 순번** = 그 세대에서 받은 **가장 작은** 순번(먼저 커밋된 순번이 아니다). 더 작은 순번이 늦게 오면 처음 본 순번이 낮아지고, 진도는 거기서부터 받은 열쇠를 따라 다시 잇는다(5 · 3 · 4 · 1 을 받으면 진도는 1 에서 멈추고 틈 1 — 2 가 오면 5 까지). 두 자리가 함께 받아도 요약 행의 잠금 안에서 고친다.
+- **읽기 진도** = 세대마다 **처음 본 순번**부터 틈 없이 이어진 항목들의 가장 큰 `at`(서버는 세대들 중 큰 것). 처음 본 순번이 1 이 아니면 그 앞은 틈이 아니고 `first_seq_seen` 으로 드러난다.
+- **틈의 확정**: 빠진 순번은 그보다 뒤의 순번을 처음 받은 때부터 `TRAFFIC_GAP_WAIT`(기본 10분)가 넘게 지나도록 오지 않으면 잃음으로 확정하고, 진도는 그 틈을 넘어 나아간다(**틈의 확정은 뒤의 항목을 받을 때** 그 받은 시각으로 판정한다 — 뒤에 아무것도 오지 않으면 확정되지 않는다. 에이전트가 살아 있으면 30초마다 빈 항목이 온다. 정확히 10분은 아직 기다린다). 확정 뒤 그 순번이 오면 저장하고 틈의 수가 하나 준다. 진도는 그대로다.
+- **틈의 수** = 세대마다 (가장 큰 순번 − 처음 본 순번 + 1 − 받은 수), 0 아래로 내려가지 않는다. 스트림 상한에 밀려 사라진 항목은 되살리지 않고 이 수로만 드러난다.
+- **채우는 중 · 수신 지연**: `읽기 진도 − 30초` 보다 뒤에서 끝나는 칸은 "채우는 중"이라 지도의 판정 수치에 넣지 않는다. 진도가 2분 넘게 나아가지 않으면 그 서버는 "수신 지연"이다.
+
+### 보관
+
+- **원본 칸 7일 → 5분 묶음 30일**: 원본 칸은 추가만 하는 행(`traffic_segment` — 항목마다 한 행, 칸 한 줄을 고치지 않는다)이고 칸의 값은 읽을 때 같은 `(server, bucket, service, caller, class)` 의 행을 합쳐 낸다(수 · 상태 · 분포는 더하고 `max_ms` 는 큰 쪽). 5분 묶음 · 다시 계산 · 구간마다 따로 · 원본 삭제의 조건은 자원 지표의 5분 평균과 같다(`traffic_rollup_bucket` · `traffic_rollup` · `traffic_rollup_attempt`, 간격 `TRAFFIC_ROLLUP_INTERVAL_MS`). 칸은 6일까지 늦게 채워질 수 있으므로 원본이 늘면 그 구간을 다시 계산한다.
+- **요청별 줄 7일**(`traffic_request` — `end_ms` 로), **받은 열쇠 7일**(`traffic_receipt` — 받은 시각으로), 순번 요약은 마지막 받은 시각이 7일 지나면 지운다. 경계(정확히 7일 · 30일)는 남긴다.
+- 삭제는 로그 삭제와 같은 시각(03:40 서울)에 **따로의 예약**으로 돈다 — 통신 표가 막혀 기다려도 로그 · 지표의 예약은 기다리지 않는다. 결과는 헬스의 `traffic.last_retention_*` 와 서버 로그에.
+- 저장된 것 어디에도 접속 주소 · 쿼리 · 모르는 칸의 값이 없다.
+
+### 조회 API
+
+전부 GET, 전부 `X-Observe-Secret`(인증을 입력 검사보다 먼저 본다). 봉투와 오류는 지표 조회와 같다 — 401 `unauthorized` · 422 `invalid_request`(`detail`) · 503 `query_failed` · 504 `query_timeout`.
+
+| 경로 | 설명 |
+|---|---|
+| `GET /traffic/map?from=&to=` | `{from, to, servers, edges}` — 기간은 둘 다 없으면 최근 5분, 최대 24시간. 원본 칸만 읽는다. `edges[]`: `(service, caller, class)` 마다 `{service, caller, class, <수치>, filling_count}` — 수치는 **채워진 칸만**, 채우는 중인 칸의 **요청 수**는 `filling_count` 에만(`count + filling_count` = 전체). 합은 DB 에서 (서버 · 선 · 채우는 중)으로 묶어 낸다 — 채우는 중의 경계는 칸마다 그 칸의 서버의 읽기 진도 − 30초, 돌아오는 행은 칸이 아니라 선 × 서버 × 2 이하 |
+| `GET /traffic/series?service=&caller=&class=&from=&to=` | `{service, caller, class, from, to, step_ms, source, servers, points}` — `service` 필수, `caller` 없으면 모든 호출자의 합(`caller` null), `class` 기본 `request`. 기간은 기본 1시간 · 최대 31일. 간격 · 읽는 곳(원본 / 5분 묶음)은 `GET /metrics/series` 와 같다. `points[]`: 칸이 있는 간격마다 `{at, <수치>, filling}` — `filling` 은 그 간격에 채우는 중인 칸이 있으면 참(수치에는 모든 칸이 든다) |
+| `GET /traffic/requests?request_id=` | `{request_id, spans, truncated}` — 요청 ID(`/logs` 와 같은 꼴) 하나의 구간 `{server, service, caller, method, path, path_truncated, status, end_at, duration_ms, upstream_ms, upstream_status, slot, bytes_sent}`, `end_at` · 서비스순, 500 개까지(넘치면 `truncated` 참) |
+
+- **수치**: `count` · `status{2xx,3xx,4xx,5xx,other}` · `error_rate`(5xx ÷ count — 4xx · 499 는 오류가 아니다, count 0 이면 null) · `p50` · `p95`(든 칸의 위쪽 경계 `{"le_ms": …}`, 마지막 칸이면 `{"gt_ms": 180000}`, request 줄이 없으면 null — 보간하지 않는다) · `max_ms`.
+- **`servers[]`**: `{server, read_progress_at, receive_delayed, sequence_gaps, last_received_at, missing, requests_dropped, requests_rejected, first_seq_seen}` — 진도를 아는 서버와 기간 안에 받은 항목의 서버, 이름순. `missing` · `requests_dropped` · `requests_rejected` 는 기간 안에 받은 항목의 요약.
+
+### 헬스의 `traffic` 칸
+
+`GET /health` 본문에 `traffic` 객체가 붙는다. **통신 쪽이 어떻게 실패해도 로그 수집의 `status` 와 HTTP 상태는 바뀌지 않는다**(지표 칸과 같이 동시에 읽기 시작하고, 바깥에 묻는 것은 합쳐 2초까지만 기다린다).
+
+| 칸 | 뜻 |
+|---|---|
+| `status` · `last_loop_at` · `last_stored_at` · `stored_since_start` · `unacknowledged` · `lag` · `failure` | 지표 칸의 같은 칸과 같은 뜻(통신 스트림 · 통신 표 기준). `stored_since_start` 는 새로 저장한 항목만(순번으로 버린 것은 빼고) |
+| `dropped` · `dropped_total` · `skipped_other_kind` · `duplicates` | 버린 항목 수(이유별 — 모든 이유가 0 부터) · 그 합 · 다른 종류라 건너뛴 수 · 이미 받은 순번이라 버린 수 |
+| `cells_dropped` | 칸 · 요청별 줄만 버린 수 — `segment_ahead` · `segment_too_old` · `request_ahead` · `request_too_old` |
+| `at_ahead` · `at_too_old` · `requests_rejected` | `at` 이 2분 넘게 앞선 · 6일 넘게 뒤진 항목 수 · 그 줄만 버린 요청별 줄 수(새로 받은 항목만) |
+| `last_store_failure` · `last_store_failure_at` | 마지막 저장 실패의 예외 종류와 시각 — 그 뒤에 성공해도 남는다 |
+| `servers` | `[{server, read_progress_at, receive_delayed, sequence_gaps, last_received_at, first_seq_seen}]`(읽지 못하면 빈 목록 · 없는 값은 빈 문자열 · -1) |
+| `last_rollup_at` · `last_rollup_failure` · `last_rollup_failed_buckets` | 지표 칸의 같은 칸과 같은 뜻(통신 5분 묶음) |
+| `last_retention_at` · `last_retention_entries_deleted` · `last_retention_segments_deleted` · `last_retention_requests_deleted` · `last_retention_rollup_deleted` · `last_retention_failure` | 마지막 통신 삭제의 시각 · 지운 받은 열쇠 · 원본 칸 · 요청별 줄 · (서버, 5분 구간) 수 · 실패 종류 |
+
+### 설정
+
+| 설정(환경변수) | 기본 | 뜻 |
+|---|---|---|
+| `TRAFFIC_STREAM` | `traffic` | 받는 스트림(agent 의 같은 이름 설정과 같은 값) |
+| `TRAFFIC_GROUP` | `observe` | 소비자 그룹 이름 |
+| `TRAFFIC_ROLLUP_INTERVAL_MS` | `60000` | 5분 묶음 바퀴의 간격(밀리초) |
+| `TRAFFIC_GAP_WAIT` | `10m` | 빠진 순번을 잃음으로 확정하기까지 기다리는 시간(0 보다 길어야 한다 — 아니면 뜰 때 실패) |
+
+연결 풀은 통신 전용 넷이다: `observe-traffic-ingest`(수집 · 5분 묶음 · 삭제 2) · `observe-traffic-query`(조회 2) · `observe-traffic-health`(헬스의 상태 읽기 1) · `observe-traffic-health-detail`(헬스의 서버별 진도 1).
+
+### 알고 두는 한계
+
+- 스트림 상한(agent 의 `MAXLEN ~ 5000`, 서버 셋이면 약 14시간분)을 넘게 관측 서버가 멈추면 밀려난 항목의 수치는 되살리지 못하고 순번의 틈으로만 드러난다. 세대가 바뀌기 직전 꼬리에서 잃은 것은 틈이 아니라 agent 의 `missing`(`cursor_lost`)으로만 보인다.
+- 다시 보낸 항목이 이미 받은 순번이면 통째로 버려진다 — 다시 읽으며 새로 알게 된 `missing` 은 관측 서버에 닿지 않는다.
+- 받은 열쇠는 7일 뒤 지워지므로 그보다 늦게 다시 온 같은 순번은 다시 받는다 — 그 칸 · 줄은 6일 검사가 막는다.
+- 판(`v`)은 `1` 만 받는다. 분포의 경계가 바뀌는 판은 같은 칸에 더할 수 없어, 판을 올릴 때는 관측 서버가 먼저 두 판을 따로 두도록 바뀌어야 한다(통신 규약 7.2).
+- 처음 본 순번이 낮아지면 진도를 다시 잇는 동안 읽기 진도가 잠시 뒤로 갈 수 있다(낮아진 처음 순번부터 틈 없이 이어진 곳까지).
+- 받은 열쇠가 7일 뒤 지워진 순번이 다시 오면 받은 수가 한 번 더 늘 수 있다 — 틈의 수는 0 아래로 내려가지 않는다.
+- `dropped` · `duplicates` · `cells_dropped` 는 이 프로세스가 뜬 뒤의 값이다.
+
 ## 무중단 배포와 두 자리
 
 배포 중에는 두 자리(blue·green)가 잠시 함께 떠 있다. 둘 다 수집하지만 결과는 하나일 때와 같다 — **자리별 활성 판정을 두지 않는다**.
@@ -453,6 +545,7 @@ front ── XADD visits ──▶ Redis ──▶ 관측 서버(방문 전용 �
 - 한쪽이 저장하다 죽어 확인하지 못한 항목은 같은 이름의 미확인분이라 다른 쪽이 기동 직후와 1분마다 다시 받아 저장한다(따로 넘겨받는 절차가 없다). 그 사이 양쪽이 같은 항목을 저장해도 기본 키가 한 번만 남긴다.
 - 30일 삭제(와 로그인 시도 기록 삭제 · 지표 삭제 · 5분 평균)가 두 자리에서 함께 돌아도 결과가 같다.
 - 지표도 같은 규칙이다 — 두 자리가 같은 지표 소비자 그룹을 같은 이름으로 읽고, 같은 항목은 한 번만 남는다. 방문도 같다.
+- 통신도 같다 — 같은 항목은 열쇠 `(server, generation, seq)` 로 한 번만 들어간다. 두 자리가 같은 항목을 동시에 저장해도 한쪽은 트랜잭션의 첫 문장(열쇠 넣기)에서 기다렸다가 버린다.
 - 로그인 잠금 판정은 두 자리가 같은 DB 의 같은 상태 행을 잡으므로 어느 자리가 받아도 같다.
 - 조회는 nginx 가 보내는 자리 하나가 받는다. 두 자리는 같은 DB 를 본다.
 

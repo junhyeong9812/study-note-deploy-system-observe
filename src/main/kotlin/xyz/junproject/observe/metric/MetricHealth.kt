@@ -1,15 +1,11 @@
 package xyz.junproject.observe.metric
 
 import org.slf4j.LoggerFactory
-import java.sql.SQLException
 import java.time.Duration
 import java.time.Instant
 import java.util.concurrent.CompletableFuture
-import java.util.concurrent.Executors
-import java.util.concurrent.ExecutionException
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.TimeoutException
 import xyz.junproject.observe.threshold.ThresholdRound
+import xyz.junproject.observe.collect.HealthReads
 
 /**
  * 지표 수집의 헬스 칸 — `/health` 본문의 `metrics` 객체. **로그 수집의 `status` 와 HTTP 상태에는 넣지 않는다**(§10.3).
@@ -128,20 +124,10 @@ class MetricHealth(
     }
 
     /** 읽기 하나를 가상 스레드에서 시작한다 */
-    private fun <T> startRead(read: () -> T): CompletableFuture<T> = CompletableFuture.supplyAsync({ read() }, READERS)
+    private fun <T> startRead(read: () -> T): CompletableFuture<T> = HealthReads.start(read)
 
-    /** 마감까지 기다린 결과 — 마감을 넘기면 [TimeoutException] 실패(늦은 읽기는 버려 두고 기다리지 않는다). 읽기의 예외는 그대로 */
-    private fun <T> awaitRead(read: CompletableFuture<T>, deadline: Long): Result<T> = try {
-        Result.success(read.get(maxOf(0L, deadline - System.nanoTime()), TimeUnit.NANOSECONDS))
-    } catch (error: ExecutionException) {
-        Result.failure(error.cause ?: error)
-    } catch (error: TimeoutException) {
-        read.cancel(true)
-        Result.failure(error)
-    } catch (error: InterruptedException) {
-        Thread.currentThread().interrupt()
-        Result.failure(error)
-    }
+    /** 마감까지 기다린 결과 — 마감을 넘기면 [java.util.concurrent.TimeoutException] 실패(늦은 읽기는 버려 두고 기다리지 않는다). 읽기의 예외는 그대로 */
+    private fun <T> awaitRead(read: CompletableFuture<T>, deadline: Long): Result<T> = HealthReads.await(read, deadline)
 
     /** 시계가 뒤처진 서버(이름순) — 읽지 못했으면 빈 목록이고 로그 기준도 바꾸지 않는다. 새로 뒤처진 서버 · 풀린 서버만 1줄씩 */
     private fun clockBehind(latest: List<ResourceSample>?): List<String> {
@@ -159,8 +145,7 @@ class MetricHealth(
         return behind
     }
 
-    private fun isTableMissing(error: Throwable) =
-        generateSequence(error) { it.cause }.any { it is SQLException && it.sqlState == UNDEFINED_TABLE }
+    private fun isTableMissing(error: Throwable) = HealthReads.isTableMissing(error)
 
     /** 닿지 못한 이유의 전체 문구는 서버 로그에만 — 같은 이유를 헬스 요청마다 되풀이해 남기지 않는다 */
     private fun logProblems(problems: List<Pair<String, Throwable>>) {
@@ -169,9 +154,4 @@ class MetricHealth(
         lastLoggedProblem = detail
     }
 
-    private companion object {
-        /** 헬스의 선택 칸 읽기 — 가상 스레드라 늦은 읽기가 쌓여도 스레드를 잡지 않는다 */
-        val READERS = Executors.newVirtualThreadPerTaskExecutor()!!
-        const val UNDEFINED_TABLE = "42P01"   // PostgreSQL: relation does not exist
-    }
 }
