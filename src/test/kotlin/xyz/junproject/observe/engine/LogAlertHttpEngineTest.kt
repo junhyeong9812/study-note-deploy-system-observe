@@ -104,8 +104,8 @@ class LogAlertHttpEngineTest {
         val field = ObserveConfiguration::class.java.getDeclaredField("pools").apply { isAccessible = true }
         @Suppress("UNCHECKED_CAST")
         val pools = (field.get(configuration) as List<HikariDataSource>).associate { it.poolName to it.maximumPoolSize }
-        assertEquals(21, pools.values.sum(), "자리당 연결 수가 바뀌었다: $pools")
-        assertEquals(9, pools.size, "새 풀이 생겼다: $pools")
+        assertEquals(24, pools.values.sum(), "자리당 연결 수가 바뀌었다: $pools")
+        assertEquals(12, pools.size, "새 풀이 생겼다: $pools")
     }
 
     private class Received(val key: String?, val body: String)

@@ -32,6 +32,12 @@ observe:
     alert:
       silent-warm-up: ${METRICS_ALERT_SILENT_WARM_UP:3m}               # 끊김 판정은 뜬 지 이만큼 지나고 한 번 따라잡은 뒤부터(§15.1)
       silent-give-up-after: ${METRICS_ALERT_SILENT_GIVE_UP_AFTER:15m}  # 따라잡지 못해도 뜬 지 이만큼 지나면 판정한다
+  visits:                                          # 방문 — front 가 같은 Redis 의 이 스트림으로 보낸다. 주소 원문은 visit_event 표에만(90일)
+    stream: ${VISITS_STREAM:visits}
+    group: ${VISITS_GROUP:observe}
+    retention-cron: ${VISITS_RETENTION_CRON:0 40 3 * * *}   # 90일 삭제 — 서울 시각. '-'(끔)이면 뜨지 않는다(주소를 저장하므로 끌 수 없다)
+    retention-batch-size: ${VISITS_RETENTION_BATCH_SIZE:5000}  # 90일 삭제의 한 문장이 지우는 줄 수의 상한(1 이상)
+    retention-time-budget: ${VISITS_RETENTION_TIME_BUDGET:5m}  # 90일 삭제 한 번의 시간 예산 — 넘기면 멈추고 다음 실행이 잇는다(0 보다 길게)
   log-alerts:                                      # 로그 무수신 알림 — 둘 다 비면 판정이 꺼진다. 판정 주기는 metrics.judge-interval-ms
     services: ${LOG_ALERT_SERVICES:}                # <서비스>@<사는 서버>=<기준(분)> 을 쉼표로 — 기준은 1~360분
     all-threshold-minutes: ${LOG_ALERT_ALL_THRESHOLD_MINUTES:}   # 전체 스트림 한 줄의 기준(분) — 비면 감시하지 않는다
