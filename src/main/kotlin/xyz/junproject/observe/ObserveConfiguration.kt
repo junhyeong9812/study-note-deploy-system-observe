@@ -34,9 +34,24 @@ import java.time.Duration
 import kotlin.reflect.full.primaryConstructor
 import jakarta.annotation.PreDestroy
 import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler
+import org.springframework.scheduling.annotation.Scheduled
 import java.time.Instant
 import java.util.concurrent.CopyOnWriteArrayList
 import xyz.junproject.observe.threshold.SilentGate
+import xyz.junproject.observe.logalert.LogAlertRound
+import xyz.junproject.observe.logalert.LogAlertSettings
+import xyz.junproject.observe.logalert.LogAlertStore
+import xyz.junproject.observe.logalert.LogJudgingGate
+import xyz.junproject.observe.logalert.LogPatternJudge
+import xyz.junproject.observe.logalert.LogPatternRound
+import xyz.junproject.observe.logalert.LogPatternSettings
+import xyz.junproject.observe.logalert.LogSilentJudge
+import xyz.junproject.observe.visit.RedisVisitStreamCleaner
+import xyz.junproject.observe.visit.VisitCollector
+import xyz.junproject.observe.visit.VisitHealth
+import xyz.junproject.observe.visit.VisitRetention
+import xyz.junproject.observe.visit.VisitSchedule
+import xyz.junproject.observe.visit.VisitStore
 import xyz.junproject.observe.traffic.TrafficCollector
 import xyz.junproject.observe.traffic.TrafficHealth
 import xyz.junproject.observe.traffic.TrafficStore
@@ -280,6 +295,99 @@ class ObserveConfiguration {
     }
 
     /**
+     * 방문 저장소 — 로그와 같은 DB, 연결 풀은 방문 전용(수집 1 — 하루 한 번의 90일 삭제와 함께 쓴다 · 조회 1 · 헬스 1).
+     * 방문 쪽이 무겁거나 실패해도 로그 · 지표의 풀을 잡지 않는다. 헬스 풀은 지표의 헬스 풀과 같은 꼴(연결 하나 · 대기 2초 · 문장 2초).
+     * 단순화: 90일 삭제는 수집과 연결 하나를 나눠 쓴다 — 삭제하는 동안 수집 바퀴가 연결을 5초 넘게 기다리면 실패로 남고 다시 시도한다(항목은 잃지 않는다).
+     * 하루치 삭제가 몇 초 안에 끝나는 동안(하루 방문 수만 줄 안팎)은 문제없다 — 삭제가 그보다 길어지면 삭제 전용 연결을 따로 둔다.
+     * 세 풀의 주소는 [visitJdbcUrl] 이 만든다 — 서버 오류의 세부를 드라이버 예외 글에 싣지 않고(연결이 끊긴 쪽 오류면 풀이 그 예외를
+     * 통째로 로그에 남기는데, 묶음 저장의 값이나 서버 오류의 세부(DETAIL)에 주소 · 구분값이 실린다), 묶음 저장이 줄마다 결과를 돌려주게 한다.
+     */
+    @Bean
+    fun visitStore(
+        @Value("\${observe.db.url}") url: String,
+        @Value("\${observe.db.user}") user: String,
+        @Value("\${observe.db.password}") password: String,
+    ): VisitStore {
+        val visitUrl = visitJdbcUrl(url)
+        val ingest = pool("observe-visit-ingest", visitUrl, user, password, size = 1, statementTimeoutMs = 30_000)
+        val query = pool("observe-visit-query", visitUrl, user, password, size = 1, statementTimeoutMs = 10_000)
+        val health = pool("observe-visit-health", visitUrl, user, password, size = 1, statementTimeoutMs = 2_000, connectionTimeoutMs = 2_000, validationTimeoutMs = 1_000)
+        return VisitStore(JdbcTemplate(ingest), JdbcTemplate(query), JdbcTemplate(health))
+    }
+
+    private var sharedVisitStreamSource: RedisMetricStreamSource? = null
+
+    companion object {
+        /** 방문 풀이 주소에 박는 드라이버 설정 — 주어진 주소에 이미 있어도(값이 무엇이든) 이 값 하나만 남긴다 */
+        private val VISIT_DRIVER_SETTINGS = listOf(
+            "logServerErrorDetail" to "false",   // 드라이버 예외 글에 서버 오류의 세부 · 넣으려던 값(주소 · 구분값)을 싣지 않는다
+            "reWriteBatchedInserts" to "false",  // 묶음 저장이 줄마다 결과를 돌려준다 — 켜지면 모든 줄이 "결과 모름"이 되어 저장한 수를 셀 수 없다
+        )
+
+        /** 방문 풀 셋의 JDBC 주소 — 주소의 앞부분과 다른 매개변수는 그대로 두고 [VISIT_DRIVER_SETTINGS] 를 꼭 한 번씩 붙인다(물음표는 하나) */
+        internal fun visitJdbcUrl(url: String): String {
+            val names = VISIT_DRIVER_SETTINGS.map { it.first }
+            val others = url.substringAfter('?', "").split('&').filter { it.isNotEmpty() && it.substringBefore('=') !in names }
+            return url.substringBefore('?') + "?" + (others + VISIT_DRIVER_SETTINGS.map { (name, value) -> "$name=$value" }).joinToString("&")
+        }
+    }
+
+    /**
+     * 방문 스트림 읽기 — 지표의 스트림 읽기([RedisMetricStreamSource] — 칸 전부를 넘긴다)를 스트림 이름만 바꿔 쓴다. 빈으로 두지 않는다:
+     * 같은 타입의 빈이 둘이면 지표 수집기 · 헬스의 주입이 모호해진다. 수집기와 헬스가 이 하나를 나눠 쓴다.
+     */
+    @Synchronized
+    private fun visitStreamSource(redis: StringRedisTemplate, stream: String, group: String): RedisMetricStreamSource = sharedVisitStreamSource
+        ?: RedisMetricStreamSource(redis, stream, group).also {
+            log.info("observe:observe:collecting visit stream '{}' as group '{}'", stream, group)
+            sharedVisitStreamSource = it
+        }
+
+    /** 방문 수집 — 저장하고 확인한 항목을 방문 스트림에서 지운다(V2b — 지우개는 방문 스트림에만. 하루 한 번의 안전망도 이 지우개를 쓴다) */
+    @Bean
+    fun visitCollector(
+        redis: StringRedisTemplate,
+        @Value("\${observe.visits.stream:visits}") stream: String,
+        @Value("\${observe.visits.group:observe}") group: String,
+        store: VisitStore,
+    ) = VisitCollector(visitStreamSource(redis, stream, group), store, cleaner = RedisVisitStreamCleaner(redis, stream))
+
+    /**
+     * 방문 수집 스레드와 90일 삭제(`observe.visits.retention-cron`, 서울). 삭제를 끄는 값(`-`)은 받지 않는다 — 주소를 저장하면서 삭제를 끌 수 없다.
+     * 묶음 크기(1 이상)와 시간 예산(0 보다 긴 기간)이 틀리면 뜰 때 실패한다.
+     */
+    @Bean
+    fun visitSchedule(
+        collector: VisitCollector,
+        retention: VisitRetention,
+        @Value("\${observe.visits.retention-cron:0 40 3 * * *}") retentionCron: String,
+        @Value("\${observe.visits.retention-batch-size:5000}") retentionBatchSize: Int,
+        @Value("\${observe.visits.retention-time-budget:5m}") retentionTimeBudget: String,
+    ): VisitSchedule {
+        require(retentionCron.trim() != Scheduled.CRON_DISABLED) {
+            "observe.visits.retention-cron 은 '-'(끔)일 수 없다 — 방문자의 주소를 저장하므로 90일 삭제를 끌 수 없다"
+        }
+        require(retentionBatchSize >= 1) { "observe.visits.retention-batch-size 는 1 이상이어야 한다: $retentionBatchSize" }
+        val timeBudget = runCatching { DurationStyle.detectAndParse(retentionTimeBudget.trim()) }.getOrNull()
+        require(timeBudget != null && timeBudget > Duration.ZERO) { "observe.visits.retention-time-budget 은 0 보다 긴 기간이어야 한다(예: 5m): $retentionTimeBudget" }
+        return VisitSchedule(collector, retention, retentionBatchSize = retentionBatchSize, retentionTimeBudget = timeBudget)
+    }
+
+    @Bean
+    fun visitHealth(
+        collector: VisitCollector,
+        redis: StringRedisTemplate,
+        @Value("\${observe.visits.stream:visits}") stream: String,
+        @Value("\${observe.visits.group:observe}") group: String,
+        store: VisitStore,
+        schedule: VisitSchedule,
+    ): VisitHealth {
+        val source = visitStreamSource(redis, stream, group)
+        return VisitHealth(collector, { source.unacknowledgedCount() }, { source.lag() }, { store.latestStoredAt() }, { schedule.lastRetention },
+            oldestStoredAt = { store.oldestStoredAt() }, lastStreamTrim = { schedule.lastStreamTrim })
+    }
+
+    /**
      * 통신 저장소 — 로그 · 지표와 같은 DB, 연결 풀은 통신 전용(`observe-traffic-ingest` 2 · `observe-traffic-query` 2 · `observe-traffic-health` 1 ·
      * `observe-traffic-health-detail` 1). 네 풀 모두 드라이버 설정 `logServerErrorDetail=false` — 드라이버 예외 글에 서버 오류의 상세(행의 값)와
      * 묶음 문장의 값이 실리지 않게(항목의 경로가 예외 글을 타고 로그에 새지 않게).
@@ -349,7 +457,68 @@ class ObserveConfiguration {
 
     @Bean
     fun collectorHealth(collector: LogCollector, source: RedisLogStreamSource, store: LogStore, schedule: ObserveSchedule, metricHealth: MetricHealth,
-                        trafficHealth: TrafficHealth) =
+                        visitHealth: VisitHealth, logAlertRound: LogAlertRound, trafficHealth: TrafficHealth) =
         CollectorHealth(collector, { source.unacknowledgedCount() }, { source.lag() }, { store.latestStoredAt() }, { schedule.lastRetention },
-            lastAuthRetention = { schedule.lastAuthRetention }, metrics = metricHealth, traffic = trafficHealth)
+            lastAuthRetention = { schedule.lastAuthRetention }, metrics = metricHealth, visits = visitHealth, logAlerts = logAlertRound,
+            traffic = trafficHealth)
+
+    /**
+     * 로그 무수신 감시의 설정(`LOG_ALERT_SERVICES` · `LOG_ALERT_ALL_THRESHOLD_MINUTES`) — 감시하는 것 · 받아들이지 않은 줄(다듬은 글자와 까닭)을 기동 로그에.
+     * 둘 다 비면 판정이 꺼진다
+     */
+    @Bean
+    fun logAlertSettings(
+        @Value("\${observe.log-alerts.services:}") services: String,
+        @Value("\${observe.log-alerts.all-threshold-minutes:}") allThresholdMinutes: String,
+        @Value("\${observe.metrics.expected-servers:}") expectedServers: String,
+    ): LogAlertSettings = LogAlertSettings.parse(services, allThresholdMinutes,
+        expectedServers.split(',').map { it.trim() }.filter { it.isNotEmpty() }.toSet()).also { settings ->
+        for (line in settings.startupLines()) {
+            if (line.contains("not watching") || line.contains("with warning")) log.warn("observe:observe:{}", line) else log.info("observe:observe:{}", line)
+        }
+    }
+
+    /**
+     * 로그 글자 규칙의 설정(`LOG_ALERT_PATTERNS` — ⑪-6a) — 쓰는 규칙 · 버린 규칙(다듬은 글자와 까닭)을 기동 로그에. 쓰는 규칙의 줄에는 규칙의 글자를 싣지 않는다.
+     * 비면 글자 규칙이 꺼진다
+     */
+    @Bean
+    fun logPatternSettings(@Value("\${observe.log-alerts.patterns:}") patterns: String): LogPatternSettings =
+        LogPatternSettings.parse(patterns).also { settings ->
+            for (line in settings.startupLines()) if (line.contains("not using")) log.warn("observe:observe:{}", line) else log.info("observe:observe:{}", line)
+        }
+
+    /** 로그 무수신 · 글자 규칙 판정의 상태 표 — 판정 · 알림 풀([thresholdJdbc])을 함께 쓴다(새 풀을 만들지 않는다) */
+    @Bean
+    fun logAlertStore(
+        @Value("\${observe.db.url}") url: String,
+        @Value("\${observe.db.user}") user: String,
+        @Value("\${observe.db.password}") password: String,
+    ) = LogAlertStore(thresholdJdbc(url, user, password))
+
+    /**
+     * 로그 무수신 판정 — 판정은 이 프로세스가 뜬 지 warm-up(`observe.log-alerts.warm-up`, 기본 3분)이 지나고, 로그 수집의 마지막 성공 바퀴가
+     * 따라잡은 바퀴일 때만 한다(다시 밀린 동안 · 수집이 실패 중이거나 멈춘 동안은 보류 — 오래 밀려도 포기하지 않는다). 말이 안 되는 값이면 뜰 때 실패한다.
+     * 글자 규칙(⑪-6a)도 같은 바퀴 · 같은 문으로 따로 돈다 — 저장된 로그 표를 읽는다(로그를 받는 길에는 끼우지 않는다)
+     */
+    @Bean
+    fun logAlertRound(settings: LogAlertSettings, patternSettings: LogPatternSettings, store: LogAlertStore, collector: LogCollector,
+                      @Value("\${observe.log-alerts.warm-up:3m}") warmUpText: String): LogAlertRound {
+        val warmUp = DurationStyle.detectAndParse(warmUpText.trim())
+        require(!warmUp.isNegative && !warmUp.isZero) { "observe.log-alerts.warm-up 은 0 보다 길어야 한다" }
+        val gate = LogJudgingGate(Instant.now(), warmUp, { collector.lastFailure }, { collector.lastLoopAt }, { collector.lastRoundCaughtUp })
+        val patterns = LogPatternRound(patternSettings, store, store, LogPatternJudge(patternSettings)) { gate.active(it) }
+        return LogAlertRound(settings, store, store, LogSilentJudge(settings), patterns) { gate.active(it) }
+    }
+
+    /** 뜬 직후 로그 알림 판정의 표를 미리 만든다(무수신 감시나 글자 규칙이 켜져 있을 때만 · 최선 노력 — 실패해도 첫 바퀴가 다시 만든다) */
+    @EventListener(ApplicationReadyEvent::class)
+    fun prepareLogAlertSchema(event: ApplicationReadyEvent) {
+        if (!event.applicationContext.getBean(LogAlertSettings::class.java).enabled && !event.applicationContext.getBean(LogPatternSettings::class.java).enabled) return
+        try {
+            event.applicationContext.getBean(LogAlertStore::class.java).prepareSchema()
+        } catch (error: Exception) {
+            log.error("observe:observe:log alert schema failed — will retry on first use: {}", error.javaClass.simpleName)
+        }
+    }
 }

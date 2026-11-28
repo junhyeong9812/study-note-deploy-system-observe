@@ -21,7 +21,8 @@ data class ThresholdRoundResult(
  * 판정과 보내기(§11.4 · §15) — 둘은 따로 도는 예약 작업이다: [judgeOnce](30초마다) · [dispatchOnce](보내기 간격마다). [runOnce] 는 둘을 차례로.
  * 판정: 판정 잠금을 얻은 자리만 ① 표본 읽기(측정 시각 `(now − judge.lookback, now]`) · 서버별 마지막 수신 시각 ② 판정 · 기록([RuleStateStore.judgeRound]).
  * 어떤 것도 예외를 내지 않는다. 결과는 [lastResult](판정) · [lastDispatchFailure](보내기), 마지막으로 판정한 시각은 [lastJudgedAt],
- * 보낼 표의 건수는 바퀴가 끝날 때 세어 [lastAlertCounts] 에 둔다(헬스는 이 값만 읽는다).
+ * 보낼 표의 건수는 바퀴가 끝날 때(보내기 바퀴는 보내기 잠금을 놓은 뒤에) 한 번 세어 [lastAlertCounts] 에 둔다(헬스는 이 값만 읽는다).
+ * 보내기 바퀴는 그 한 번의 결과로 이 판이 모르는 규칙 글자의 줄을 경고 로그에 남긴다 — 경고와 헬스가 같은 수를 말한다.
  */
 class ThresholdRound(
     private val samples: MetricSampleSource,
@@ -77,7 +78,24 @@ class ThresholdRound(
         if (dispatch != null && dispatch.delivered + dispatch.retrying + dispatch.rejected > 0) {
             log.info("observe:observe:alerts delivered {} · retrying {} · rejected {}", dispatch.delivered, dispatch.retrying, dispatch.rejected)
         }
-        countAlerts()
+        // 보내기 잠금을 놓은 뒤에 한 번 센다(잠금을 얻지 못한 바퀴도). 이 판이 모르는 규칙 글자의 줄(섞인 판에서 새 판이 쓴 줄)은 바퀴마다 경고 한 줄 —
+        // 줄은 남아 그 규칙을 아는 판이 보낸다. 세지 못하면 예외의 종류 이름만 남긴다(문구에 주소 등이 실릴 수 있다)
+        val counts = try {
+            queue.alertCounts()
+        } catch (error: Exception) {
+            log.warn("observe:observe:alerts could not count unknown rule lines: {}", error.javaClass.simpleName)
+            null
+        }
+        lastAlertCounts = counts
+        val skipped = counts?.unknownRules.orEmpty()
+        if (skipped.isNotEmpty()) {
+            // 규칙 글자는 다른 판이 쓴 표의 값이라 로그에 찍을 때만 다듬는다 — 규칙 글자 순으로 앞의 10가지, 나머지는 가짓수
+            val printed = skipped.toSortedMap().entries.take(LOGGED_RULES)
+                .joinToString(", ") { "${printableRule(it.key)}=${it.value}" }
+            val more = if (skipped.size > LOGGED_RULES) " (+${skipped.size - LOGGED_RULES} more)" else ""
+            log.warn("observe:observe:alerts skipped unknown rule lines (left for a version that knows the rule): {}{} · total {}",
+                printed, more, skipped.values.sum())
+        }
         return dispatch
     }
 
@@ -101,4 +119,26 @@ class ThresholdRound(
 
     /** 보낼 표의 건수(헬스용) — 읽지 못하면 null */
     fun alertCounts(): AlertCounts? = runCatching { queue.alertCounts() }.getOrNull()
+
+    private companion object {
+        const val LOGGED_RULES = 10
+        const val LOGGED_RULE_LENGTH = 64
+
+        /** 로그에 찍는 규칙 글자 — 숨은 문자를 '?' 로([visibleText]), 길이를 [LOGGED_RULE_LENGTH] 코드포인트까지 */
+        fun printableRule(rule: String): String = visibleText(rule, LOGGED_RULE_LENGTH)
+    }
+}
+
+private const val LINE_SEPARATOR = 0x2028
+private const val PARAGRAPH_SEPARATOR = 0x2029
+
+/**
+ * 다른 판 · 설정 · 발신 쪽이 정한 글자를 로그나 알림의 글에 실을 때 — 줄바꿈 등으로 가짜 줄을 만들거나 글자를 숨길 수 없게 제어 문자 ·
+ * 줄 · 문단 구분 문자(U+2028 · U+2029) · 서식 문자(Cf)를 하나씩 '?' 로, 길이를 [maxCodePoints] 코드포인트까지(서로게이트 쌍을 쪼개지 않는다)
+ */
+internal fun visibleText(text: String, maxCodePoints: Int = Int.MAX_VALUE): String = buildString {
+    text.codePoints().limit(maxCodePoints.toLong()).forEach { codePoint ->
+        if (Character.isISOControl(codePoint) || codePoint == LINE_SEPARATOR || codePoint == PARAGRAPH_SEPARATOR ||
+            Character.getType(codePoint) == Character.FORMAT.toInt()) append('?') else appendCodePoint(codePoint)
+    }
 }

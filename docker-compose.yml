@@ -10,7 +10,7 @@ x-observe-environment: &observe-environment
 x-observe: &observe
   build: .
   image: observe-app:${IMAGE_TAG:-local}  # ci-cd: CI 가 커밋 태그로 빌드, CD 가 그 태그로 교체
-  env_file: .env                          # 서버 간 비밀값·Redis 주소 — 서버에만 있다(.env.example 참고)
+  env_file: .env                          # 서버 간 비밀값·Redis 주소 · 알림 · 로그 무수신 감시(LOG_ALERT_*) — 서버에만 있다(.env.example 참고). 비면 그 기능이 꺼진다
   depends_on:
     postgres:
       condition: service_healthy          # 손으로 올릴 때는 DB 가 받을 수 있게 된 뒤 뜬다. agent 는 --no-deps 로 자리만 띄운다(postgres 를 건드리지 않는다)
@@ -49,6 +49,11 @@ services:
     volumes:
       - ./deploy/active:/etc/nginx:ro            # nginx 가 읽는 것은 git 밖의 활성 디렉토리뿐
     restart: unless-stopped
+    logging:   # 접속 기록(통신 규약 v1)이 표준 출력으로 가므로 크기를 묶는다 — 에이전트는 json-file 을 도커 API 로 읽는다
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # 로그 저장소. profiles 가 없어 이름 없이 `docker compose up -d` 해도 뜬다. 두 자리가 같은 DB 를 본다.
   postgres:

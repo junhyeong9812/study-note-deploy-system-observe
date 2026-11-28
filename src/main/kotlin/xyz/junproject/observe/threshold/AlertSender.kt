@@ -87,6 +87,8 @@ data class DispatchOutcome(val lockAcquired: Boolean, val delivered: Int, val re
  * 대상마다 오래된 [batchSize] 건), 한 바퀴에 합쳐 [batchSize] 건까지.
  * Delivered → [AlertQueue.markDelivered], Retry → [AlertQueue.markRetry], Rejected → [AlertQueue.markRejected].
  * 보내는 쪽이 예외를 내도 Retry 로 본다. 보내기 잠금은 한 바퀴 동안 쥔다 — 그 길이는 [roundBudget] 를 넘지 않는다.
+ * 이 판이 모르는 규칙 글자의 줄은 [AlertQueue.pendingByTarget] 에 나오지 않는다. 보내는 쪽은 아무것도 세지 않는다 — 모르는 줄의 수는
+ * 바퀴가 보내기 잠금을 놓은 뒤에 [AlertQueue.alertCounts] 로 센다([ThresholdRound.dispatchOnce]).
  */
 class AlertDispatcher(
     private val queue: AlertQueue,
