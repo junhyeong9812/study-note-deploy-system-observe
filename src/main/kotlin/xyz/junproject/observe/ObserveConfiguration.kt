@@ -38,6 +38,11 @@ import org.springframework.scheduling.annotation.Scheduled
 import java.time.Instant
 import java.util.concurrent.CopyOnWriteArrayList
 import xyz.junproject.observe.threshold.SilentGate
+import xyz.junproject.observe.logalert.LogAlertRound
+import xyz.junproject.observe.logalert.LogAlertSettings
+import xyz.junproject.observe.logalert.LogAlertStore
+import xyz.junproject.observe.logalert.LogJudgingGate
+import xyz.junproject.observe.logalert.LogSilentJudge
 import xyz.junproject.observe.visit.RedisVisitStreamCleaner
 import xyz.junproject.observe.visit.VisitCollector
 import xyz.junproject.observe.visit.VisitHealth
@@ -389,7 +394,55 @@ class ObserveConfiguration {
 
     @Bean
     fun collectorHealth(collector: LogCollector, source: RedisLogStreamSource, store: LogStore, schedule: ObserveSchedule, metricHealth: MetricHealth,
-                        visitHealth: VisitHealth) =
+                        visitHealth: VisitHealth, logAlertRound: LogAlertRound) =
         CollectorHealth(collector, { source.unacknowledgedCount() }, { source.lag() }, { store.latestStoredAt() }, { schedule.lastRetention },
-            lastAuthRetention = { schedule.lastAuthRetention }, metrics = metricHealth, visits = visitHealth)
+            lastAuthRetention = { schedule.lastAuthRetention }, metrics = metricHealth, visits = visitHealth, logAlerts = logAlertRound)
+
+    /**
+     * 로그 무수신 감시의 설정(`LOG_ALERT_SERVICES` · `LOG_ALERT_ALL_THRESHOLD_MINUTES`) — 감시하는 것 · 받아들이지 않은 줄(다듬은 글자와 까닭)을 기동 로그에.
+     * 둘 다 비면 판정이 꺼진다
+     */
+    @Bean
+    fun logAlertSettings(
+        @Value("\${observe.log-alerts.services:}") services: String,
+        @Value("\${observe.log-alerts.all-threshold-minutes:}") allThresholdMinutes: String,
+        @Value("\${observe.metrics.expected-servers:}") expectedServers: String,
+    ): LogAlertSettings = LogAlertSettings.parse(services, allThresholdMinutes,
+        expectedServers.split(',').map { it.trim() }.filter { it.isNotEmpty() }.toSet()).also { settings ->
+        for (line in settings.startupLines()) {
+            if (line.contains("not watching") || line.contains("with warning")) log.warn("observe:observe:{}", line) else log.info("observe:observe:{}", line)
+        }
+    }
+
+    /** 로그 무수신 판정의 상태 표 — 판정 · 알림 풀([thresholdJdbc])을 함께 쓴다(새 풀을 만들지 않는다) */
+    @Bean
+    fun logAlertStore(
+        @Value("\${observe.db.url}") url: String,
+        @Value("\${observe.db.user}") user: String,
+        @Value("\${observe.db.password}") password: String,
+    ) = LogAlertStore(thresholdJdbc(url, user, password))
+
+    /**
+     * 로그 무수신 판정 — 판정은 이 프로세스가 뜬 지 warm-up(`observe.log-alerts.warm-up`, 기본 3분)이 지나고, 로그 수집의 마지막 성공 바퀴가
+     * 따라잡은 바퀴일 때만 한다(다시 밀린 동안 · 수집이 실패 중이거나 멈춘 동안은 보류 — 오래 밀려도 포기하지 않는다). 말이 안 되는 값이면 뜰 때 실패한다
+     */
+    @Bean
+    fun logAlertRound(settings: LogAlertSettings, store: LogAlertStore, collector: LogCollector,
+                      @Value("\${observe.log-alerts.warm-up:3m}") warmUpText: String): LogAlertRound {
+        val warmUp = DurationStyle.detectAndParse(warmUpText.trim())
+        require(!warmUp.isNegative && !warmUp.isZero) { "observe.log-alerts.warm-up 은 0 보다 길어야 한다" }
+        val gate = LogJudgingGate(Instant.now(), warmUp, { collector.lastFailure }, { collector.lastLoopAt }, { collector.lastRoundCaughtUp })
+        return LogAlertRound(settings, store, store, LogSilentJudge(settings)) { gate.active(it) }
+    }
+
+    /** 뜬 직후 로그 무수신 판정의 표를 미리 만든다(감시가 켜져 있을 때만 · 최선 노력 — 실패해도 첫 바퀴가 다시 만든다) */
+    @EventListener(ApplicationReadyEvent::class)
+    fun prepareLogAlertSchema(event: ApplicationReadyEvent) {
+        if (!event.applicationContext.getBean(LogAlertSettings::class.java).enabled) return
+        try {
+            event.applicationContext.getBean(LogAlertStore::class.java).prepareSchema()
+        } catch (error: Exception) {
+            log.error("observe:observe:log alert schema failed — will retry on first use: {}", error.javaClass.simpleName)
+        }
+    }
 }

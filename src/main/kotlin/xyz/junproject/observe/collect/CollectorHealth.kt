@@ -2,6 +2,7 @@ package xyz.junproject.observe.collect
 
 import org.slf4j.LoggerFactory
 import xyz.junproject.observe.log.RetentionResult
+import xyz.junproject.observe.logalert.LogAlertRound
 import xyz.junproject.observe.metric.MetricHealth
 import xyz.junproject.observe.visit.VisitHealth
 import java.sql.SQLException
@@ -27,6 +28,7 @@ import java.util.concurrent.Executors
  * 실패 사유는 예외 종류 이름만 낸다(헬스는 인증이 없다). 문구는 서버 로그에만.
  * [metrics] 가 있으면 본문에 `metrics` 객체([MetricHealth.report])를 더한다 — 지표 쪽이 어떻게 실패해도 위 `status` 와 HTTP 상태는 바뀌지 않는다.
  * [visits] 가 있으면 `visits` 객체([VisitHealth.report])를 같은 규칙으로 더한다 — 그 칸이 실패하면 서버 로그에도 종류 이름만 남긴다(방문 쪽 예외의 글에는 주소가 실릴 수 있다).
+ * [logAlerts] 가 있으면 본문에 `log_alerts` 객체([LogAlertRound.health])를 더한다 — 로그 무수신 판정의 실패도 `status` 와 HTTP 상태를 바꾸지 않는다.
  */
 class CollectorHealth(
     private val collector: LogCollector,
@@ -39,6 +41,7 @@ class CollectorHealth(
     private val startedAt: Instant = Instant.now(),
     private val metrics: MetricHealth? = null,                          // 지표 수집의 칸 — 본문에만, 판정에 넣지 않는다
     private val visits: VisitHealth? = null,                            // 방문 수집의 칸 — 본문에만, 판정에 넣지 않는다
+    private val logAlerts: LogAlertRound? = null,                       // 로그 무수신 판정의 칸(`log_alerts`) — 본문에만, 판정에 넣지 않는다
 ) {
     data class Report(val healthy: Boolean, val body: Map<String, Any>)
 
@@ -92,7 +95,11 @@ class CollectorHealth(
             log.error("observe:observe:visit health failed: {}", cause.javaClass.simpleName)
             mapOf("status" to "failing", "failure" to "health ${cause.javaClass.simpleName}")
         })
-        return Report(status == "ok", withVisits)
+        // 로그 무수신 판정의 칸 — 바퀴가 남긴 값만 읽는다(DB 를 읽지 않는다). 판정의 어떤 실패도 위 status 와 HTTP 상태에 닿지 않는다
+        val withLogAlerts = logAlerts?.let { round ->
+            withVisits + ("log_alerts" to runCatching { round.health(now) }.getOrElse { mapOf("last_failure" to "health ${it.javaClass.simpleName}") })
+        } ?: withVisits
+        return Report(status == "ok", withLogAlerts)
     }
 
     private fun isTableMissing(error: Throwable) =

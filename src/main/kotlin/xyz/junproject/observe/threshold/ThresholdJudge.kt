@@ -6,11 +6,30 @@ import java.time.Duration
 import java.time.Instant
 
 /**
+ * 보낼 표에 드는 알림의 규칙 — 자원 규칙([ResourceRule])과 로그 규칙([LogRule]). [wireName] 은 보낼 표의 `rule` 칸 · 알림 key 의 규칙 자리,
+ * [kind] 는 알림 서버 `POST /events` 의 `kind`.
+ */
+sealed interface AlertRule {
+    val wireName: String
+    val kind: String
+
+    companion object {
+        /** 이 판이 아는 규칙 전부 */
+        val entries: List<AlertRule> get() = ResourceRule.entries + LogRule.entries
+
+        /** 규칙 글자 → 규칙 — 글자가 정확히 같아야 한다(대소문자 · 공백도). 모르는 글자는 [IllegalStateException] */
+        fun fromWireName(wireName: String): AlertRule =
+            entries.firstOrNull { it.wireName == wireName } ?: throw IllegalStateException("알 수 없는 규칙: $wireName")
+    }
+}
+
+/**
  * 임계값 규칙(명세 §2.4 · §11.4). [wireName] 은 알림 key 의 `<규칙>` 자리 · `GET /metrics/latest` 의 `firing[].rule` 글자,
  * [kind] 는 알림 서버 `POST /events` 의 `kind`. 디스크는 단계마다 규칙 하나(경고 · 위험 — 같은 key 를 알림 서버가 10분 억제하므로
  * 단계가 바뀐 알림이 억제되지 않게 key 를 나눈다).
  */
-enum class ResourceRule(val wireName: String, val kind: String) {
+
+enum class ResourceRule(override val wireName: String, override val kind: String) : AlertRule {
     DISK_WARNING("disk_warning", "resource_disk"),
     DISK_CRITICAL("disk_critical", "resource_disk"),
     MEMORY("memory", "resource_memory"),
@@ -20,7 +39,15 @@ enum class ResourceRule(val wireName: String, val kind: String) {
 }
 
 /** 알림 서버의 `severity` 글자(알림 서버가 받는 셋 — info · warning · critical) */
-enum class AlertSeverity(val wireName: String) { INFO("info"), WARNING("warning"), CRITICAL("critical") }
+enum class AlertSeverity(val wireName: String) {
+    INFO("info"), WARNING("warning"), CRITICAL("critical");
+
+    companion object {
+        /** 등급 글자 → 등급 — 글자가 정확히 같아야 한다(대소문자 · 공백도). 모르는 글자는 [IllegalStateException] */
+        fun fromWireName(wireName: String): AlertSeverity =
+            entries.firstOrNull { it.wireName == wireName } ?: throw IllegalStateException("알 수 없는 등급: $wireName")
+    }
+}
 
 /**
  * 수치(명세 §2.4 의 표가 기본값). 설정 키는 `observe.metrics.alert.<칸 이름의 케밥꼴>`, 환경 변수는 `METRICS_ALERT_<대문자 밑줄꼴>`
@@ -104,7 +131,7 @@ data class ResourceAlert(
     val title: String,
     val detail: String,
     val server: String,
-    val rule: ResourceRule,
+    val rule: AlertRule,
     val targetName: String?,
     val createdAt: Instant,
 ) {
@@ -118,6 +145,27 @@ data class ResourceAlert(
         const val MAX_TITLE = 200
         const val MAX_DETAIL = 1500
     }
+}
+
+/** 해소 알림의 key 에 붙는 꼬리 */
+internal const val RESOLVED_SUFFIX = ":resolved"
+
+/** 알림 서버가 key 를 자르는 길이 */
+private const val MAX_ALERT_KEY = 120
+
+/** 글의 UTF-8 SHA-256 앞 12자(소문자 16진) — key 를 가르는 꼬리 */
+internal fun shortHash(text: String): String =
+    MessageDigest.getInstance("SHA-256").digest(text.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }.take(12)
+
+/**
+ * 넘음 key 를 뒤에 [RESOLVED_SUFFIX] 가 붙어도 120자를 넘지 않게 — 길면 앞부분과 전체의 해시로 줄인다(같은 [full] 은 늘 같은 key,
+ * 다른 [full] 은 해시가 갈라 다른 key). 앞부분을 자르는 길은 [prefix](기본은 UTF-16 단위의 `take` — 자원 알림의 key 는 이 꼴 그대로)
+ */
+internal fun boundedBaseKey(full: String, prefix: (String, Int) -> String = { text, length -> text.take(length) }): String {
+    val maxBaseKey = MAX_ALERT_KEY - RESOLVED_SUFFIX.length
+    if (full.length <= maxBaseKey) return full
+    val digest = shortHash(full)
+    return prefix(full, maxBaseKey - digest.length - 1) + "~" + digest
 }
 
 /**
@@ -229,7 +277,7 @@ class ThresholdJudge(private val thresholds: ResourceThresholds = ResourceThresh
         private fun alert(server: String, rule: ResourceRule, target: String, targetName: String?, resolved: Boolean, severity: AlertSeverity,
                           title: String, detail: String): ResourceAlert {
             val base = baseKey(server, rule, targetName)
-            val key = if (resolved) "$base$RESOLVED" else base
+            val key = if (resolved) "$base$RESOLVED_SUFFIX" else base
             // 같은 (key, 판정 시각)이면 같은 고유 키 — 재시작 규칙은 이름이 같은 두 컨테이너가 겹치지 않게 ID 를 붙인다
             val eventId = "$key@${now.toEpochMilli()}" + if (target.isEmpty()) "" else "#$target"
             return ResourceAlert(eventId, key, rule.kind, severity, title.take(ResourceAlert.MAX_TITLE), detail.take(ResourceAlert.MAX_DETAIL),
@@ -356,20 +404,12 @@ class ThresholdJudge(private val thresholds: ResourceThresholds = ResourceThresh
     }
 
     private companion object {
-        const val RESOLVED = ":resolved"
         /** 이 낱말이 `missing` 에 있으면 그 표본의 컨테이너 목록은 온전하지 않다 */
         val INCOMPLETE_CONTAINERS = setOf("containers", "containers_truncated")
-        const val MAX_KEY = 120
-        /** 넘음 key 의 최대 길이 — 뒤에 `:resolved` 가 붙어도 [MAX_KEY] 를 넘지 않게 */
-        val MAX_BASE_KEY = MAX_KEY - RESOLVED.length
 
-        /** `resource:<서버>:<규칙>[:<컨테이너 이름>]` — 길면 앞부분과 전체의 해시로 줄인다(같은 대상은 늘 같은 key) */
-        fun baseKey(server: String, rule: ResourceRule, targetName: String?): String {
-            val full = "resource:$server:${rule.wireName}" + (targetName?.let { ":$it" } ?: "")
-            if (full.length <= MAX_BASE_KEY) return full
-            val digest = MessageDigest.getInstance("SHA-256").digest(full.toByteArray()).joinToString("") { "%02x".format(it) }.take(12)
-            return full.take(MAX_BASE_KEY - digest.length - 1) + "~" + digest
-        }
+        /** `resource:<서버>:<규칙>[:<컨테이너 이름>]` — 길면 줄인다([boundedBaseKey]) */
+        fun baseKey(server: String, rule: ResourceRule, targetName: String?): String =
+            boundedBaseKey("resource:$server:${rule.wireName}" + (targetName?.let { ":$it" } ?: ""))
 
         fun memoryPct(sample: ResourceSample): Double? = ratio(sample.host?.memUsed, sample.host?.memTotal)
         fun diskPct(sample: ResourceSample): Double? = ratio(sample.host?.diskUsed, sample.host?.diskTotal)
